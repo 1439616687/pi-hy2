@@ -175,8 +175,10 @@ def node_to_proxy(node: dict, settings: dict) -> dict:
         p["obfs"] = node["obfs"]
         if node.get("obfs_password"):
             p["obfs-password"] = node["obfs_password"]
-    if node.get("fingerprint"):
-        p["fingerprint"] = node["fingerprint"]
+    # fingerprint 必须是 hex 证书指纹，否则 mihomo 启动报错；非 hex 一律丢弃
+    fp = str(node.get("fingerprint", "")).replace(":", "").lower()
+    if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp):
+        p["fingerprint"] = fp
     if node.get("fast_open"):
         p["fast-open"] = True
     return p

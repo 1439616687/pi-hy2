@@ -11,6 +11,8 @@ import json
 import os
 import secrets
 import threading
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import manager, parser
@@ -18,8 +20,13 @@ from .store import Store
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
+TOKEN_TTL = 12 * 3600          # token 有效期（秒）
+LOGIN_MAX_FAILS = 8            # 同一 IP 连续失败上限
+LOGIN_LOCK_SECS = 60          # 触发上限后锁定时长
+
 _lock = threading.Lock()
-_tokens: set[str] = set()
+_tokens: dict[str, float] = {}          # token -> 过期时间戳
+_login_fails: dict[str, list] = {}      # ip -> [失败次数, 最近失败时间]
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -73,7 +80,16 @@ class Handler(BaseHTTPRequestHandler):
             return True
         auth = self.headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
-        return token in _tokens
+        exp = _tokens.get(token)
+        if exp is None:
+            return False
+        if exp < time.time():           # 过期则清除
+            _tokens.pop(token, None)
+            return False
+        return True
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "?"
 
     # ----------------------------------------------------------- 路由
     def do_GET(self):
@@ -144,8 +160,12 @@ class Handler(BaseHTTPRequestHandler):
             s = store.data["settings"]
             out = {n["id"]: manager.clash_delay(n["name"], s) for n in store.data["nodes"]}
             return self._json({"ok": True, "delays": out})
-        if path == "/api/config":  # 预览当前会生成的配置
-            return self._json({"ok": True, "config": store.render_config()})
+        if path == "/api/config":  # 预览当前会生成的配置（隐去 clash 密钥）
+            cfg = store.render_config()
+            sec = store.data["settings"].get("secret")
+            if sec:
+                cfg = cfg.replace(sec, "******")
+            return self._json({"ok": True, "config": cfg})
         if path == "/api/export":  # 导出所有节点链接
             links = [parser.node_to_link(n) for n in store.data["nodes"]]
             return self._json({"ok": True, "links": links})
@@ -157,12 +177,30 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
 
         if path == "/api/login":
+            ip = self._client_ip()
+            with _lock:
+                fails = _login_fails.get(ip, [0, 0.0])
+                # 锁定窗口内拒绝继续尝试，遏制暴力破解
+                if fails[0] >= LOGIN_MAX_FAILS and time.time() - fails[1] < LOGIN_LOCK_SECS:
+                    return self._err("尝试过于频繁，请稍后再试", 429)
             pw = store.data["webui"].get("password", "")
-            if pw and body.get("password") == pw:
+            if pw and secrets.compare_digest(str(body.get("password", "")), pw):
                 token = secrets.token_urlsafe(24)
-                _tokens.add(token)
+                with _lock:
+                    _tokens[token] = time.time() + TOKEN_TTL
+                    _login_fails.pop(ip, None)
                 return self._json({"ok": True, "token": token})
+            with _lock:
+                f = _login_fails.get(ip, [0, 0.0])
+                _login_fails[ip] = [f[0] + 1, time.time()]
+            time.sleep(0.5)             # 失败固定延时，进一步抬高爆破成本
             return self._err("密码错误", 401)
+
+        if path == "/api/logout":
+            auth = self.headers.get("Authorization", "")
+            tok = auth[7:] if auth.startswith("Bearer ") else ""
+            _tokens.pop(tok, None)
+            return self._json({"ok": True})
 
         if not self._authed(store):
             return self._err("未登录", 401)
@@ -234,7 +272,19 @@ class Handler(BaseHTTPRequestHandler):
                 store.save()
                 return self._json({"ok": True})
             if path == "/api/settings":
-                store.set_settings(body.get("settings", {}))
+                settings = dict(body.get("settings", {}))
+                # external_controller 必须是回环地址，否则带密钥外发会造成 SSRF/密钥外泄
+                ec = settings.get("external_controller")
+                if ec is not None:
+                    host = urllib.parse.urlparse(
+                        ec if ec.startswith("http") else "http://" + ec).hostname or ""
+                    if host not in ("127.0.0.1", "::1", "localhost"):
+                        return self._err("外部控制器必须是本机回环地址（127.0.0.1）")
+                # 下载镜像必须 https
+                mir = settings.get("github_mirror", "")
+                if mir and not mir.lower().startswith("https://"):
+                    return self._err("下载镜像必须以 https:// 开头")
+                store.set_settings(settings)
                 store.save()
                 return self._json({"ok": True})
             if path == "/api/webui":
@@ -269,6 +319,11 @@ def serve(port: int | None = None, bind: str | None = None):
     store = Store()
     port = port or store.data["webui"]["port"]
     bind = bind or store.data["webui"].get("bind", "0.0.0.0")
+    # 安全兜底：未设访问密码时，绝不监听非回环地址（否则=局域网内无鉴权的 root 控制台）
+    if not store.data["webui"].get("password") and bind not in ("127.0.0.1", "::1", "localhost"):
+        print("⚠️  未设置访问密码，为安全起见仅监听 127.0.0.1。"
+              "请在面板/向导里设置密码后再开放到局域网。")
+        bind = "127.0.0.1"
     httpd = ThreadingHTTPServer((bind, port), Handler)
     print(f"pihy2 WebUI 运行于 http://{bind}:{port}（静态目录 {WEB_DIR}）")
     try:

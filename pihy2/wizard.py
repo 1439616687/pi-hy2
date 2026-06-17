@@ -143,22 +143,27 @@ def _run_wizard():
     title("第 4 步 / WebUI 管理面板")
     port = ask("WebUI 端口", str(store.data["webui"]["port"]))
     store.data["webui"]["port"] = int(port) if port.isdigit() else 8088
-    _p(f"{C_WARN}面板能改系统代理，建议设访问密码。{C_END}")
-    if ask_yn("设置访问密码吗？", True):
-        import getpass
-        try:
-            pw = getpass.getpass("输入密码（输入时不显示）: ").strip()
-        except Exception:
-            pw = ask("输入密码")
-        store.data["webui"]["password"] = pw or secrets.token_urlsafe(9)
-        if not pw:
-            _p(f"  未输入，已生成随机密码：{C_OK}{store.data['webui']['password']}{C_END}")
+    # 面板能以 root 改系统代理，必须有密码——否则只监听回环，无法局域网访问。
+    _p(f"{C_WARN}面板以 root 运行、能改系统代理，必须设访问密码才会开放到局域网。{C_END}")
+    import getpass
+    pw = ""
+    try:
+        pw = getpass.getpass("设置访问密码（直接回车=自动生成）: ").strip()
+    except Exception:
+        pw = ask("设置访问密码（留空=自动生成）")
+    store.data["webui"]["password"] = pw or secrets.token_urlsafe(9)
+    if not pw:
+        _p(f"  已生成随机密码：{C_OK}{store.data['webui']['password']}{C_END}")
     store.save()
 
     # ---- 5. 安装 ----
     title("第 5 步 / 开始部署")
     _p("· 准备 TUN 设备")
-    manager.ensure_tun(log=lambda m: _p("  " + m))
+    if not manager.ensure_tun(log=lambda m: _p("  " + m)):
+        _p(f"{C_WARN}  未检测到 /dev/net/tun，TUN 全局代理可能无法工作。{C_END}")
+        if not ask_yn("仍要继续吗？", False):
+            _p("已中止。请确认内核 tun 模块可用后重试。")
+            sys.exit(1)
     _p("· 安装 mihomo（首次直连 GitHub，可能较慢，请耐心等待）")
     try:
         manager.install_mihomo(mirror=store.data["settings"].get("github_mirror", ""),
@@ -183,12 +188,22 @@ def _run_wizard():
     # ---- 6. 验证 ----
     title("第 6 步 / 验证")
     import time
-    time.sleep(4)
+    time.sleep(5)
     st = manager.service_status("mihomo")
-    _p(f"  mihomo 服务：{st['active']} / 开机自启 {st['enabled']}")
-    ip = manager.current_ip()
-    _p(f"  当前出口 IP：{C_OK}{ip}{C_END}")
-    _p(f"  {C_DIM}若该 IP 是你节点所在地区，说明整机已走代理。{C_END}")
+    ok_run = st["active"] == "active"
+    color = C_OK if ok_run else C_ERR
+    _p(f"  mihomo 服务：{color}{st['active']}{C_END} / 开机自启 {st['enabled']}")
+    if not ok_run:
+        _p(f"{C_WARN}  mihomo 未在运行，查看日志：journalctl -u mihomo -n 30{C_END}")
+        _p(manager.journal("mihomo", 12))
+    else:
+        _p(f"  {C_DIM}正在探测出口 IP（刚启动连接未热，会多试几次）…{C_END}")
+        ip = manager.current_ip(retries=4)
+        _p(f"  当前出口 IP：{C_OK}{ip}{C_END}")
+        _p(f"  {C_DIM}若该 IP 是你节点所在地区，说明整机已走代理。{C_END}")
+    web_st = manager.service_status("pihy2-web")
+    if web_st["active"] != "active":
+        _p(f"{C_WARN}  面板服务未运行：journalctl -u pihy2-web -n 30{C_END}")
 
     title("完成 🎉")
     webui = store.data["webui"]
