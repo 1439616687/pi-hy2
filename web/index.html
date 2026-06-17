@@ -27,6 +27,7 @@
       <span id="st-mihomo" class="pill">mihomo: …</span>
       <span id="st-ip" class="pill">出口IP: …</span>
       <button class="btn ghost" onclick="refreshStatus()">刷新</button>
+      <button class="btn ghost" onclick="logout()">退出</button>
       <button class="btn primary" onclick="applyConfig()">应用配置并重启</button>
     </div>
   </header>
@@ -60,7 +61,8 @@
         <button class="btn primary" onclick="addRuleRow()">+ 添加规则</button>
       </div>
       <p class="muted small">从上到下匹配，命中即止。支持通配符：<code>*.cn</code>、<code>github.com</code>、
-        <code>1.2.3.0/24</code>。私有网段已自动直连（保证 SSH 不断），无需手动添加。</p>
+        <code>1.2.3.0/24</code>。私有网段已自动直连（保证 SSH 不断），无需手动添加。
+        <br>GEOIP/GEOSITE 规则需要 mihomo 在运行时联网下载地理数据库（走代理），首次添加后请点“应用配置”。</p>
       <div class="rule-head">
         <span>值（域名 / IP / 通配符）</span><span>类型</span><span>策略</span><span>生成规则</span><span></span>
       </div>
@@ -127,7 +129,9 @@
         <div class="grid">
           <label>监听端口 <input id="web-port" type="number"></label>
           <label>监听地址 <input id="web-bind" type="text"></label>
-          <label>访问密码（留空=取消密码） <input id="web-pw" type="password" placeholder="不修改请留此处不动"></label>
+          <label>修改密码（留空=保持不变） <input id="web-pw" type="password" placeholder="输入新密码以修改">
+            <span id="web-pw-hint" class="muted small"></span></label>
+          <label class="row"><input id="web-pw-clear" type="checkbox"> 取消密码保护（清空，仅本机可访问）</label>
         </div>
         <div class="bar"><button class="btn" onclick="saveWebui()">保存面板设置</button>
           <span class="muted small">改端口/地址后需重启面板服务生效：<code>systemctl restart pihy2-web</code></span></div>

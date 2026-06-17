@@ -15,9 +15,11 @@ from . import config_gen
 STATE_DIR = os.environ.get("PIHY2_DIR", "/etc/pihy2")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
-# 内置的常用直连规则（首次初始化时写入，用户可在面板里增删）
+# 内置的常用直连规则（首次初始化时写入，用户可在面板里增删）。
+# 刻意只用“不依赖 geodata”的规则：GEOIP/GEOSITE 需要 geoip.metadb/GeoSite.dat，
+# 首次部署时 mihomo 还没起来、只能直连 GitHub 下载，被墙就会导致配置校验失败、服务起不来。
+# 想要更全面的“大陆直连”，可在部署完成后（mihomo 已在跑、下载走代理）于面板添加 GEOIP,CN。
 DEFAULT_RULES = [
-    {"value": "CN", "policy": "DIRECT", "type": "geoip"},          # 中国大陆 IP 直连
     {"value": "cn", "policy": "DIRECT", "type": "domain-suffix"},  # .cn 域名直连
 ]
 
@@ -57,11 +59,20 @@ class Store:
         return _new_state()
 
     def save(self) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        # state.json 含明文密码/密钥，目录与文件都收紧权限到仅 root 可读
+        d = os.path.dirname(self.path) or "."
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)  # 原子替换，避免写一半损坏
+            f.flush()
+            os.fsync(f.fileno())          # 防掉电写一半
+        os.chmod(tmp, 0o600)              # 替换前就设好权限，避免出现可读窗口
+        os.replace(tmp, self.path)        # 原子替换，避免写一半损坏
 
     def _migrate(self, data: dict) -> dict:
         base = _new_state()

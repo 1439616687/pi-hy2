@@ -4,15 +4,19 @@
 let TOKEN = localStorage.getItem('pihy2_token') || '';
 let STATE = { nodes: [], rules: [], settings: {}, webui: {}, active: '' };
 let DELAYS = {};
+let rulesDirty = false;          // 路由有未保存修改时为 true
+let toastTimer = null;
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
   if (TOKEN) opt.headers['Authorization'] = 'Bearer ' + TOKEN;
   if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
-  if (r.status === 401) { showLogin(); throw new Error('未登录'); }
-  const data = await r.json().catch(() => ({}));
-  return data;
+  if (r.status === 401) {           // token 失效/服务端重启：清掉并回到登录
+    TOKEN = ''; localStorage.removeItem('pihy2_token'); showLogin();
+    throw new Error('未登录');
+  }
+  return await r.json().catch(() => ({}));
 }
 
 function el(id) { return document.getElementById(id); }
@@ -21,15 +25,23 @@ function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '
 function toast(msg, kind) {
   const t = el('toast');
   t.textContent = msg; t.className = 'toast ' + (kind || '');
-  setTimeout(() => t.classList.add('hidden'), 2600);
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), 2800);
+}
+// 统一处理“写操作”结果：成功提示 okMsg，失败显示后端 error
+function done(r, okMsg) {
+  const ok = r && r.ok;
+  toast(ok ? okMsg : ('失败：' + ((r && (r.error || r.message)) || '请重试')), ok ? 'ok' : 'err');
+  return ok;
 }
 
 // ----------------------------------------------------------------- 鉴权
 async function boot() {
   const info = await fetch('/api/authinfo').then(r => r.json()).catch(() => ({ need_auth: false }));
   if (info.need_auth && !TOKEN) { showLogin(); return; }
-  const ok = await loadState();
-  if (ok) { showApp(); refreshStatus(); }
+  try {
+    if (await loadState()) { showApp(); refreshStatus(); }
+  } catch (e) { /* 401 已弹出登录框 */ }
 }
 function showLogin() { el('login').classList.remove('hidden'); el('app').classList.add('hidden'); }
 function showApp() { el('login').classList.add('hidden'); el('app').classList.remove('hidden'); }
@@ -37,21 +49,28 @@ function showApp() { el('login').classList.add('hidden'); el('app').classList.re
 async function doLogin(e) {
   e.preventDefault();
   const pw = el('login-pw').value;
-  const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) }).then(r => r.json());
-  if (r.ok) { TOKEN = r.token; localStorage.setItem('pihy2_token', TOKEN); await loadState(); showApp(); refreshStatus(); }
+  const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) }).then(r => r.json()).catch(() => ({}));
+  if (r.ok) { TOKEN = r.token; localStorage.setItem('pihy2_token', TOKEN); el('login-pw').value = ''; el('login-err').textContent = ''; await loadState(); showApp(); refreshStatus(); }
   else { el('login-err').textContent = r.error || '密码错误'; }
 }
 
 async function loadState() {
   const s = await api('GET', '/api/state');
   if (!s.ok) return false;
+  const keepRules = rulesDirty ? STATE.rules : null;   // 保住未保存的路由编辑，避免被覆盖丢失
   STATE = s;
+  if (keepRules) STATE.rules = keepRules;
   renderNodes(); renderRules(); renderSettings();
   return true;
 }
 
 // ----------------------------------------------------------------- 标签页
 function switchTab(name) {
+  // 离开“路由”页且有未保存修改时提醒，避免静默丢失
+  const leavingRules = !el('tab-rules').classList.contains('hidden') && name !== 'rules';
+  if (leavingRules && rulesDirty) {
+    if (!confirm('路由有未保存的修改，切走后仍会保留但不会生效。继续切换？')) return;
+  }
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.add('hidden'));
   el('tab-' + name).classList.remove('hidden');
@@ -59,25 +78,32 @@ function switchTab(name) {
 
 // ----------------------------------------------------------------- 状态栏
 async function refreshStatus() {
-  const s = await api('GET', '/api/status');
+  const s = await api('GET', '/api/status').catch(() => ({}));
   if (!s.ok) return;
   const m = el('st-mihomo');
-  const running = s.mihomo.active === 'active';
-  m.textContent = 'mihomo: ' + (running ? '运行中' : s.mihomo.active);
+  const active = (s.mihomo && s.mihomo.active) || '未知';
+  const running = active === 'active';
+  m.textContent = 'mihomo: ' + (running ? '运行中' : active);
   m.className = 'pill ' + (running ? 'ok' : 'bad');
   el('st-ip').textContent = '出口IP: ' + (s.ip || '—');
 }
 
+let applying = false;
 async function applyConfig() {
+  if (applying) return;            // 防重复点击
+  applying = true;
   toast('正在校验并应用…');
-  const r = await api('POST', '/api/apply');
-  toast(r.message || (r.ok ? '已应用' : '失败'), r.ok ? 'ok' : 'err');
-  if (r.ok) setTimeout(refreshStatus, 1500);
+  try {
+    const r = await api('POST', '/api/apply');
+    toast(r.message || (r.ok ? '已应用' : '失败'), r.ok ? 'ok' : 'err');
+    if (r.ok) setTimeout(refreshStatus, 1500);
+  } finally { applying = false; }
 }
 
 // ----------------------------------------------------------------- 节点
-function delayClass(d) { return d == null ? '' : d <= 0 ? 'bad' : d < 300 ? 'good' : d < 800 ? 'mid' : 'bad'; }
-function delayText(d) { return d == null ? '' : d <= 0 ? '超时' : d + 'ms'; }
+// undefined=未测；null/<=0=测过但超时；其余=毫秒
+function delayClass(d) { return d === undefined ? '' : (d === null || d <= 0) ? 'bad' : d < 300 ? 'good' : d < 800 ? 'mid' : 'bad'; }
+function delayText(d) { return d === undefined ? '' : (d === null || d <= 0) ? '超时' : d + 'ms'; }
 
 function renderNodes() {
   el('node-count').textContent = `（${STATE.nodes.length}）`;
@@ -94,10 +120,12 @@ function renderNodes() {
       <div class="dot" title="设为当前出口" onclick="setActive('${n.id}')"></div>
       <div class="info">
         <div class="name">${esc(n.name)}</div>
-        <div class="addr">${esc(n.server)}:${n.port}</div>
+        <div class="addr">${esc(n.server)}:${esc(n.port)}</div>
         ${tags.length ? `<div class="tags">${tags.map(t => `<span class="tag">${t}</span>`).join('')}</div>` : ''}
       </div>
       <div class="delay ${delayClass(d)}">${delayText(d)}</div>
+      <button class="btn small" title="上移" onclick="moveNode('${n.id}',-1)">↑</button>
+      <button class="btn small" title="下移" onclick="moveNode('${n.id}',1)">↓</button>
       <button class="btn small" onclick="editNode('${n.id}')">编辑</button>
       <button class="btn small danger" onclick="deleteNode('${n.id}')">删除</button>
     </div>`;
@@ -105,8 +133,21 @@ function renderNodes() {
   enableDragOrder();
 }
 
+// 上移/下移（触屏也能用，弥补 HTML5 拖拽在移动端不触发）
+async function moveNode(id, dir) {
+  const ids = STATE.nodes.map(n => n.id);
+  const i = ids.indexOf(id), j = i + dir;
+  if (i < 0 || j < 0 || j >= ids.length) return;
+  ids.splice(j, 0, ids.splice(i, 1)[0]);
+  STATE.nodes.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+  renderNodes();
+  const r = await api('POST', '/api/nodes/order', { order: ids });
+  if (!r.ok) toast('排序保存失败', 'err');
+}
+
 async function setActive(id) {
   const r = await api('POST', '/api/active', { id });
+  if (!r.ok) { toast('切换失败：' + (r.error || ''), 'err'); return; }
   STATE.active = id; renderNodes();
   if (r.live) toast('已切换当前节点（已生效）', 'ok');
   else toast('已选为当前节点，点“应用配置并重启”后生效', 'ok');
@@ -115,8 +156,9 @@ async function setActive(id) {
 async function deleteNode(id) {
   const n = STATE.nodes.find(x => x.id === id);
   if (!confirm(`删除节点「${n ? n.name : id}」？`)) return;
-  await api('DELETE', '/api/nodes/' + id);
-  await loadState(); toast('已删除，记得“应用配置”', 'ok');
+  const r = await api('DELETE', '/api/nodes/' + id);
+  await loadState();
+  done(r, '已删除，记得“应用配置”');
 }
 
 async function testDelays() {
@@ -144,15 +186,17 @@ async function previewNodes() {
   const r = await api('POST', '/api/parse', { text: el('add-text').value });
   const box = el('add-preview');
   let html = '';
-  (r.nodes || []).forEach(n => { html += `<div class="preview-node">✓ <b>${esc(n.name)}</b> — ${esc(n.server)}:${n.port}${n.obfs ? ' · 混淆' : ''}${n.skip_cert_verify ? ' · 跳过证书' : ''}</div>`; });
+  (r.nodes || []).forEach(n => { html += `<div class="preview-node">✓ <b>${esc(n.name)}</b> — ${esc(n.server)}:${esc(n.port)}${n.obfs ? ' · 混淆' : ''}${n.skip_cert_verify ? ' · 跳过证书' : ''}</div>`; });
   (r.errors || []).forEach(e => { html += `<div class="preview-node" style="color:var(--warn)">${esc(e)}</div>`; });
   box.innerHTML = html || '<p class="muted">无结果</p>';
 }
 async function commitNodes() {
   const r = await api('POST', '/api/nodes', { text: el('add-text').value });
+  if (!r.ok) { toast('添加失败：' + (r.error || ''), 'err'); return; }
   closeModal();
   await loadState();
-  toast(`已添加 ${(r.added || []).length} 个节点，记得“应用配置”`, 'ok');
+  const errs = (r.errors || []).length;
+  toast(`已添加 ${(r.added || []).length} 个节点${errs ? `（${errs} 行无法解析）` : ''}，记得“应用配置”`, 'ok');
 }
 
 // 编辑节点
@@ -161,7 +205,7 @@ const NODE_FIELDS = [
   ['password', '密码', 'text'], ['sni', 'SNI', 'text'], ['ports', '端口跳跃(如 443-9000)', 'text'],
   ['obfs', '混淆(salamander 或空)', 'text'], ['obfs_password', '混淆密码', 'text'],
   ['up', '上行(留空用默认)', 'text'], ['down', '下行(留空用默认)', 'text'],
-  ['fingerprint', '证书指纹(pinSHA256)', 'text'],
+  ['fingerprint', '证书指纹(64位hex,可空)', 'text'],
 ];
 function editNode(id) {
   const n = STATE.nodes.find(x => x.id === id); if (!n) return;
@@ -187,8 +231,9 @@ async function saveNode(id) {
   });
   patch.skip_cert_verify = el('ed-skip').checked;
   patch.fast_open = el('ed-fopen').checked;
-  await api('PUT', '/api/nodes/' + id, patch);
-  closeModal(); await loadState(); toast('已保存，记得“应用配置”', 'ok');
+  const r = await api('PUT', '/api/nodes/' + id, patch);
+  closeModal(); await loadState();
+  done(r, '已保存，记得“应用配置”');
 }
 function closeModal() { el('modal').classList.add('hidden'); }
 
@@ -215,29 +260,36 @@ function enableDragOrder() {
 const RULE_TYPES = [['auto', '自动判别'], ['domain-suffix', '域名后缀'], ['domain', '精确域名'],
   ['domain-keyword', '关键词'], ['domain-wildcard', '通配符'], ['ip-cidr', 'IP段'], ['geoip', 'GEOIP'], ['geosite', 'GEOSITE']];
 
+// 与服务端 config_gen.classify_rule 保持一致，确保“生成规则”预览即最终结果
+function isIPv4(v) { const p = v.split('/')[0].split('.'); return p.length === 4 && p.every(o => /^\d+$/.test(o) && +o <= 255); }
+function isIPv6(v) { const h = v.split('/')[0]; return h.includes(':') && /^[0-9a-fA-F:]+$/.test(h); }
 function classifyRule(value, rtype) {
   value = (value || '').trim(); rtype = (rtype || 'auto').toLowerCase();
-  const map = { domain: 'DOMAIN', 'domain-suffix': 'DOMAIN-SUFFIX', 'domain-keyword': 'DOMAIN-KEYWORD', 'domain-wildcard': 'DOMAIN-WILDCARD', 'ip-cidr': 'IP-CIDR', geoip: 'GEOIP', geosite: 'GEOSITE' };
-  const isV4 = /^\d{1,3}(\.\d{1,3}){3}(\/\d+)?$/.test(value);
-  const isV6 = value.includes(':');
-  if (rtype !== 'auto') {
-    let kind = map[rtype] || 'DOMAIN-SUFFIX';
-    if (kind === 'IP-CIDR' && !value.includes('/')) value += isV6 ? '/128' : '/32';
+  const map = { domain: 'DOMAIN', 'domain-suffix': 'DOMAIN-SUFFIX', suffix: 'DOMAIN-SUFFIX', 'domain-keyword': 'DOMAIN-KEYWORD', keyword: 'DOMAIN-KEYWORD', 'domain-wildcard': 'DOMAIN-WILDCARD', wildcard: 'DOMAIN-WILDCARD', 'ip-cidr': 'IP-CIDR', ip: 'IP-CIDR', geoip: 'GEOIP', geosite: 'GEOSITE', 'process-name': 'PROCESS-NAME' };
+  if (rtype !== 'auto' && map[rtype]) {       // 已知显式类型
+    let kind = map[rtype];
+    if (kind === 'IP-CIDR' && !value.includes('/')) value += isIPv6(value) ? '/128' : '/32';
     return [kind, value];
   }
-  if (isV4 || isV6) { if (!value.includes('/')) value += isV6 ? '/128' : '/32'; return ['IP-CIDR', value]; }
+  // auto（未知显式类型也回退到此，和服务端一致）
+  if (isIPv4(value) || isIPv6(value)) { if (!value.includes('/')) value += isIPv6(value) ? '/128' : '/32'; return ['IP-CIDR', value]; }
   if (value.startsWith('*.')) return ['DOMAIN-SUFFIX', value.slice(2)];
   if (value.includes('*') || value.includes('?')) return ['DOMAIN-WILDCARD', value];
   if (value.startsWith('.')) return ['DOMAIN-SUFFIX', value.slice(1)];
   if (value.includes('.')) return ['DOMAIN-SUFFIX', value];
   return ['DOMAIN-KEYWORD', value];
 }
+function genRule(r) {
+  if (!(r.value || '').trim()) return '';
+  const [kind, val] = classifyRule(r.value, r.type);
+  const policy = (r.policy || 'PROXY').toUpperCase();
+  return `${kind},${val},${policy}${kind === 'IP-CIDR' ? ',no-resolve' : ''}`;
+}
 
 function ruleRowHtml(r, i) {
   const typeOpts = RULE_TYPES.map(([v, t]) => `<option value="${v}" ${r.type === v ? 'selected' : ''}>${t}</option>`).join('');
-  const [kind, val] = classifyRule(r.value, r.type);
   const policy = (r.policy || 'PROXY').toUpperCase();
-  const gen = r.value ? `${kind},${val},${policy}` : '';
+  const gen = genRule(r);
   return `<div class="rule-row" data-i="${i}">
     <input value="${esc(r.value)}" oninput="ruleEdited(${i},'value',this.value)" placeholder="*.cn / github.com / 1.2.3.0/24">
     <select onchange="ruleEdited(${i},'type',this.value)">${typeOpts}</select>
@@ -256,17 +308,19 @@ function renderRules() {
 }
 function ruleEdited(i, key, val) {
   STATE.rules[i][key] = val;
+  rulesDirty = true;
   // 仅刷新该行的“生成规则”预览，避免输入时光标丢失
   const row = el('rule-list').querySelector(`.rule-row[data-i="${i}"] .gen`);
-  if (row) { const [k, v] = classifyRule(STATE.rules[i].value, STATE.rules[i].type); row.textContent = STATE.rules[i].value ? `${k},${v},${(STATE.rules[i].policy || 'PROXY').toUpperCase()}` : ''; }
+  if (row) row.textContent = genRule(STATE.rules[i]);
 }
-function addRuleRow() { STATE.rules.push({ value: '', type: 'auto', policy: 'PROXY' }); renderRules(); }
-function delRule(i) { STATE.rules.splice(i, 1); renderRules(); }
+function addRuleRow() { STATE.rules.push({ value: '', type: 'auto', policy: 'PROXY' }); rulesDirty = true; renderRules(); }
+function delRule(i) { STATE.rules.splice(i, 1); rulesDirty = true; renderRules(); }
 async function saveRules() {
   const rules = STATE.rules.filter(r => (r.value || '').trim());
-  await api('PUT', '/api/rules', { rules });
-  await api('PUT', '/api/settings', { settings: { final: el('final-policy').value } });
-  toast('路由已保存，记得“应用配置”', 'ok');
+  const r1 = await api('PUT', '/api/rules', { rules });
+  const r2 = await api('PUT', '/api/settings', { settings: { final: el('final-policy').value } });
+  if (r1.ok && r2.ok) { rulesDirty = false; toast('路由已保存，记得“应用配置”', 'ok'); }
+  else toast('保存失败：' + ((r1.error || r2.error) || ''), 'err');
 }
 
 // ----------------------------------------------------------------- 设置
@@ -283,8 +337,11 @@ function renderSettings() {
   el('set-dnscn').value = (s.dns_china || []).join('\n');
   el('set-mirror').value = s.github_mirror || '';
   el('set-ctrl').value = s.external_controller || '';
-  el('web-port').value = STATE.webui.port || 8088;
-  el('web-bind').value = STATE.webui.bind || '0.0.0.0';
+  el('web-port').value = (STATE.webui || {}).port || 8088;
+  el('web-bind').value = (STATE.webui || {}).bind || '0.0.0.0';
+  el('web-pw').value = '';
+  const hint = el('web-pw-hint');
+  if (hint) hint.textContent = (STATE.webui || {}).has_password ? '当前已设密码' : '当前未设密码（仅本机可访问）';
 }
 async function saveSettings() {
   const lines = v => v.split('\n').map(x => x.trim()).filter(Boolean);
@@ -301,16 +358,21 @@ async function saveSettings() {
     github_mirror: el('set-mirror').value.trim(),
     external_controller: el('set-ctrl').value.trim(),
   };
-  await api('PUT', '/api/settings', { settings });
+  const r = await api('PUT', '/api/settings', { settings });
+  if (!done(r, '设置已保存，记得“应用配置”')) return;
   await loadState();
-  toast('设置已保存，记得“应用配置”', 'ok');
 }
 async function saveWebui() {
   const body = { port: parseInt(el('web-port').value) || 8088, bind: el('web-bind').value.trim() };
   const pw = el('web-pw').value;
-  if (pw !== '') body.password = pw;
-  await api('PUT', '/api/webui', body);
-  toast('面板设置已保存（端口/地址改动需重启面板服务）', 'ok');
+  if (el('web-pw-clear').checked) body.password = '';   // 勾选=取消密码
+  else if (pw !== '') body.password = pw;                // 否则非空才修改
+  const r = await api('PUT', '/api/webui', body);
+  if (done(r, '面板设置已保存（端口/地址改动需重启面板服务）')) { el('web-pw').value = ''; el('web-pw-clear').checked = false; await loadState(); }
+}
+async function logout() {
+  await api('POST', '/api/logout').catch(() => {});
+  TOKEN = ''; localStorage.removeItem('pihy2_token'); showLogin();
 }
 
 // ----------------------------------------------------------------- 工具
@@ -324,8 +386,13 @@ async function exportLinks() {
 }
 async function serviceAction(action) {
   if (action !== 'restart' && !confirm(`确定 ${action} mihomo 服务？`)) return;
-  await api('POST', '/api/service', { action });
-  toast('已执行 ' + action, 'ok'); setTimeout(refreshStatus, 1200);
+  const r = await api('POST', '/api/service', { action });
+  if (done(r, '已执行 ' + action)) setTimeout(refreshStatus, 1200);
 }
+
+// 离开页面时若有未保存的路由修改则提醒
+window.addEventListener('beforeunload', (e) => {
+  if (rulesDirty) { e.preventDefault(); e.returnValue = ''; }
+});
 
 window.addEventListener('DOMContentLoaded', boot);

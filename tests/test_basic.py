@@ -84,6 +84,17 @@ try:
 except parser.ParseError:
     check("非 hy2 报错", True)
 
+# 8. 安全回归：pinSHA256 不能污染 fingerprint（base64 公钥固定会让 mihomo 启动失败）
+pin = parser.parse_link("hysteria2://pw@h.com:443?pinSHA256=sha256%2FAAAA%3D%3D#x")
+check("base64 pin 不进 fingerprint", pin["fingerprint"] == "" and pin["pin_sha256"].startswith("sha256/"))
+hexpin = parser.parse_link("hysteria2://pw@h.com:443?pinSHA256="
+                           "47de42a98fc1c149afbf4c89996fb9249cee41e4649b934ca495991b7852b855#x")
+check("hex 指纹保留为 fingerprint", len(hexpin["fingerprint"]) == 64 and hexpin["pin_sha256"] == "")
+
+# 9. 安全回归：query 形式密码里的 '+' 不被吃成空格
+qp = parser.parse_link("hysteria2://h.com:443?auth=AB%2BCD#x")
+check("query 密码 + 不丢", qp["password"] == "AB+CD", qp["password"])
+
 
 print("== 规则判别 ==")
 cases = [
@@ -103,11 +114,12 @@ for (val, typ), expect in cases:
 
 print("== 配置生成 ==")
 nodes = [n, n2]
+# 刻意不放 GEOIP/GEOSITE，保证 mihomo -t 离线也能过（不触发地理库下载）
 rules = [
     {"value": "*.cn", "policy": "DIRECT", "type": "auto"},
     {"value": "baidu.com", "policy": "DIRECT", "type": "auto"},
     {"value": "openai.com", "policy": "PROXY", "type": "auto"},
-    {"value": "CN", "policy": "DIRECT", "type": "geoip"},
+    {"value": "1.2.3.0/24", "policy": "DIRECT", "type": "auto"},
 ]
 settings = dict(config_gen.DEFAULT_SETTINGS)
 settings["secret"] = "testsecret"
@@ -118,6 +130,15 @@ check("含 AUTO 测速组（多节点）", '"AUTO"' in text)
 check("私有网段安全直连在前", text.index("192.168.0.0/16") < text.index("openai.com"))
 check("密码被正确引号包裹", '"REDACTED"' in text)
 check("中文节点名保留", "某地区" in text)
+
+# 非 hex 的 fingerprint 必须被丢弃（否则 mihomo 启动报错）
+bad_fp_node = dict(n); bad_fp_node["fingerprint"] = "sha256/AAAA=="
+check("非 hex fingerprint 被丢弃", "fingerprint" not in config_gen.render([bad_fp_node], [], settings))
+
+# 默认规则不含 GEOIP/GEOSITE（首次部署不依赖联网下载地理库）
+from pihy2.store import DEFAULT_RULES
+check("默认规则不依赖地理库",
+      all(r["type"] not in ("geoip", "geosite") for r in DEFAULT_RULES))
 
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")

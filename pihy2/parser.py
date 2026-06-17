@@ -31,6 +31,30 @@ def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _normalize_fingerprint(v: str) -> str:
+    """把证书指纹规范化为 mihomo 期望的 64 位小写 hex；不是 hex 则返回 ""。
+
+    注意：分享链接里的 pinSHA256 通常是 ``sha256/<base64>`` 形式的“公钥固定”，
+    与 mihomo 的 ``fingerprint``（证书的 hex SHA-256）是两种不同机制，不能混用，
+    否则 mihomo 启动直接报 ``fingerprint string decode error`` 导致整条配置失效。
+    """
+    s = v.strip().replace(":", "").lower()
+    if len(s) == 64 and all(c in "0123456789abcdef" for c in s):
+        return s
+    return ""
+
+
+def _raw_query(query: str, *keys: str) -> str:
+    """从原始 query 串里取参数值，用 unquote（而非 parse_qs 的 unquote_plus），
+    避免密码里的 '+' 被误解成空格。"""
+    wanted = {k.lower() for k in keys}
+    for pair in query.split("&"):
+        k, _, val = pair.partition("=")
+        if k.lower() in wanted and val != "":
+            return unquote(val)
+    return ""
+
+
 def _first(qs: dict, *keys: str, default: str = "") -> str:
     """从 parse_qs 结果里按多个候选键（忽略大小写）取第一个非空值。"""
     lowered = {k.lower(): v for k, v in qs.items()}
@@ -88,8 +112,8 @@ def parse_link(link: str) -> dict:
 
     qs = parse_qs(sr.query, keep_blank_values=True)
 
-    # 密码：优先 userinfo，其次 query 里的 auth/password
-    password = unquote(userinfo) if userinfo else _first(qs, "auth", "password")
+    # 密码：优先 userinfo（已 unquote），其次 query 里的 auth/password（用 unquote 取原始值）
+    password = unquote(userinfo) if userinfo else _raw_query(sr.query, "auth", "password")
     if not password:
         raise ParseError("缺少密码")
 
@@ -107,6 +131,12 @@ def parse_link(link: str) -> dict:
         # 未知混淆类型，保留原值让用户在面板里确认（mihomo -t 会校验）
         pass
 
+    # 证书指纹/公钥固定：链接里的 pinSHA256 多为 sha256/<base64> 公钥固定，
+    # mihomo 的 fingerprint 只接受 hex 证书指纹。仅当确实是 hex 时才用作 fingerprint，
+    # 其余原样保存在 pin_sha256（仅作展示/导出，不下发给 mihomo）以免启动失败。
+    pin_raw = _first(qs, "pinSHA256", "pinsha256").strip()
+    fingerprint = _normalize_fingerprint(pin_raw)
+
     node = {
         "name": unquote(sr.fragment).strip() if sr.fragment else host,
         "type": "hysteria2",
@@ -121,7 +151,8 @@ def parse_link(link: str) -> dict:
         "obfs_password": obfs_password,
         "up": _first(qs, "up", "upmbps").strip(),       # "" 表示用全局默认
         "down": _first(qs, "down", "downmbps").strip(),
-        "fingerprint": _first(qs, "pinSHA256", "pinsha256").strip(),  # 证书指纹固定
+        "fingerprint": fingerprint,                     # 仅 hex 证书指纹
+        "pin_sha256": "" if fingerprint else pin_raw,   # 无法被 mihomo 使用的公钥固定，仅保留
         "fast_open": _truthy(_first(qs, "fastopen", default="0")),
     }
     return node
@@ -198,7 +229,10 @@ def node_to_link(node: dict) -> str:
         params["up"] = node["up"]
     if node.get("down"):
         params["down"] = node["down"]
-    if node.get("fingerprint"):
+    # 优先导出原始公钥固定；否则导出 hex 证书指纹
+    if node.get("pin_sha256"):
+        params["pinSHA256"] = node["pin_sha256"]
+    elif node.get("fingerprint"):
         params["pinSHA256"] = node["fingerprint"]
     if node.get("fast_open"):
         params["fastopen"] = "1"
