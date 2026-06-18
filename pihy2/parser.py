@@ -378,7 +378,7 @@ def _maybe_base64_decode(text: str) -> str | None:
             decoded = base64.b64decode(padded).decode("utf-8", "ignore")
         except (binascii.Error, ValueError):
             continue
-        if "://" in decoded:
+        if "://" in decoded or "proxies:" in decoded:   # base64 的链接列表或 Clash YAML
             return decoded
     return None
 
@@ -394,6 +394,12 @@ def parse_many(text: str) -> tuple[list[dict], list[str]]:
     decoded = _maybe_base64_decode(text)
     if decoded is not None:
         text = decoded
+
+    # 没有任何 scheme 链接、但像 Clash/mihomo YAML 订阅 -> 走 YAML 解析
+    has_link = any("://" in ln and ln.strip().split("://", 1)[0].lower() in _PARSERS
+                   for ln in text.splitlines())
+    if not has_link and "proxies:" in text:
+        return parse_clash_yaml(text)
 
     nodes: list[dict] = []
     errors: list[str] = []
@@ -412,6 +418,96 @@ def parse_many(text: str) -> tuple[list[dict], list[str]]:
             errors.append(f"解析异常：{e} —— {line[:40]}")
     if not nodes and not errors:
         errors.append("未发现可用的节点链接")
+    return nodes, errors
+
+
+# ---------------------------------------------------------------- Clash YAML
+# mihomo 代理字段 -> 内部节点字段（其余按传输/特殊逻辑单独处理）
+_MIHOMO_FIELD_MAP = {
+    "password": "password", "uuid": "uuid", "cipher": "cipher",
+    "alterId": "alter_id", "flow": "flow", "client-fingerprint": "client_fingerprint",
+    "fingerprint": "fingerprint", "obfs": "obfs", "obfs-password": "obfs_password",
+    "up": "up", "down": "down", "ports": "ports", "plugin": "plugin",
+    "congestion-controller": "congestion", "udp-relay-mode": "udp_relay_mode",
+}
+_SUPPORTED_TYPES = {"hysteria2", "vless", "vmess", "trojan", "ss", "tuic"}
+
+
+def proxy_to_node(p: dict) -> dict:
+    """把一条 mihomo proxies 条目转成内部节点字典。不支持的类型抛 ParseError。"""
+    t = str(p.get("type", "")).lower()
+    t = {"hy2": "hysteria2", "shadowsocks": "ss"}.get(t, t)
+    if t not in _SUPPORTED_TYPES:
+        raise ParseError(f"暂不支持的协议类型：{t or '空'}")
+    server = str(p.get("server", "")).strip()
+    if not server:
+        raise ParseError("缺少服务器地址")
+    node = _base_node(str(p.get("name") or server), t, server, _int(p.get("port"), 443))
+
+    for src, dst in _MIHOMO_FIELD_MAP.items():
+        if p.get(src) not in (None, ""):
+            node[dst] = p[src]
+    if "skip-cert-verify" in p:
+        node["skip_cert_verify"] = bool(p["skip-cert-verify"])
+    if p.get("tls"):
+        node["tls"] = True
+    if p.get("fast-open"):
+        node["fast_open"] = True
+    if "sni" not in node:
+        sni = p.get("sni") or p.get("servername")
+        if sni:
+            node["sni"] = sni
+    alpn = p.get("alpn")
+    if isinstance(alpn, list):
+        node["alpn"] = [str(a) for a in alpn]
+    elif isinstance(alpn, str):
+        node["alpn"] = _alpn(alpn)
+    ro = p.get("reality-opts")
+    if isinstance(ro, dict):
+        node["reality_pbk"] = ro.get("public-key", "")
+        node["reality_sid"] = ro.get("short-id", "")
+        node["tls"] = True
+    net = str(p.get("network", "")).lower()
+    if net in ("ws", "grpc", "httpupgrade"):
+        node["network"] = net
+        ws = p.get("ws-opts")
+        if isinstance(ws, dict):
+            node["ws_path"] = ws.get("path", "/")
+            h = ws.get("headers")
+            if isinstance(h, dict):
+                node["ws_host"] = h.get("Host") or h.get("host") or ""
+        g = p.get("grpc-opts")
+        if isinstance(g, dict):
+            node["grpc_service_name"] = g.get("grpc-service-name", "")
+    po = p.get("plugin-opts")
+    if isinstance(po, dict):
+        node["plugin_opts"] = dict(po)
+    if t in ("vless", "vmess", "tuic") and not node.get("uuid"):
+        raise ParseError(f"{t} 缺少 UUID")
+    return node
+
+
+def parse_clash_yaml(text: str) -> tuple[list[dict], list[str]]:
+    """解析 Clash/mihomo YAML 订阅的 proxies 段。返回 (节点列表, 错误列表)。"""
+    from . import yaml_lite
+    try:
+        doc = yaml_lite.load(text)
+    except yaml_lite.YamlError as e:
+        return [], [f"YAML 解析失败：{e}"]
+    if not isinstance(doc, dict) or not isinstance(doc.get("proxies"), list):
+        return [], ["未找到 proxies 段（不是 Clash 订阅？）"]
+    nodes, errors = [], []
+    for p in doc["proxies"]:
+        if not isinstance(p, dict):
+            continue
+        try:
+            nodes.append(proxy_to_node(p))
+        except ParseError as e:
+            errors.append(f"跳过：{e} —— {p.get('name', '?')}")
+        except Exception as e:
+            errors.append(f"跳过（异常 {e}）：{p.get('name', '?')}")
+    if not nodes and not errors:
+        errors.append("proxies 段为空")
     return nodes, errors
 
 
