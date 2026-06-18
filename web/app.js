@@ -111,7 +111,9 @@ function renderNodes() {
   if (!STATE.nodes.length) { list.innerHTML = '<p class="muted">还没有节点，点击右上角“添加节点”，把 hy2 链接粘贴进去即可。</p>'; return; }
   list.innerHTML = STATE.nodes.map(n => {
     const active = n.id === STATE.active;
-    const tags = [];
+    const tags = [esc((n.type || 'hysteria2').toUpperCase())];
+    if (n.network && n.network !== 'tcp') tags.push(esc(n.network));
+    if (n.reality_pbk) tags.push('reality');
     if (n.obfs) tags.push('混淆:' + esc(n.obfs));
     if (n.ports) tags.push('端口跳跃:' + esc(n.ports));
     if (n.skip_cert_verify) tags.push('跳过证书校验');
@@ -172,8 +174,9 @@ async function testDelays() {
 function openAddNodes() {
   el('modal-card').innerHTML = `
     <h3>添加节点</h3>
-    <p class="muted small">粘贴一个或多个 hy2 链接（每行一个），或 base64 订阅内容。</p>
-    <textarea id="add-text" rows="6" placeholder="hysteria2://...&#10;hy2://..."></textarea>
+    <p class="muted small">粘贴一个或多个分享链接（每行一个），或 base64 订阅内容。<br>
+      支持 hysteria2 / vless / vmess / trojan / ss / tuic。</p>
+    <textarea id="add-text" rows="6" placeholder="hysteria2://...&#10;vless://...&#10;vmess://...&#10;trojan://..."></textarea>
     <div class="bar" style="margin-top:8px"><button class="btn" onclick="previewNodes()">解析预览</button></div>
     <div id="add-preview"></div>
     <div class="modal-actions">
@@ -199,23 +202,32 @@ async function commitNodes() {
   toast(`已添加 ${(r.added || []).length} 个节点${errs ? `（${errs} 行无法解析）` : ''}，记得“应用配置”`, 'ok');
 }
 
-// 编辑节点
-const NODE_FIELDS = [
-  ['name', '名称', 'text'], ['server', '服务器', 'text'], ['port', '端口', 'number'],
-  ['password', '密码', 'text'], ['sni', 'SNI', 'text'], ['ports', '端口跳跃(如 443-9000)', 'text'],
-  ['obfs', '混淆(salamander 或空)', 'text'], ['obfs_password', '混淆密码', 'text'],
-  ['up', '上行(留空用默认)', 'text'], ['down', '下行(留空用默认)', 'text'],
-  ['fingerprint', '证书指纹(64位hex,可空)', 'text'],
-];
+// 编辑节点：按协议显示对应字段
+const COMMON = [['name', '名称'], ['server', '服务器'], ['port', '端口', 'number']];
+const NET = [['network', '传输(tcp/ws/grpc)'], ['ws_path', 'ws 路径'], ['ws_host', 'ws Host'], ['grpc_service_name', 'grpc 服务名']];
+const FIELDS_BY_TYPE = {
+  hysteria2: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['ports', '端口跳跃(如 443-9000)'],
+    ['obfs', '混淆(salamander/空)'], ['obfs_password', '混淆密码'], ['up', '上行(留空默认)'], ['down', '下行(留空默认)'], ['fingerprint', '证书指纹(64位hex)']],
+  vless: [...COMMON, ['uuid', 'UUID'], ['sni', 'SNI'], ['flow', 'flow'], ['client_fingerprint', '指纹(chrome..)'],
+    ['reality_pbk', 'reality 公钥'], ['reality_sid', 'reality shortId'], ...NET],
+  vmess: [...COMMON, ['uuid', 'UUID'], ['alter_id', 'alterId', 'number'], ['cipher', '加密(auto..)'], ['sni', 'SNI'], ...NET],
+  trojan: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['client_fingerprint', '指纹'], ...NET],
+  ss: [...COMMON, ['cipher', '加密方式'], ['password', '密码']],
+  tuic: [...COMMON, ['uuid', 'UUID'], ['password', '密码'], ['sni', 'SNI'], ['congestion', '拥塞控制(bbr)'], ['udp_relay_mode', 'UDP中继(native)']],
+};
+const TLS_TYPES = ['vless', 'vmess', 'trojan'];
 function editNode(id) {
   const n = STATE.nodes.find(x => x.id === id); if (!n) return;
-  const fields = NODE_FIELDS.map(([k, label, type]) =>
-    `<label>${label}<input data-k="${k}" type="${type}" value="${esc(n[k] != null ? n[k] : '')}"></label>`).join('');
+  const type = n.type || 'hysteria2';
+  const fields = (FIELDS_BY_TYPE[type] || FIELDS_BY_TYPE.hysteria2).map(([k, label, t]) =>
+    `<label>${label}<input data-k="${k}" type="${t || 'text'}" value="${esc(n[k] != null ? n[k] : '')}"></label>`).join('');
+  const tlsBox = TLS_TYPES.includes(type) ? `<label class="row"><input id="ed-tls" type="checkbox" ${n.tls ? 'checked' : ''}> 启用 TLS</label>` : '';
+  const fopenBox = type === 'hysteria2' ? `<label class="row"><input id="ed-fopen" type="checkbox" ${n.fast_open ? 'checked' : ''}> fast-open</label>` : '';
   el('modal-card').innerHTML = `
-    <h3>编辑节点</h3>
+    <h3>编辑节点 <span class="muted small">${esc(type.toUpperCase())}</span></h3>
     <div class="grid">${fields}</div>
     <label class="row"><input id="ed-skip" type="checkbox" ${n.skip_cert_verify ? 'checked' : ''}> 跳过证书校验 (insecure)</label>
-    <label class="row"><input id="ed-fopen" type="checkbox" ${n.fast_open ? 'checked' : ''}> fast-open</label>
+    ${tlsBox}${fopenBox}
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">取消</button>
       <button class="btn primary" onclick="saveNode('${id}')">保存</button>
@@ -226,11 +238,12 @@ async function saveNode(id) {
   const patch = {};
   el('modal-card').querySelectorAll('input[data-k]').forEach(i => {
     let v = i.value;
-    if (i.dataset.k === 'port') v = parseInt(v) || 443;
+    if (i.dataset.k === 'port' || i.dataset.k === 'alter_id') v = parseInt(v) || (i.dataset.k === 'port' ? 443 : 0);
     patch[i.dataset.k] = v;
   });
   patch.skip_cert_verify = el('ed-skip').checked;
-  patch.fast_open = el('ed-fopen').checked;
+  if (el('ed-tls')) patch.tls = el('ed-tls').checked;
+  if (el('ed-fopen')) patch.fast_open = el('ed-fopen').checked;
   const r = await api('PUT', '/api/nodes/' + id, patch);
   closeModal(); await loadState();
   done(r, '已保存，记得“应用配置”');

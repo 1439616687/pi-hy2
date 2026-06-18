@@ -155,14 +155,25 @@ def rule_to_mihomo(rule: dict) -> str:
 
 
 # ---------------------------------------------------------------- 节点 -> proxy
-def node_to_proxy(node: dict, settings: dict) -> dict:
-    """节点字典 -> mihomo proxies 条目。"""
+def _apply_transport(p: dict, node: dict):
+    """把 ws/grpc 等传输层字段写进 mihomo proxy。"""
+    net = node.get("network")
+    if net in ("ws", "grpc", "h2", "http", "httpupgrade"):
+        p["network"] = net
+    if net == "ws":
+        ws = {"path": node.get("ws_path") or "/"}
+        if node.get("ws_host"):
+            ws["headers"] = {"Host": node["ws_host"]}
+        p["ws-opts"] = ws
+    elif net == "grpc" and node.get("grpc_service_name"):
+        p["grpc-opts"] = {"grpc-service-name": node["grpc_service_name"]}
+
+
+def _proxy_hysteria2(node: dict, settings: dict) -> dict:
     p = {
-        "name": node["name"],
-        "type": "hysteria2",
-        "server": node["server"],
-        "port": int(node["port"]),
-        "password": str(node["password"]),
+        "name": node["name"], "type": "hysteria2",
+        "server": node["server"], "port": int(node["port"]),
+        "password": str(node.get("password", "")),
         "sni": node.get("sni") or node["server"],
         "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
         "alpn": node.get("alpn") or ["h3"],
@@ -175,13 +186,111 @@ def node_to_proxy(node: dict, settings: dict) -> dict:
         p["obfs"] = node["obfs"]
         if node.get("obfs_password"):
             p["obfs-password"] = node["obfs_password"]
-    # fingerprint 必须是 hex 证书指纹，否则 mihomo 启动报错；非 hex 一律丢弃
     fp = str(node.get("fingerprint", "")).replace(":", "").lower()
     if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp):
         p["fingerprint"] = fp
     if node.get("fast_open"):
         p["fast-open"] = True
     return p
+
+
+def _proxy_vless(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "vless",
+        "server": node["server"], "port": int(node["port"]),
+        "uuid": str(node.get("uuid", "")), "udp": True,
+        "tls": bool(node.get("tls", False)),
+    }
+    if node.get("flow"):
+        p["flow"] = node["flow"]
+    if node.get("sni"):
+        p["servername"] = node["sni"]
+    if node.get("alpn"):
+        p["alpn"] = node["alpn"]
+    if node.get("client_fingerprint"):
+        p["client-fingerprint"] = node["client_fingerprint"]
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    if node.get("reality_pbk"):
+        p["reality-opts"] = {"public-key": node["reality_pbk"],
+                             "short-id": node.get("reality_sid", "")}
+    _apply_transport(p, node)
+    return p
+
+
+def _proxy_vmess(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "vmess",
+        "server": node["server"], "port": int(node["port"]),
+        "uuid": str(node.get("uuid", "")), "alterId": int(node.get("alter_id", 0)),
+        "cipher": node.get("cipher") or "auto", "udp": True,
+        "tls": bool(node.get("tls", False)),
+    }
+    if node.get("sni"):
+        p["servername"] = node["sni"]
+    if node.get("alpn"):
+        p["alpn"] = node["alpn"]
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    _apply_transport(p, node)
+    return p
+
+
+def _proxy_trojan(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "trojan",
+        "server": node["server"], "port": int(node["port"]),
+        "password": str(node.get("password", "")), "udp": True,
+        "sni": node.get("sni") or node["server"],
+        "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
+    }
+    if node.get("alpn"):
+        p["alpn"] = node["alpn"]
+    if node.get("client_fingerprint"):
+        p["client-fingerprint"] = node["client_fingerprint"]
+    _apply_transport(p, node)
+    return p
+
+
+def _proxy_ss(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "ss",
+        "server": node["server"], "port": int(node["port"]),
+        "cipher": node.get("cipher") or "aes-256-gcm",
+        "password": str(node.get("password", "")), "udp": True,
+    }
+    if node.get("plugin"):
+        p["plugin"] = node["plugin"]
+        if node.get("plugin_opts"):
+            p["plugin-opts"] = node["plugin_opts"]
+    return p
+
+
+def _proxy_tuic(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "tuic",
+        "server": node["server"], "port": int(node["port"]),
+        "uuid": str(node.get("uuid", "")), "password": str(node.get("password", "")),
+        "sni": node.get("sni") or node["server"],
+        "alpn": node.get("alpn") or ["h3"],
+        "congestion-controller": node.get("congestion") or "bbr",
+        "udp-relay-mode": node.get("udp_relay_mode") or "native",
+        "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
+    }
+    return p
+
+
+_PROXY_BUILDERS = {
+    "hysteria2": _proxy_hysteria2, "vless": _proxy_vless, "vmess": _proxy_vmess,
+    "trojan": _proxy_trojan, "ss": _proxy_ss, "tuic": _proxy_tuic,
+}
+
+
+def node_to_proxy(node: dict, settings: dict) -> dict:
+    """节点字典 -> mihomo proxies 条目（按协议分发）。"""
+    builder = _PROXY_BUILDERS.get(node.get("type", "hysteria2"), _proxy_hysteria2)
+    return builder(node, settings)
+
 
 
 def _dedup_names(nodes: list[dict]) -> list[dict]:

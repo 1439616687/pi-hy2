@@ -96,6 +96,34 @@ qp = parser.parse_link("hysteria2://h.com:443?auth=AB%2BCD#x")
 check("query 密码 + 不丢", qp["password"] == "AB+CD", qp["password"])
 
 
+print("== 多协议解析 ==")
+import base64 as _b
+_uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+proto_links = {
+    "vless": (f"vless://{_uuid}@v.com:443?security=tls&type=ws&sni=v.com&path=%2Fws&host=v.com#V", "vless"),
+    "vmess": ("vmess://" + _b.b64encode(
+        b'{"v":"2","ps":"M","add":"m.com","port":"443","id":"' + _uuid.encode()
+        + b'","aid":"0","net":"ws","path":"/p","tls":"tls"}').decode(), "vmess"),
+    "trojan": ("trojan://tjpw@t.com:443?sni=t.com#T", "trojan"),
+    "ss": ("ss://" + _b.b64encode(b"aes-256-gcm:sspw").decode() + "@s.com:8388#S", "ss"),
+    "tuic": ("tuic://uu:pw@u.com:443?sni=u.com&alpn=h3#U", "tuic"),
+}
+proto_nodes = []
+for label, (lnk, exp_type) in proto_links.items():
+    nd = parser.parse_link(lnk)
+    proto_nodes.append(nd)
+    check(f"{label} 解析", nd["type"] == exp_type and nd["server"].endswith(".com"), str(nd.get("type")))
+check("vless 解析出 ws 传输与 UUID", proto_nodes[0]["network"] == "ws" and proto_nodes[0]["uuid"] == _uuid)
+check("vmess 解析出 UUID/网络", proto_nodes[1]["uuid"] == _uuid and proto_nodes[1]["network"] == "ws")
+check("ss 解析出 cipher/password", proto_nodes[3]["cipher"] == "aes-256-gcm" and proto_nodes[3]["password"] == "sspw")
+# round-trip 导出不崩、凭据保留
+for nd in proto_nodes:
+    back = parser.parse_link(parser.node_to_link(nd))
+    cred_a = nd.get("password") or nd.get("uuid")
+    cred_b = back.get("password") or back.get("uuid")
+    check(f"{nd['type']} round-trip 凭据", cred_a == cred_b and back["server"] == nd["server"])
+
+
 print("== 规则判别 ==")
 cases = [
     (("*.cn", "auto"), ("DOMAIN-SUFFIX", "cn")),
@@ -157,7 +185,12 @@ if mihomo and os.path.exists(mihomo):
     d0 = tempfile.mkdtemp(prefix="pihy2-test0-")
     with open(os.path.join(d0, "config.yaml"), "w") as f:
         f.write(text0)
-    for label, folder in (("多节点", d), ("单节点", d1), ("零节点", d0)):
+    # 多协议混合（vless/vmess/trojan/ss/tuic + hy2）
+    textp = config_gen.render([n] + proto_nodes, [], settings)
+    dp = tempfile.mkdtemp(prefix="pihy2-testp-")
+    with open(os.path.join(dp, "config.yaml"), "w") as f:
+        f.write(textp)
+    for label, folder in (("多节点", d), ("单节点", d1), ("零节点", d0), ("多协议混合", dp)):
         r = subprocess.run([mihomo, "-d", folder, "-t"], capture_output=True, text=True)
         ok = r.returncode == 0 and "test is successful" in (r.stdout + r.stderr)
         check(f"{label}配置通过 mihomo -t", ok, (r.stdout + r.stderr).strip()[-300:])
