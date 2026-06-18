@@ -31,14 +31,15 @@ def check(name, cond, detail=""):
 print("== 解析器 ==")
 
 # 1. 标准链接：密码含 %2F、带 sni 与 fragment
+# 1. 标准链接：密码含 %2F、带 sni 与 fragment（均为示例假数据）
 n = parser.parse_link(
-    "hysteria2://REDACTED@your-node.example.com:443/"
-    "?sni=your-node.example.com#%E4%BF%9D%E5%8A%A0%E5%88%A9%E4%BA%9A"
+    "hysteria2://Dm9xQ2%2FkF7wZ%2Fp8@node.example.com:443/"
+    "?sni=node.example.com#%E6%B5%8B%E8%AF%95%E8%8A%82%E7%82%B9"
 )
-check("scheme/host/port", n["server"] == "your-node.example.com" and n["port"] == 443)
-check("密码 %2F 还原", n["password"] == "REDACTED", n["password"])
-check("sni", n["sni"] == "your-node.example.com")
-check("中文节点名还原", n["name"] == "某地区", n["name"])
+check("scheme/host/port", n["server"] == "node.example.com" and n["port"] == 443)
+check("密码 %2F 还原", n["password"] == "Dm9xQ2/kF7wZ/p8", n["password"])
+check("sni", n["sni"] == "node.example.com")
+check("中文节点名还原", n["name"] == "测试节点", n["name"])
 check("默认 alpn=h3", n["alpn"] == ["h3"])
 
 # 2. hy2:// 简写、insecure、obfs、端口跳跃、无 sni（回退 host）
@@ -207,8 +208,8 @@ check("含 proxies", '"hysteria2"' in text)
 check("含 PROXY 策略组", '"PROXY"' in text)
 check("含 AUTO 测速组（多节点）", '"AUTO"' in text)
 check("私有网段安全直连在前", text.index("192.168.0.0/16") < text.index("openai.com"))
-check("密码被正确引号包裹", '"REDACTED"' in text)
-check("中文节点名保留", "某地区" in text)
+check("密码被正确引号包裹", '"Dm9xQ2/kF7wZ/p8"' in text)
+check("中文节点名保留", "测试节点" in text)
 
 # 非 hex 的 fingerprint 必须被丢弃（否则 mihomo 启动报错）
 bad_fp_node = dict(n); bad_fp_node["fingerprint"] = "sha256/AAAA=="
