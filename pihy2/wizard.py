@@ -44,7 +44,7 @@ def ask_yn(prompt: str, default: bool = True) -> bool:
 
 
 def read_links() -> str:
-    _p("粘贴一个或多个 hy2 节点链接（hysteria2:// 或 hy2://，每行一个；")
+    _p("粘贴一个或多个节点分享链接（每行一个，支持 hysteria2/vless/vmess/trojan/ss/tuic；")
     _p("也支持 base64 订阅内容）。粘贴完成后按回车进入空行结束：")
     lines = []
     while True:
