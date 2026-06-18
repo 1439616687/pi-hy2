@@ -95,7 +95,24 @@ def _run_wizard():
 
     # ---- 1. 节点 ----
     title("第 1 步 / 添加节点")
-    while True:
+    # 1a. 可选：先加订阅地址（之后会定时自动更新）
+    if ask_yn("有订阅地址吗？填了会定时自动更新（没有就跳过）", False):
+        url = ask("订阅 URL")
+        if url:
+            sub = store.add_subscription(ask("给这个订阅起个名字", "我的订阅"), url)
+            _p(f"  {C_DIM}正在拉取订阅…{C_END}")
+            cnt, errs = manager.refresh_subscription(store, sub["id"], log=lambda m: _p("  " + m))
+            for e in errs[:3]:
+                _p(f"  {C_WARN}{e}{C_END}")
+            if cnt:
+                _p(f"  {C_OK}订阅添加成功，{cnt} 个节点{C_END}")
+            else:
+                _p(f"  {C_WARN}订阅暂未取到节点，可稍后在面板重试{C_END}")
+    # 1b. 手动粘贴链接（已有订阅节点时可跳过）
+    want_manual = True
+    if store.data["nodes"]:
+        want_manual = ask_yn("再手动粘贴一些链接吗？", False)
+    while want_manual:
         text = read_links()
         nodes, errs = parser.parse_many(text)
         for e in errs:
@@ -109,10 +126,10 @@ def _run_wizard():
         else:
             _p(f"{C_ERR}没有解析到节点。{C_END}")
         if not ask_yn("重新粘贴？", True):
-            if not store.data["nodes"]:
-                _p("没有任何节点，已退出。")
-                return
             break
+    if not store.data["nodes"]:
+        _p("没有任何节点，已退出。")
+        return
 
     # ---- 2. 默认带宽 ----
     title("第 2 步 / 默认带宽（影响 hy2 速度，填接近你实际宽带的值）")
@@ -181,7 +198,8 @@ def _run_wizard():
     _p(f"  {C_OK}配置校验通过{C_END}")
 
     _p("· 安装系统服务并设为开机自启")
-    manager.install_services(log=lambda m: _p("  " + m))
+    manager.install_services_with_timer(
+        hours=store.data.get("sub_interval_hours", 12), log=lambda m: _p("  " + m))
     manager.enable_start("mihomo", log=lambda m: _p("  " + m))
     manager.enable_start("pihy2-web", log=lambda m: _p("  " + m))
 

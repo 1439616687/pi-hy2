@@ -270,6 +270,11 @@ WantedBy=multi-user.target
     log("systemd 服务已写入")
 
 
+def install_services_with_timer(hours: int = 12, log=print) -> None:
+    install_services(log)
+    install_sub_timer(hours, log)
+
+
 def service_action(name: str, action: str, log=print) -> subprocess.CompletedProcess:
     r = run(["systemctl", action, name])
     if r.returncode != 0 and (r.stderr.strip()):
@@ -293,6 +298,70 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
     if restart and os.path.exists(MIHOMO_SERVICE):
         service_action("mihomo", "restart", log)
     return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
+
+
+# ---------------------------------------------------------------- 订阅
+SUB_SERVICE = "/etc/systemd/system/pihy2-sub-update.service"
+SUB_TIMER = "/etc/systemd/system/pihy2-sub-update.timer"
+
+
+def fetch_text(url: str, timeout: int = 30) -> str:
+    """拉取订阅内容。部分机场按 User-Agent 返回不同格式，这里用通用 UA 期望拿到链接列表。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "pihy2/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "ignore")
+
+
+def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
+    """拉取并解析一个订阅，替换其名下节点。返回 (节点数, 错误列表)。"""
+    from . import parser
+    sub = store.get_subscription(sid)
+    if not sub:
+        return 0, ["订阅不存在"]
+    try:
+        text = fetch_text(sub["url"])
+    except Exception as e:
+        return 0, [f"拉取失败：{e}"]
+    nodes, errors = parser.parse_many(text)
+    if not nodes:
+        return 0, (errors or ["订阅里没有可解析的节点（若是 Clash YAML 订阅，暂不支持）"])
+    n = store.set_subscription_nodes(sid, nodes)
+    log(f"订阅「{sub['name']}」更新 {n} 个节点")
+    return n, errors
+
+
+def refresh_all_subscriptions(store, log=print) -> dict:
+    return {s["id"]: refresh_subscription(store, s["id"], log)[0]
+            for s in list(store.data.get("subscriptions", []))}
+
+
+def install_sub_timer(hours: int = 12, log=print) -> None:
+    """写入并启用订阅定时更新 timer。"""
+    py = sys.executable or "/usr/bin/python3"
+    _write(SUB_SERVICE, f"""[Unit]
+Description=pihy2 订阅更新
+After=network-online.target mihomo.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={INSTALL_DIR}
+Environment=PYTHONPATH={INSTALL_DIR}
+ExecStart={py} -m pihy2 sub update all --apply
+""")
+    _write(SUB_TIMER, f"""[Unit]
+Description=pihy2 订阅定时更新
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec={max(1, int(hours))}h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+""")
+    run(["systemctl", "daemon-reload"])
+    service_action("pihy2-sub-update.timer", "enable", log)
+    service_action("pihy2-sub-update.timer", "start", log)
 
 
 # ---------------------------------------------------------------- 状态/排错
@@ -374,10 +443,10 @@ def clash_delay(name: str, settings: dict, timeout: int = 5000) -> int | None:
 
 # ---------------------------------------------------------------- 卸载
 def uninstall(purge: bool = False, log=print) -> None:
-    for svc in ("pihy2-web", "mihomo"):
+    for svc in ("pihy2-sub-update.timer", "pihy2-web", "mihomo"):
         service_action(svc, "disable", log)
         service_action(svc, "stop", log)
-    for path in (MIHOMO_SERVICE, WEBUI_SERVICE):
+    for path in (MIHOMO_SERVICE, WEBUI_SERVICE, SUB_SERVICE, SUB_TIMER):
         if os.path.exists(path):
             os.remove(path)
     run(["systemctl", "daemon-reload"])

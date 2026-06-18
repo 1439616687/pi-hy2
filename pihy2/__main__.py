@@ -83,6 +83,48 @@ def cmd_uninstall(args):
     manager.uninstall(purge=args.purge)
 
 
+def cmd_sub(args):
+    store = Store()
+    action = args.sub_action
+    if action == "list":
+        subs = store.data.get("subscriptions", [])
+        if not subs:
+            print("（无订阅）")
+        for s in subs:
+            print(f"  {s['id']}  {s['name']}  节点{s['count']}  更新于 {s['updated'] or '从未'}\n      {s['url']}")
+        return
+    if action == "add":
+        sub = store.add_subscription(args.name or "订阅", args.url)
+        cnt, errs = manager.refresh_subscription(store, sub["id"])
+        store.save()
+        for e in errs[:3]:
+            print("  " + e)
+        print(f"已添加订阅 {sub['id']}（{cnt} 个节点）")
+        if args.apply:
+            print(manager.apply_config(store)[1])
+        return
+    if action == "update":
+        target = args.id or "all"
+        if target == "all":
+            res = manager.refresh_all_subscriptions(store)
+            print(f"已更新 {len(res)} 个订阅，共 {sum(res.values())} 个节点")
+        else:
+            cnt, errs = manager.refresh_subscription(store, target)
+            for e in errs[:3]:
+                print("  " + e)
+            print(f"已更新 {cnt} 个节点")
+        store.save()
+        if args.apply:
+            print(manager.apply_config(store)[1])
+        return
+    if action == "del":
+        ok = store.delete_subscription(args.id, remove_nodes=not args.keep_nodes)
+        store.save()
+        print("已删除" if ok else "订阅不存在")
+        if ok and args.apply:
+            print(manager.apply_config(store)[1])
+
+
 def cmd_version(args):
     print(f"pihy2 {__version__}")
 
@@ -117,6 +159,19 @@ def build_parser():
     ad.add_argument("link", nargs="?", help="hy2 链接（省略则从标准输入读取）")
     ad.add_argument("--apply", action="store_true", help="添加后立即应用")
     ad.set_defaults(func=cmd_add)
+
+    sb = sub.add_parser("sub", help="订阅管理")
+    sbs = sb.add_subparsers(dest="sub_action")
+    sbs.add_parser("list", help="列出订阅").set_defaults(func=cmd_sub)
+    sba = sbs.add_parser("add", help="添加订阅")
+    sba.add_argument("url"); sba.add_argument("--name", default="")
+    sba.add_argument("--apply", action="store_true"); sba.set_defaults(func=cmd_sub)
+    sbu = sbs.add_parser("update", help="更新订阅（id 或 all）")
+    sbu.add_argument("id", nargs="?", default="all")
+    sbu.add_argument("--apply", action="store_true"); sbu.set_defaults(func=cmd_sub)
+    sbd = sbs.add_parser("del", help="删除订阅")
+    sbd.add_argument("id"); sbd.add_argument("--keep-nodes", action="store_true")
+    sbd.add_argument("--apply", action="store_true"); sbd.set_defaults(func=cmd_sub)
 
     un = sub.add_parser("uninstall", help="卸载")
     un.add_argument("--purge", action="store_true", help="同时删除二进制与配置")
