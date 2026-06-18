@@ -143,6 +143,38 @@ _rl = parser.parse_link("vless://" + _uuid + "@h.com:443?type=grpc&pbk=ABC&sid=0
 check("reality 仅 pbk 也识别", _rl["tls"] and _rl.get("reality_pbk") == "ABC")
 
 
+print("== Clash YAML 订阅 ==")
+_clash = '''
+proxies:
+  - {name: "香港", type: ss, server: a.com, port: 8388, cipher: aes-256-gcm, password: "p@ss"}
+  - name: VM
+    type: vmess
+    server: b.com
+    port: 443
+    uuid: ''' + _uuid + '''
+    alterId: 0
+    network: ws
+    tls: true
+    servername: b.com
+    ws-opts:
+      path: /vm
+      headers:
+        Host: b.com
+  - name: WG
+    type: wireguard
+    server: e.com
+    port: 51820
+'''
+_yn, _ye = parser.parse_many(_clash)        # parse_many 自动识别 YAML
+check("Clash YAML 解析出节点", len(_yn) == 2 and _yn[0]["type"] == "ss", str([n["type"] for n in _yn]))
+check("YAML 中文名/特殊密码", _yn[0]["name"] == "香港" and _yn[0]["password"] == "p@ss")
+check("YAML 嵌套 ws-opts", _yn[1]["network"] == "ws" and _yn[1]["ws_path"] == "/vm" and _yn[1]["ws_host"] == "b.com")
+check("YAML 跳过不支持协议", any("wireguard" in e for e in _ye))
+check("base64-of-YAML 也识别", len(parser.parse_many(_b.b64encode(_clash.encode()).decode())[0]) == 2)
+# YAML 转出的配置可通过 mihomo -t（若提供二进制）—— 放到下方统一校验
+_yaml_nodes = _yn
+
+
 print("== 规则判别 ==")
 cases = [
     (("*.cn", "auto"), ("DOMAIN-SUFFIX", "cn")),
@@ -228,7 +260,13 @@ if mihomo and os.path.exists(mihomo):
     dp = tempfile.mkdtemp(prefix="pihy2-testp-")
     with open(os.path.join(dp, "config.yaml"), "w") as f:
         f.write(textp)
-    for label, folder in (("多节点", d), ("单节点", d1), ("零节点", d0), ("多协议混合", dp)):
+    # Clash YAML 订阅转出的节点
+    texty = config_gen.render(_yaml_nodes, [], settings)
+    dy = tempfile.mkdtemp(prefix="pihy2-testy-")
+    with open(os.path.join(dy, "config.yaml"), "w") as f:
+        f.write(texty)
+    for label, folder in (("多节点", d), ("单节点", d1), ("零节点", d0),
+                          ("多协议混合", dp), ("ClashYAML转出", dy)):
         r = subprocess.run([mihomo, "-d", folder, "-t"], capture_output=True, text=True)
         ok = r.returncode == 0 and "test is successful" in (r.stdout + r.stderr)
         check(f"{label}配置通过 mihomo -t", ok, (r.stdout + r.stderr).strip()[-300:])

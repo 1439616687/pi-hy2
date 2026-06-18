@@ -292,20 +292,25 @@ SYSCTL_FILE = "/etc/sysctl.d/99-pihy2.conf"
 
 
 def set_ip_forward(on: bool, log=print) -> None:
-    """开/关 IPv4 转发（全屋网关模式需要）。已是目标状态则跳过，避免每次 apply 都写盘。"""
+    """开/关全屋网关所需内核参数（IP 转发 + 宽松反向路径过滤）。
+    rp_filter=2(loose) 是透明网关常见的关键项：TUN 代理下进出路径不对称，
+    严格 rp_filter 会丢回程包。已是目标状态则跳过，避免每次 apply 写盘。"""
     have = os.path.exists(SYSCTL_FILE)
     if on == have:
         return
     try:
         if on:
             with open(SYSCTL_FILE, "w") as f:
-                f.write("net.ipv4.ip_forward=1\n")
+                f.write("net.ipv4.ip_forward=1\n"
+                        "net.ipv4.conf.all.rp_filter=2\n"
+                        "net.ipv4.conf.default.rp_filter=2\n")
             run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+            run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
         else:
             os.remove(SYSCTL_FILE)
             run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
     except OSError as e:
-        log(f"设置 IP 转发失败：{e}")
+        log(f"设置网关内核参数失败：{e}")
 
 
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
@@ -380,9 +385,7 @@ def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
     except Exception as e:                    # 解析器兜底，任何脏数据都不该拖垮定时更新
         return 0, [f"解析失败：{e}"]
     if not nodes:
-        hint = "（看起来是 Clash YAML 订阅，暂仅支持链接/base64 订阅，试试机场的“通用/v2ray”订阅地址）" \
-            if "proxies:" in text[:2000] else ""
-        return 0, (errors or [f"订阅里没有可解析的节点{hint}"])
+        return 0, (errors or ["订阅里没有可解析的节点（可能是返回了登录页/空内容，或全是暂不支持的协议）"])
     n = store.set_subscription_nodes(sid, nodes)
     log(f"订阅「{sub['name']}」更新 {n} 个节点")
     return n, errors
