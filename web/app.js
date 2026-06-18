@@ -363,6 +363,13 @@ function ruleRowHtml(r, i) {
 function renderRules() {
   el('rule-list').innerHTML = STATE.rules.map((r, i) => ruleRowHtml(r, i)).join('');
   el('final-policy').value = (STATE.settings.final || 'PROXY');
+  renderPresets();
+}
+function renderPresets() {
+  const box = el('preset-list'); if (!box) return;
+  const on = new Set((STATE.settings || {}).presets || []);
+  box.innerHTML = (STATE.preset_catalog || []).map(p =>
+    `<label class="row" title="${esc(p.desc)}"><input type="checkbox" class="preset-cb" value="${esc(p.key)}" ${on.has(p.key) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('');
 }
 function ruleEdited(i, key, val) {
   STATE.rules[i][key] = val;
@@ -375,9 +382,10 @@ function addRuleRow() { STATE.rules.push({ value: '', type: 'auto', policy: 'PRO
 function delRule(i) { STATE.rules.splice(i, 1); rulesDirty = true; renderRules(); }
 async function saveRules() {
   const rules = STATE.rules.filter(r => (r.value || '').trim());
+  const presets = [...document.querySelectorAll('.preset-cb:checked')].map(c => c.value);
   const r1 = await api('PUT', '/api/rules', { rules });
-  const r2 = await api('PUT', '/api/settings', { settings: { final: el('final-policy').value } });
-  if (r1.ok && r2.ok) { rulesDirty = false; toast('路由已保存，记得“应用配置”', 'ok'); }
+  const r2 = await api('PUT', '/api/settings', { settings: { final: el('final-policy').value, presets } });
+  if (r1.ok && r2.ok) { rulesDirty = false; STATE.settings.presets = presets; toast('路由已保存，记得“应用配置”', 'ok'); }
   else toast('保存失败：' + ((r1.error || r2.error) || ''), 'err');
 }
 

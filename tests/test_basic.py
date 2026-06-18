@@ -168,6 +168,19 @@ from pihy2.store import DEFAULT_RULES
 check("默认规则不依赖地理库",
       all(r["type"] not in ("geoip", "geosite") for r in DEFAULT_RULES))
 
+# 一键分流预设：展开顺序（拦截在前、直连在后）+ 去重
+pl = config_gen.expand_presets(["cn_direct", "ads", "ads"])
+check("预设展开 ads 在前", pl and pl[0] == "GEOSITE,category-ads-all,REJECT", str(pl[:1]))
+check("预设展开 cn_direct 在后", pl and pl[-1] == "GEOIP,CN,DIRECT", str(pl[-1:]))
+check("预设去重", pl.count("GEOSITE,category-ads-all,REJECT") == 1)
+# 零节点时，引用 PROXY 的用户规则/预设都不应出现（否则 mihomo 报未知策略组）
+t0 = config_gen.render([], [{"value": "x.com", "policy": "PROXY", "type": "auto"}],
+                       dict(config_gen.DEFAULT_SETTINGS, presets=["ads"]))
+check("零节点不泄漏 PROXY 规则/预设", "GEOSITE" not in t0 and "x.com" not in t0 and "MATCH,DIRECT" in t0)
+# 有节点时预设进入配置
+tp = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", presets=["ads"]))
+check("启用预设后含对应规则", "GEOSITE,category-ads-all,REJECT" in tp)
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):
