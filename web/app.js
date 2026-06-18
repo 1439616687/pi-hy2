@@ -20,7 +20,7 @@ async function api(method, path, body) {
 }
 
 function el(id) { return document.getElementById(id); }
-function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
 function toast(msg, kind) {
   const t = el('toast');
@@ -43,7 +43,7 @@ async function boot() {
     if (await loadState()) { showApp(); refreshStatus(); }
   } catch (e) { /* 401 已弹出登录框 */ }
 }
-function showLogin() { el('login').classList.remove('hidden'); el('app').classList.add('hidden'); }
+function showLogin() { stopTraffic(); el('login').classList.remove('hidden'); el('app').classList.add('hidden'); }
 function showApp() { el('login').classList.add('hidden'); el('app').classList.remove('hidden'); }
 
 async function doLogin(e) {
@@ -57,9 +57,12 @@ async function doLogin(e) {
 async function loadState() {
   const s = await api('GET', '/api/state');
   if (!s.ok) return false;
-  const keepRules = rulesDirty ? STATE.rules : null;   // 保住未保存的路由编辑，避免被覆盖丢失
+  // 保住未保存的路由/预设编辑，避免被后台 loadState 覆盖丢失
+  const keepRules = rulesDirty ? STATE.rules : null;
+  const keepPresets = rulesDirty ? ((STATE.settings || {}).presets || []) : null;
   STATE = s;
   if (keepRules) STATE.rules = keepRules;
+  if (keepPresets) { if (!STATE.settings) STATE.settings = {}; STATE.settings.presets = keepPresets; }
   renderNodes(); renderRules(); renderSettings(); renderSubs();
   return true;
 }
@@ -83,19 +86,19 @@ async function addSub() {
   if (!url) { toast('请填订阅链接', 'err'); return; }
   toast('正在拉取订阅…');
   const r = await api('POST', '/api/subs', { url, name: el('sub-name').value.trim() });
-  if (r.ok) { el('sub-url').value = ''; el('sub-name').value = ''; await loadState(); toast(`订阅已添加，${r.count} 个节点，记得“应用配置”`, 'ok'); }
+  if (r.ok) { el('sub-url').value = ''; el('sub-name').value = ''; await loadState(); toast(`订阅已添加，${r.count || 0} 个节点已生效`, 'ok'); }
   else toast('添加失败：' + (r.error || ''), 'err');
 }
 async function updateSub(id) {
   toast('更新中…');
   const r = await api('POST', '/api/subs/update', { id });
-  await loadState(); done(r, `已更新 ${r.count || 0} 个节点，记得“应用配置”`);
+  await loadState(); done(r, `已更新 ${r.count || 0} 个节点并生效`);
 }
 async function updateAllSubs() {
   if (!(STATE.subscriptions || []).length) { toast('没有订阅', 'err'); return; }
   toast('更新中…');
   const r = await api('POST', '/api/subs/update', { id: 'all' });
-  await loadState(); done(r, `已更新，共 ${r.count || 0} 个节点，记得“应用配置”`);
+  await loadState(); done(r, `已更新共 ${r.count || 0} 个节点并生效`);
 }
 async function delSub(id, name) {
   if (!confirm(`删除订阅「${name}」及其节点？`)) return;
@@ -370,7 +373,13 @@ function renderPresets() {
   const box = el('preset-list'); if (!box) return;
   const on = new Set((STATE.settings || {}).presets || []);
   box.innerHTML = (STATE.preset_catalog || []).map(p =>
-    `<label class="row" title="${esc(p.desc)}"><input type="checkbox" class="preset-cb" value="${esc(p.key)}" ${on.has(p.key) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('');
+    `<label class="row" title="${esc(p.desc)}"><input type="checkbox" class="preset-cb" value="${esc(p.key)}" onchange="presetChanged()" ${on.has(p.key) ? 'checked' : ''}> ${esc(p.name)}</label>`).join('');
+}
+// 勾选预设即标记“未保存”并同步进 STATE，避免后续 loadState 把勾选覆盖丢失
+function presetChanged() {
+  rulesDirty = true;
+  if (!STATE.settings) STATE.settings = {};
+  STATE.settings.presets = [...document.querySelectorAll('.preset-cb:checked')].map(c => c.value);
 }
 function ruleEdited(i, key, val) {
   STATE.rules[i][key] = val;
@@ -476,8 +485,9 @@ async function pollTraffic() {
   el('traffic-hint').textContent = '数据每 2 秒刷新。';
   if (prevTraffic) {
     const dt = (now - prevTraffic.t) / 1000 || 1;
-    el('sp-up').textContent = humanBytes((r.up_total - prevTraffic.up) / dt);
-    el('sp-down').textContent = humanBytes((r.down_total - prevTraffic.down) / dt);
+    // Math.max(0,…)：mihomo 重启后累计值归零，差值会变负，钳到 0 避免显示负速度
+    el('sp-up').textContent = humanBytes(Math.max(0, r.up_total - prevTraffic.up) / dt);
+    el('sp-down').textContent = humanBytes(Math.max(0, r.down_total - prevTraffic.down) / dt);
   }
   prevTraffic = { up: r.up_total, down: r.down_total, t: now };
   el('sp-count').textContent = r.count;

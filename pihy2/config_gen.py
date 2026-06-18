@@ -190,9 +190,9 @@ def rule_to_mihomo(rule: dict) -> str:
 def _apply_transport(p: dict, node: dict):
     """把 ws/grpc 等传输层字段写进 mihomo proxy。"""
     net = node.get("network")
-    if net in ("ws", "grpc", "h2", "http", "httpupgrade"):
+    if net in ("ws", "grpc", "httpupgrade"):
         p["network"] = net
-    if net == "ws":
+    if net in ("ws", "httpupgrade"):          # httpupgrade 复用 ws-opts
         ws = {"path": node.get("ws_path") or "/"}
         if node.get("ws_host"):
             ws["headers"] = {"Host": node["ws_host"]}

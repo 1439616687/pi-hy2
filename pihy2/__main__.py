@@ -161,7 +161,7 @@ def build_parser():
     ad.set_defaults(func=cmd_add)
 
     sb = sub.add_parser("sub", help="订阅管理")
-    sbs = sb.add_subparsers(dest="sub_action")
+    sbs = sb.add_subparsers(dest="sub_action", required=True)
     sbs.add_parser("list", help="列出订阅").set_defaults(func=cmd_sub)
     sba = sbs.add_parser("add", help="添加订阅")
     sba.add_argument("url"); sba.add_argument("--name", default="")

@@ -292,29 +292,40 @@ SYSCTL_FILE = "/etc/sysctl.d/99-pihy2.conf"
 
 
 def set_ip_forward(on: bool, log=print) -> None:
-    """开/关 IPv4 转发（全屋网关模式需要：让别的设备把树莓派当网关转发上网）。"""
+    """开/关 IPv4 转发（全屋网关模式需要）。已是目标状态则跳过，避免每次 apply 都写盘。"""
+    have = os.path.exists(SYSCTL_FILE)
+    if on == have:
+        return
     try:
         if on:
             with open(SYSCTL_FILE, "w") as f:
                 f.write("net.ipv4.ip_forward=1\n")
             run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
         else:
-            if os.path.exists(SYSCTL_FILE):
-                os.remove(SYSCTL_FILE)
+            os.remove(SYSCTL_FILE)
             run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
     except OSError as e:
         log(f"设置 IP 转发失败：{e}")
 
 
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
-    """渲染 -> 校验 -> 落盘 -> 重启 mihomo。校验失败则不落盘。"""
+    """渲染 -> 校验 -> 落盘 -> 重启 mihomo。校验失败则不落盘。
+    与现有配置完全一致时跳过落盘与重启，避免（如订阅定时任务）无谓地断开连接。"""
     text = store.render_config()
+    current = ""
+    if os.path.exists(MIHOMO_CONFIG):
+        try:
+            with open(MIHOMO_CONFIG, "r", encoding="utf-8") as f:
+                current = f.read()
+        except OSError:
+            pass
+    set_ip_forward(bool(store.data["settings"].get("gateway_mode")), log)
+    if text == current:
+        return True, "配置无变化，未重启"
     ok, out = test_config(text)
     if not ok:
         return False, f"配置校验失败，已保留原配置：\n{out}"
     write_config(text)
-    # 网关模式跟随设置开/关 IP 转发
-    set_ip_forward(bool(store.data["settings"].get("gateway_mode")), log)
     if restart and os.path.exists(MIHOMO_SERVICE):
         service_action("mihomo", "restart", log)
     return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
@@ -325,11 +336,33 @@ SUB_SERVICE = "/etc/systemd/system/pihy2-sub-update.service"
 SUB_TIMER = "/etc/systemd/system/pihy2-sub-update.timer"
 
 
-def fetch_text(url: str, timeout: int = 30) -> str:
-    """拉取订阅内容。部分机场按 User-Agent 返回不同格式，这里用通用 UA 期望拿到链接列表。"""
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise urllib.error.HTTPError(a[0].full_url, 399, "订阅地址发生跳转，已拒绝", {}, None)
+
+
+def _assert_public_host(url: str):
+    """订阅是 root 进程发起的服务端请求，拒绝指向内网/本机，避免 SSRF。"""
+    import ipaddress
+    import socket
+    host = urllib.parse.urlparse(url).hostname or ""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise ValueError("无法解析订阅域名")
+    for fam, _, _, _, sa in infos:
+        ip = ipaddress.ip_address(sa[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError("订阅地址不能指向内网/本机地址")
+
+
+def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024) -> str:
+    """拉取订阅内容。拒绝内网地址与跳转（防 SSRF），并限制大小。"""
+    _assert_public_host(url)
+    opener = urllib.request.build_opener(_NoRedirect)
     req = urllib.request.Request(url, headers={"User-Agent": "pihy2/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", "ignore")
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read(max_bytes).decode("utf-8", "ignore")
 
 
 def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
@@ -342,9 +375,14 @@ def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
         text = fetch_text(sub["url"])
     except Exception as e:
         return 0, [f"拉取失败：{e}"]
-    nodes, errors = parser.parse_many(text)
+    try:
+        nodes, errors = parser.parse_many(text)
+    except Exception as e:                    # 解析器兜底，任何脏数据都不该拖垮定时更新
+        return 0, [f"解析失败：{e}"]
     if not nodes:
-        return 0, (errors or ["订阅里没有可解析的节点（若是 Clash YAML 订阅，暂不支持）"])
+        hint = "（看起来是 Clash YAML 订阅，暂仅支持链接/base64 订阅，试试机场的“通用/v2ray”订阅地址）" \
+            if "proxies:" in text[:2000] else ""
+        return 0, (errors or [f"订阅里没有可解析的节点{hint}"])
     n = store.set_subscription_nodes(sid, nodes)
     log(f"订阅「{sub['name']}」更新 {n} 个节点")
     return n, errors
@@ -374,7 +412,6 @@ Description=pihy2 订阅定时更新
 [Timer]
 OnBootSec=10min
 OnUnitActiveSec={max(1, int(hours))}h
-Persistent=true
 
 [Install]
 WantedBy=timers.target

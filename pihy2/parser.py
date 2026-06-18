@@ -35,6 +35,14 @@ def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _int(v, default: int = 0) -> int:
+    """宽松转 int，兼容 "443"/"1.0"/None/非法值，避免脏数据让整次订阅解析崩掉。"""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_fingerprint(v: str) -> str:
     """把证书指纹规范化为 mihomo 期望的 64 位小写 hex；不是 hex 则返回 ""。
 
@@ -114,16 +122,17 @@ def _base_node(name: str, typ: str, host: str, port: int) -> dict:
     return {"name": name.strip() or host, "type": typ, "server": host, "port": port}
 
 
-def _net_fields(node: dict, network: str, qs: dict = None, *,
+def _net_fields(node: dict, network: str, *,
                 ws_path="", ws_host="", grpc_sn=""):
-    """填充传输层相关字段（ws/grpc/h2 等）。"""
+    """填充传输层相关字段。仅支持会真正下发 opts 的 ws/httpupgrade/grpc，
+    其余（tcp/h2/http）按 tcp 处理，避免出现“有 network 没 opts”的半截配置。"""
     network = (network or "tcp").lower()
-    if network in ("ws", "grpc", "h2", "http", "httpupgrade"):
+    if network in ("ws", "httpupgrade"):
         node["network"] = network
-    if network == "ws":
         node["ws_path"] = ws_path or "/"
         node["ws_host"] = ws_host
     elif network == "grpc":
+        node["network"] = "grpc"
         node["grpc_service_name"] = grpc_sn
 
 
@@ -172,19 +181,21 @@ def _parse_vless(link: str) -> dict:
 
     security = _first(qs, "security").lower()
     network = _first(qs, "type", "headerType", default="tcp").lower() or "tcp"
+    pbk = _first(qs, "pbk")
+    is_reality = security == "reality" or bool(pbk)   # 有公钥即按 reality 处理
 
     node = _base_node(unquote(sr.fragment), "vless", host, port)
     node.update({
         "uuid": uuid,
-        "tls": security in ("tls", "reality", "xtls"),
+        "tls": security in ("tls", "reality", "xtls") or is_reality,
         "sni": _first(qs, "sni", "peer"),
         "flow": _first(qs, "flow"),
         "client_fingerprint": _first(qs, "fp"),
         "alpn": _alpn(_first(qs, "alpn")),
         "skip_cert_verify": _truthy(_first(qs, "allowInsecure", "insecure", default="0")),
     })
-    if security == "reality":
-        node["reality_pbk"] = _first(qs, "pbk")
+    if is_reality:
+        node["reality_pbk"] = pbk
         node["reality_sid"] = _first(qs, "sid")
     _net_fields(node, network, ws_path=_first(qs, "path"),
                 ws_host=_first(qs, "host"), grpc_sn=_first(qs, "serviceName"))
@@ -199,19 +210,22 @@ def _parse_vmess(link: str) -> dict:
     except (json.JSONDecodeError, ValueError):
         raise ParseError("VMess 链接不是合法的 base64(JSON)")
     host = j.get("add", "")
-    port = int(j.get("port", 443) or 443)
+    port = _int(j.get("port"), 443)
     if not host:
         raise ParseError("VMess 缺少服务器地址")
     network = str(j.get("net", "tcp")).lower()
+    alpn_raw = j.get("alpn")
+    alpn_str = alpn_raw if isinstance(alpn_raw, str) else (
+        ",".join(str(x) for x in alpn_raw) if isinstance(alpn_raw, (list, tuple)) else "")
 
     node = _base_node(str(j.get("ps", "")), "vmess", host, port)
     node.update({
-        "uuid": j.get("id", ""),
-        "alter_id": int(j.get("aid", 0) or 0),
+        "uuid": str(j.get("id", "")),
+        "alter_id": _int(j.get("aid"), 0),
         "cipher": j.get("scy") or "auto",
         "tls": str(j.get("tls", "")).lower() in ("tls", "true", "1"),
         "sni": j.get("sni") or "",
-        "alpn": _alpn(j.get("alpn", "") if isinstance(j.get("alpn"), str) else ",".join(j.get("alpn", []))),
+        "alpn": _alpn(alpn_str),
         "skip_cert_verify": _truthy(str(j.get("skip-cert-verify", j.get("verify_cert", "0")))),
     })
     if not node["uuid"]:
@@ -277,7 +291,6 @@ def _parse_ss(link: str) -> dict:
     node = _base_node(name, "ss", host, port)
     node.update({"cipher": method, "password": password})
 
-    plugin = ""
     if query:
         qs = parse_qs(query, keep_blank_values=True)
         plugin_raw = _first(qs, "plugin")
@@ -395,6 +408,8 @@ def parse_many(text: str) -> tuple[list[dict], list[str]]:
             nodes.append(parse_link(line))
         except ParseError as e:
             errors.append(f"解析失败：{e} —— {line[:40]}")
+        except Exception as e:  # 脏数据兜底：单条异常不拖垮整次解析
+            errors.append(f"解析异常：{e} —— {line[:40]}")
     if not nodes and not errors:
         errors.append("未发现可用的节点链接")
     return nodes, errors
@@ -468,7 +483,23 @@ def node_to_link(node: dict) -> str:
     if t == "ss":
         userinfo = base64.b64encode(
             f"{node.get('cipher','')}:{node.get('password','')}".encode()).decode().rstrip("=")
-        return f"ss://{userinfo}@{hostb}:{node['port']}{frag}"
+        q = ""
+        if node.get("plugin"):                       # 还原 SIP002 plugin，避免导出丢插件
+            opts = node.get("plugin_opts") or {}
+            if node["plugin"] == "obfs":
+                ps = f"obfs-local;obfs={opts.get('mode', 'http')}"
+                if opts.get("host"):
+                    ps += f";obfs-host={opts['host']}"
+            elif node["plugin"] == "v2ray-plugin":
+                ps = f"v2ray-plugin;mode={opts.get('mode', 'websocket')}"
+                if opts.get("host"):
+                    ps += f";host={opts['host']}"
+                if opts.get("path"):
+                    ps += f";path={opts['path']}"
+            else:
+                ps = node["plugin"]
+            q = "?" + urlencode({"plugin": ps})
+        return f"ss://{userinfo}@{hostb}:{node['port']}{q}{frag}"
 
     # hysteria2
     params = {}

@@ -155,12 +155,15 @@ class Store:
         return True
 
     def set_subscription_nodes(self, sid: str, nodes: list[dict]) -> int:
-        """用新解析的节点替换该订阅下的旧节点，尽量按名字保住“当前节点”。"""
+        """用新解析的节点替换该订阅下的旧节点，尽量保住“当前节点”。"""
         sub = self.get_subscription(sid)
         if not sub:
             return 0
+        # 记录当前节点的稳定标识（名字可能被机场改/复用，故用 名+服务器+端口）
         active_node = self.active_node()
-        active_name = active_node["name"] if (active_node and active_node.get("sub") == sid) else None
+        active_key = None
+        if active_node and active_node.get("sub") == sid:
+            active_key = (active_node.get("name"), active_node.get("server"), active_node.get("port"))
         # 删掉该订阅旧节点，追加新节点（标记 sub）
         self.data["nodes"] = [n for n in self.data["nodes"] if n.get("sub") != sid]
         added = []
@@ -168,9 +171,10 @@ class Store:
             nd = dict(nd)
             nd["sub"] = sid
             added.append(self.add_node(nd))
-        # 恢复 active：优先同名，否则保持原 active（若仍存在），否则第一个
-        if active_name:
-            match = next((n for n in added if n["name"] == active_name), None)
+        # 恢复 active：优先 名+服务器+端口 完全一致，其次同名，最后该订阅第一个
+        if active_key:
+            match = next((n for n in added if (n.get("name"), n.get("server"), n.get("port")) == active_key), None) \
+                or next((n for n in added if n.get("name") == active_key[0]), None)
             self.data["active"] = (match or (added[0] if added else {})).get("id", self.data.get("active", ""))
         if self.data.get("active") and not self.get_node(self.data["active"]):
             self.data["active"] = self.data["nodes"][0]["id"] if self.data["nodes"] else ""
