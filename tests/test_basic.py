@@ -98,6 +98,7 @@ check("query 密码 + 不丢", qp["password"] == "AB+CD", qp["password"])
 
 print("== 多协议解析 ==")
 import base64 as _b
+import json as _json
 _uuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
 proto_links = {
     "vless": (f"vless://{_uuid}@v.com:443?security=tls&type=ws&sni=v.com&path=%2Fws&host=v.com#V", "vless"),
@@ -122,6 +123,24 @@ for nd in proto_nodes:
     cred_a = nd.get("password") or nd.get("uuid")
     cred_b = back.get("password") or back.get("uuid")
     check(f"{nd['type']} round-trip 凭据", cred_a == cred_b and back["server"] == nd["server"])
+
+# 健壮性回归：vmess 脏数据(port/aid/alpn)不崩，且不拖垮同批其他节点
+_bad_vm = "vmess://" + _b.b64encode(_json.dumps(
+    {"add": "h.com", "port": "80x", "id": _uuid, "aid": "abc", "net": "ws", "alpn": 123}).encode()).decode()
+vbad, _ = parser.parse_many(_bad_vm + "\nhysteria2://pw@1.2.3.4:443#good")
+check("vmess 脏数据不拖垮同批", any(x["name"] == "good" for x in vbad))
+_vt = parser.parse_link(_bad_vm)
+check("vmess 非法 port/aid 回落默认", _vt["port"] == 443 and _vt["alter_id"] == 0)
+# httpupgrade 保留 path/host
+_hu = parser.parse_link("vless://" + _uuid + "@h.com:443?security=tls&type=httpupgrade&path=%2Fhu&host=h.com#HU")
+check("httpupgrade 保留传输", _hu["network"] == "httpupgrade" and _hu["ws_path"] == "/hu")
+# SS plugin 导出不丢
+_ssp = parser.parse_link("ss://" + _b.b64encode(b"aes-256-gcm:pw").decode() + "@s.com:8388?plugin=obfs-local;obfs=http;obfs-host=cf.com#S")
+_ssb = parser.parse_link(parser.node_to_link(_ssp))
+check("SS plugin round-trip 不丢", _ssb.get("plugin") == "obfs" and _ssb.get("plugin_opts", {}).get("host") == "cf.com")
+# vless 仅 pbk 也按 reality
+_rl = parser.parse_link("vless://" + _uuid + "@h.com:443?type=grpc&pbk=ABC&sid=01&serviceName=s#R")
+check("reality 仅 pbk 也识别", _rl["tls"] and _rl.get("reality_pbk") == "ABC")
 
 
 print("== 规则判别 ==")

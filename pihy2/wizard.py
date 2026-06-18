@@ -156,7 +156,9 @@ def _run_wizard():
     else:
         store.data["settings"]["final"] = "DIRECT"
 
-    _p(f"{C_DIM}全屋网关：让局域网里别的设备也走代理（把它们的网关/代理指向树莓派）。{C_END}")
+    _p(f"{C_DIM}全屋网关：让局域网里别的设备也走代理。开启后两种用法——{C_END}")
+    _p(f"{C_DIM}  ① 最稳：在设备上把 HTTP/SOCKS 代理填成 树莓派IP:7890（即开即用）；{C_END}")
+    _p(f"{C_DIM}  ② 进阶：把设备网关指向树莓派做透明代理（依赖 TUN 转发，设好后请用该设备验证出口IP）。{C_END}")
     store.data["settings"]["gateway_mode"] = ask_yn("开启全屋网关模式吗？", False)
 
     # ---- 4. WebUI ----

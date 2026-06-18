@@ -64,6 +64,9 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         if not n:
             return {}
+        if n > 4 * 1024 * 1024:          # 限制请求体大小，防止内存被撑爆
+            self.rfile.read(min(n, 1 << 20))
+            return {}
         try:
             return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
         except (json.JSONDecodeError, ValueError):
@@ -279,24 +282,29 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/connections/close":
                 return self._json({"ok": manager.clash_close_all(store.data["settings"])})
 
-            if path == "/api/subs":              # 添加订阅并立即拉取
+            if path == "/api/subs":              # 添加订阅并立即拉取 + 应用
                 url = (body.get("url") or "").strip()
                 if not url.lower().startswith(("http://", "https://")):
                     return self._err("订阅地址需以 http(s):// 开头")
                 sub = store.add_subscription(body.get("name", ""), url)
                 cnt, errs = manager.refresh_subscription(store, sub["id"])
                 store.save()
+                if cnt:
+                    manager.apply_config(store)   # 拉到节点就应用，避免“更新了却不生效”
                 return self._json({"ok": True, "sub": sub, "count": cnt, "errors": errs})
 
-            if path == "/api/subs/update":       # 更新某个或全部订阅
+            if path == "/api/subs/update":       # 更新某个或全部订阅 + 应用
                 sid = body.get("id", "all")
                 if sid == "all":
                     res = manager.refresh_all_subscriptions(store)
-                    store.save()
-                    return self._json({"ok": True, "count": sum(res.values())})
-                cnt, errs = manager.refresh_subscription(store, sid)
+                    cnt = sum(res.values())
+                else:
+                    cnt, errs = manager.refresh_subscription(store, sid)
                 store.save()
-                return self._json({"ok": True, "count": cnt, "errors": errs})
+                applied = ""
+                if cnt:
+                    applied = manager.apply_config(store)[1]
+                return self._json({"ok": True, "count": cnt, "applied": applied})
 
         return self._err("not found", 404)
 

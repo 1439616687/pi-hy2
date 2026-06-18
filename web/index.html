@@ -149,8 +149,10 @@
         <fieldset>
           <legend>全屋网关</legend>
           <label class="row"><input id="set-gateway" type="checkbox"> 开启全屋网关模式</label>
-          <p class="muted small">开启后：① 局域网内设备可把代理填成 <code><span id="gw-ip">树莓派IP</span>:<span id="gw-port">7890</span></code>（HTTP/SOCKS）；
-            ② 或把设备的<b>网关/DNS 指向树莓派</b>即可全程透明走代理（已自动开启 IP 转发）。改完点“应用配置并重启”。</p>
+          <p class="muted small">开启后两种用法：<br>
+            <b>① 最稳（推荐）</b>：在设备上把 HTTP/SOCKS 代理填成 <code><span id="gw-ip">树莓派IP</span>:<span id="gw-port">7890</span></code>，即开即用。<br>
+            <b>② 进阶</b>：把设备的<b>网关指向树莓派</b>做透明代理（已自动开 IP 转发，依赖 TUN 转发能力，设好后请用该设备打开测 IP 网站验证是否走了代理）。<br>
+            改完点“应用配置并重启”。</p>
         </fieldset>
         <fieldset>
           <legend>DNS</legend>
