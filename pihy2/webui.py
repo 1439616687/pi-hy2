@@ -1,0 +1,332 @@
+"""可视化管理面板：HTTP 服务 + REST API。
+
+零依赖（仅标准库 http.server）。前端静态文件在仓库的 web/ 目录。
+鉴权：若设置了访问密码，则 /api/login 用密码换取 token，后续请求带
+Authorization: Bearer <token>；未设密码则不鉴权（界面会提示风险）。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from . import manager, parser
+from .store import Store
+
+WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
+
+TOKEN_TTL = 12 * 3600          # token 有效期（秒）
+LOGIN_MAX_FAILS = 8            # 同一 IP 连续失败上限
+LOGIN_LOCK_SECS = 60          # 触发上限后锁定时长
+
+_lock = threading.Lock()
+_tokens: dict[str, float] = {}          # token -> 过期时间戳
+_login_fails: dict[str, list] = {}      # ip -> [失败次数, 最近失败时间]
+
+_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "pihy2"
+
+    def log_message(self, *a):  # 静默默认访问日志
+        pass
+
+    # ----------------------------------------------------------- 工具
+    def _send(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, obj, code: int = 200):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def _err(self, msg: str, code: int = 400):
+        self._json({"ok": False, "error": msg}, code)
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def _store(self) -> Store:
+        return Store()  # 每次请求从磁盘加载，避免与 CLI 写入冲突
+
+    def _need_auth(self, store: Store) -> bool:
+        return bool(store.data["webui"].get("password"))
+
+    def _authed(self, store: Store) -> bool:
+        if not self._need_auth(store):
+            return True
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        exp = _tokens.get(token)
+        if exp is None:
+            return False
+        if exp < time.time():           # 过期则清除
+            _tokens.pop(token, None)
+            return False
+        return True
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "?"
+
+    # ----------------------------------------------------------- 路由
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/api/"):
+            return self._api_get(path)
+        return self._static(path)
+
+    def do_POST(self):
+        if not self.path.startswith("/api/"):
+            return self._err("not found", 404)
+        return self._api_post(self.path.split("?", 1)[0])
+
+    def do_PUT(self):
+        if not self.path.startswith("/api/"):
+            return self._err("not found", 404)
+        return self._api_put(self.path.split("?", 1)[0])
+
+    def do_DELETE(self):
+        if not self.path.startswith("/api/"):
+            return self._err("not found", 404)
+        return self._api_delete(self.path.split("?", 1)[0])
+
+    # ----------------------------------------------------------- 静态文件
+    def _static(self, path: str):
+        if path in ("/", ""):
+            path = "/index.html"
+        # 防目录穿越
+        rel = os.path.normpath(path).lstrip("/\\")
+        full = os.path.join(WEB_DIR, rel)
+        if not os.path.abspath(full).startswith(os.path.abspath(WEB_DIR)) or not os.path.isfile(full):
+            return self._send(404, b"not found", "text/plain; charset=utf-8")
+        ext = os.path.splitext(full)[1].lower()
+        with open(full, "rb") as f:
+            self._send(200, f.read(), _MIME.get(ext, "application/octet-stream"))
+
+    # ----------------------------------------------------------- GET API
+    def _api_get(self, path: str):
+        store = self._store()
+        if path == "/api/state":
+            if not self._authed(store):
+                return self._err("未登录", 401)
+            return self._json({
+                "ok": True,
+                "need_auth": self._need_auth(store),
+                "nodes": store.data["nodes"],
+                "rules": store.data["rules"],
+                "settings": {k: v for k, v in store.data["settings"].items()
+                             if k != "secret"},
+                "webui": {"port": store.data["webui"]["port"],
+                          "bind": store.data["webui"]["bind"],
+                          "has_password": bool(store.data["webui"].get("password"))},
+                "active": store.data["active"],
+            })
+        if path == "/api/authinfo":  # 未鉴权也可访问：告诉前端是否需要登录
+            return self._json({"ok": True, "need_auth": self._need_auth(store)})
+        if not self._authed(store):
+            return self._err("未登录", 401)
+        if path == "/api/status":
+            return self._json({
+                "ok": True,
+                "mihomo": manager.service_status("mihomo"),
+                "webui": manager.service_status("pihy2-web"),
+                "ip": manager.current_ip(),
+                "installed": os.path.exists(manager.MIHOMO_BIN),
+            })
+        if path == "/api/delays":
+            s = store.data["settings"]
+            out = {n["id"]: manager.clash_delay(n["name"], s) for n in store.data["nodes"]}
+            return self._json({"ok": True, "delays": out})
+        if path == "/api/config":  # 预览当前会生成的配置（隐去 clash 密钥）
+            cfg = store.render_config()
+            sec = store.data["settings"].get("secret")
+            if sec:
+                cfg = cfg.replace(sec, "******")
+            return self._json({"ok": True, "config": cfg})
+        if path == "/api/export":  # 导出所有节点链接
+            links = [parser.node_to_link(n) for n in store.data["nodes"]]
+            return self._json({"ok": True, "links": links})
+        return self._err("not found", 404)
+
+    # ----------------------------------------------------------- POST API
+    def _api_post(self, path: str):
+        store = self._store()
+        body = self._body()
+
+        if path == "/api/login":
+            ip = self._client_ip()
+            with _lock:
+                fails = _login_fails.get(ip, [0, 0.0])
+                # 锁定窗口内拒绝继续尝试，遏制暴力破解
+                if fails[0] >= LOGIN_MAX_FAILS and time.time() - fails[1] < LOGIN_LOCK_SECS:
+                    return self._err("尝试过于频繁，请稍后再试", 429)
+            pw = store.data["webui"].get("password", "")
+            if pw and secrets.compare_digest(str(body.get("password", "")), pw):
+                token = secrets.token_urlsafe(24)
+                with _lock:
+                    _tokens[token] = time.time() + TOKEN_TTL
+                    _login_fails.pop(ip, None)
+                return self._json({"ok": True, "token": token})
+            with _lock:
+                f = _login_fails.get(ip, [0, 0.0])
+                _login_fails[ip] = [f[0] + 1, time.time()]
+            time.sleep(0.5)             # 失败固定延时，进一步抬高爆破成本
+            return self._err("密码错误", 401)
+
+        if path == "/api/logout":
+            auth = self.headers.get("Authorization", "")
+            tok = auth[7:] if auth.startswith("Bearer ") else ""
+            _tokens.pop(tok, None)
+            return self._json({"ok": True})
+
+        if not self._authed(store):
+            return self._err("未登录", 401)
+
+        if path == "/api/parse":  # 仅预览，不保存
+            nodes, errs = parser.parse_many(body.get("text", ""))
+            return self._json({"ok": True, "nodes": nodes, "errors": errs})
+
+        with _lock:
+            store = self._store()
+            if path == "/api/nodes":
+                if body.get("text"):  # 从链接批量添加
+                    nodes, errs = parser.parse_many(body["text"])
+                    added = store.add_nodes(nodes)
+                    store.save()
+                    return self._json({"ok": True, "added": added, "errors": errs})
+                if body.get("node"):  # 从表单添加单个
+                    added = store.add_node(body["node"])
+                    store.save()
+                    return self._json({"ok": True, "added": [added]})
+                return self._err("缺少 text 或 node")
+
+            if path == "/api/nodes/order":
+                store.reorder_nodes(body.get("order", []))
+                store.save()
+                return self._json({"ok": True})
+
+            if path == "/api/active":
+                nid = body.get("id", "")
+                node = store.get_node(nid)
+                if not node:
+                    return self._err("节点不存在")
+                store.set_active(nid)
+                store.save()
+                # 尝试免重启实时切换；失败则需用户点“应用配置”
+                ok, info = manager.clash_select("PROXY", node["name"], store.data["settings"])
+                return self._json({"ok": True, "live": ok, "info": info})
+
+            if path == "/api/apply":
+                ok, msg = manager.apply_config(store, restart=True)
+                return self._json({"ok": ok, "message": msg})
+
+            if path == "/api/service":
+                action = body.get("action", "restart")
+                if action not in ("restart", "stop", "start"):
+                    return self._err("非法操作")
+                manager.service_action("mihomo", action)
+                return self._json({"ok": True})
+
+        return self._err("not found", 404)
+
+    # ----------------------------------------------------------- PUT API
+    def _api_put(self, path: str):
+        store = self._store()
+        if not self._authed(store):
+            return self._err("未登录", 401)
+        body = self._body()
+        with _lock:
+            store = self._store()
+            if path.startswith("/api/nodes/"):
+                nid = path.rsplit("/", 1)[-1]
+                node = store.update_node(nid, body)
+                if not node:
+                    return self._err("节点不存在", 404)
+                store.save()
+                return self._json({"ok": True, "node": node})
+            if path == "/api/rules":
+                store.set_rules(body.get("rules", []))
+                store.save()
+                return self._json({"ok": True})
+            if path == "/api/settings":
+                settings = dict(body.get("settings", {}))
+                # external_controller 必须是回环地址，否则带密钥外发会造成 SSRF/密钥外泄
+                ec = settings.get("external_controller")
+                if ec is not None:
+                    host = urllib.parse.urlparse(
+                        ec if ec.startswith("http") else "http://" + ec).hostname or ""
+                    if host not in ("127.0.0.1", "::1", "localhost"):
+                        return self._err("外部控制器必须是本机回环地址（127.0.0.1）")
+                # 下载镜像必须 https
+                mir = settings.get("github_mirror", "")
+                if mir and not mir.lower().startswith("https://"):
+                    return self._err("下载镜像必须以 https:// 开头")
+                store.set_settings(settings)
+                store.save()
+                return self._json({"ok": True})
+            if path == "/api/webui":
+                w = store.data["webui"]
+                if "port" in body and str(body["port"]).isdigit():
+                    w["port"] = int(body["port"])
+                if "bind" in body:
+                    w["bind"] = body["bind"]
+                if "password" in body:  # 空字符串=取消密码
+                    w["password"] = body["password"]
+                    _tokens.clear()
+                store.save()
+                return self._json({"ok": True})
+        return self._err("not found", 404)
+
+    # ----------------------------------------------------------- DELETE API
+    def _api_delete(self, path: str):
+        store = self._store()
+        if not self._authed(store):
+            return self._err("未登录", 401)
+        with _lock:
+            store = self._store()
+            if path.startswith("/api/nodes/"):
+                nid = path.rsplit("/", 1)[-1]
+                ok = store.delete_node(nid)
+                store.save()
+                return self._json({"ok": ok})
+        return self._err("not found", 404)
+
+
+def serve(port: int | None = None, bind: str | None = None):
+    store = Store()
+    port = port or store.data["webui"]["port"]
+    bind = bind or store.data["webui"].get("bind", "0.0.0.0")
+    # 安全兜底：未设访问密码时，绝不监听非回环地址（否则=局域网内无鉴权的 root 控制台）
+    if not store.data["webui"].get("password") and bind not in ("127.0.0.1", "::1", "localhost"):
+        print("⚠️  未设置访问密码，为安全起见仅监听 127.0.0.1。"
+              "请在面板/向导里设置密码后再开放到局域网。")
+        bind = "127.0.0.1"
+    httpd = ThreadingHTTPServer((bind, port), Handler)
+    print(f"pihy2 WebUI 运行于 http://{bind}:{port}（静态目录 {WEB_DIR}）")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        httpd.shutdown()
