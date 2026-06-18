@@ -18,6 +18,7 @@ import re
 DEFAULT_SETTINGS = {
     "mixed_port": 7890,
     "allow_lan": False,
+    "gateway_mode": False,           # 全屋网关：allow-lan + 开启 IP 转发
     "log_level": "warning",          # silent/error/warning/info/debug
     "ipv6": False,
     "tun_stack": "system",           # system/gvisor/mixed
@@ -349,7 +350,8 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
 
     cfg: dict = {
         "mixed-port": s["mixed_port"],
-        "allow-lan": s["allow_lan"],
+        # 网关模式或显式 allow_lan 时，混合代理端口/DNS 对局域网开放
+        "allow-lan": bool(s.get("allow_lan") or s.get("gateway_mode")),
         "mode": "rule",
         "log-level": s["log_level"],
         "ipv6": s["ipv6"],

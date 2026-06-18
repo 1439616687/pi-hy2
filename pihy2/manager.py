@@ -288,6 +288,24 @@ def enable_start(name: str, log=print) -> None:
 
 
 # ---------------------------------------------------------------- 应用配置
+SYSCTL_FILE = "/etc/sysctl.d/99-pihy2.conf"
+
+
+def set_ip_forward(on: bool, log=print) -> None:
+    """开/关 IPv4 转发（全屋网关模式需要：让别的设备把树莓派当网关转发上网）。"""
+    try:
+        if on:
+            with open(SYSCTL_FILE, "w") as f:
+                f.write("net.ipv4.ip_forward=1\n")
+            run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+        else:
+            if os.path.exists(SYSCTL_FILE):
+                os.remove(SYSCTL_FILE)
+            run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
+    except OSError as e:
+        log(f"设置 IP 转发失败：{e}")
+
+
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
     """渲染 -> 校验 -> 落盘 -> 重启 mihomo。校验失败则不落盘。"""
     text = store.render_config()
@@ -295,6 +313,8 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
     if not ok:
         return False, f"配置校验失败，已保留原配置：\n{out}"
     write_config(text)
+    # 网关模式跟随设置开/关 IP 转发
+    set_ip_forward(bool(store.data["settings"].get("gateway_mode")), log)
     if restart and os.path.exists(MIHOMO_SERVICE):
         service_action("mihomo", "restart", log)
     return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
@@ -449,6 +469,7 @@ def uninstall(purge: bool = False, log=print) -> None:
     for path in (MIHOMO_SERVICE, WEBUI_SERVICE, SUB_SERVICE, SUB_TIMER):
         if os.path.exists(path):
             os.remove(path)
+    set_ip_forward(False, log)            # 关掉网关模式开的 IP 转发
     run(["systemctl", "daemon-reload"])
     if purge:
         from .store import STATE_DIR
