@@ -181,6 +181,12 @@ check("零节点不泄漏 PROXY 规则/预设", "GEOSITE" not in t0 and "x.com" 
 tp = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", presets=["ads"]))
 check("启用预设后含对应规则", "GEOSITE,category-ads-all,REJECT" in tp)
 
+# 全屋网关模式 -> allow-lan
+g_off = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", gateway_mode=False))
+g_on = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", gateway_mode=True))
+check("网关关 -> allow-lan: false", "allow-lan: false" in g_off)
+check("网关开 -> allow-lan: true", "allow-lan: true" in g_on)
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):

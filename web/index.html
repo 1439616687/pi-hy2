@@ -125,6 +125,12 @@
           <label class="row"><input id="set-ipv6" type="checkbox"> 启用 IPv6</label>
         </fieldset>
         <fieldset>
+          <legend>全屋网关</legend>
+          <label class="row"><input id="set-gateway" type="checkbox"> 开启全屋网关模式</label>
+          <p class="muted small">开启后：① 局域网内设备可把代理填成 <code><span id="gw-ip">树莓派IP</span>:<span id="gw-port">7890</span></code>（HTTP/SOCKS）；
+            ② 或把设备的<b>网关/DNS 指向树莓派</b>即可全程透明走代理（已自动开启 IP 转发）。改完点“应用配置并重启”。</p>
+        </fieldset>
+        <fieldset>
           <legend>DNS</legend>
           <label>fake-ip 网段 <input id="set-fakeip" type="text"></label>
           <label>国外 DNS（每行一个，DoH/IP）

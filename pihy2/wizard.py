@@ -156,6 +156,9 @@ def _run_wizard():
     else:
         store.data["settings"]["final"] = "DIRECT"
 
+    _p(f"{C_DIM}全屋网关：让局域网里别的设备也走代理（把它们的网关/代理指向树莓派）。{C_END}")
+    store.data["settings"]["gateway_mode"] = ask_yn("开启全屋网关模式吗？", False)
+
     # ---- 4. WebUI ----
     title("第 4 步 / WebUI 管理面板")
     port = ask("WebUI 端口", str(store.data["webui"]["port"]))

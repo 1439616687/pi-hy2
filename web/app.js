@@ -398,6 +398,9 @@ function renderSettings() {
   el('set-stack').value = s.tun_stack || 'system';
   el('set-log').value = s.log_level || 'warning';
   el('set-ipv6').checked = !!s.ipv6;
+  el('set-gateway').checked = !!s.gateway_mode;
+  if (el('gw-ip')) el('gw-ip').textContent = location.hostname || '树莓派IP';
+  if (el('gw-port')) el('gw-port').textContent = s.mixed_port || 7890;
   el('set-fakeip').value = s.fake_ip_range || '198.18.0.1/16';
   el('set-dns').value = (s.dns_nameservers || []).join('\n');
   el('set-dnscn').value = (s.dns_china || []).join('\n');
@@ -418,6 +421,7 @@ async function saveSettings() {
     tun_stack: el('set-stack').value,
     log_level: el('set-log').value,
     ipv6: el('set-ipv6').checked,
+    gateway_mode: el('set-gateway').checked,
     fake_ip_range: el('set-fakeip').value.trim(),
     dns_nameservers: lines(el('set-dns').value),
     dns_china: lines(el('set-dnscn').value),
