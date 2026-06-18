@@ -18,6 +18,7 @@ import re
 DEFAULT_SETTINGS = {
     "mixed_port": 7890,
     "allow_lan": False,
+    "gateway_mode": False,           # 全屋网关：allow-lan + 开启 IP 转发
     "log_level": "warning",          # silent/error/warning/info/debug
     "ipv6": False,
     "tun_stack": "system",           # system/gvisor/mixed
@@ -26,6 +27,7 @@ DEFAULT_SETTINGS = {
     "dns_china": ["223.5.5.5", "119.29.29.29"],
     "default_up": "20 Mbps",
     "default_down": "100 Mbps",
+    "presets": [],                   # 启用的一键分流预设 key 列表
     "final": "PROXY",                # 兜底策略：PROXY 或 DIRECT
     "external_controller": "127.0.0.1:9090",  # clash API，供面板做实时切换/测速
     "secret": "",                    # clash API 密钥（首次安装随机生成）
@@ -36,6 +38,36 @@ _SAFE_DIRECT_CIDRS = [
     "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12",
     "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10",
 ]
+
+# 一键分流预设：key -> (显示名, 说明, [mihomo 规则行])。GEOSITE/GEOIP 需地理库，
+# mihomo 运行时会自动下载（走代理），故预设只建议在部署完成后开启。
+RULE_PRESETS = {
+    "ads":      ("广告拦截", "拦截广告与追踪域名", ["GEOSITE,category-ads-all,REJECT"]),
+    "streaming": ("流媒体走代理", "Netflix/YouTube/Disney 等强制走节点",
+                  ["GEOSITE,netflix,PROXY", "GEOSITE,youtube,PROXY", "GEOSITE,disney,PROXY",
+                   "GEOSITE,bahamut,PROXY", "GEOSITE,hbo,PROXY", "GEOSITE,spotify,PROXY"]),
+    "google":   ("Google 走代理", "Google 全系走节点", ["GEOSITE,google,PROXY"]),
+    "telegram": ("Telegram 走代理", "Telegram 域名与 IP 走节点",
+                 ["GEOIP,telegram,PROXY,no-resolve", "GEOSITE,telegram,PROXY"]),
+    "apple_cn": ("Apple 国内直连", "Apple 中国区资源直连", ["GEOSITE,apple-cn,DIRECT"]),
+    "cn_direct": ("大陆直连(IP+域名)", "中国大陆 IP 与域名直连（比默认更全）",
+                  ["GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT"]),
+}
+# 应用顺序（靠前优先级高）：拦截 -> 强制代理类 -> 直连类
+_PRESET_ORDER = ["ads", "streaming", "google", "telegram", "apple_cn", "cn_direct"]
+
+
+def expand_presets(enabled) -> list[str]:
+    """把启用的预设 key 展开成 mihomo 规则行（按既定优先级排序，去重）。"""
+    enabled = set(enabled or [])
+    out, seen = [], set()
+    for key in _PRESET_ORDER:
+        if key in enabled and key in RULE_PRESETS:
+            for line in RULE_PRESETS[key][2]:
+                if line not in seen:
+                    seen.add(line)
+                    out.append(line)
+    return out
 
 
 # ---------------------------------------------------------------- YAML 序列化
@@ -155,14 +187,25 @@ def rule_to_mihomo(rule: dict) -> str:
 
 
 # ---------------------------------------------------------------- 节点 -> proxy
-def node_to_proxy(node: dict, settings: dict) -> dict:
-    """节点字典 -> mihomo proxies 条目。"""
+def _apply_transport(p: dict, node: dict):
+    """把 ws/grpc 等传输层字段写进 mihomo proxy。"""
+    net = node.get("network")
+    if net in ("ws", "grpc", "httpupgrade"):
+        p["network"] = net
+    if net in ("ws", "httpupgrade"):          # httpupgrade 复用 ws-opts
+        ws = {"path": node.get("ws_path") or "/"}
+        if node.get("ws_host"):
+            ws["headers"] = {"Host": node["ws_host"]}
+        p["ws-opts"] = ws
+    elif net == "grpc" and node.get("grpc_service_name"):
+        p["grpc-opts"] = {"grpc-service-name": node["grpc_service_name"]}
+
+
+def _proxy_hysteria2(node: dict, settings: dict) -> dict:
     p = {
-        "name": node["name"],
-        "type": "hysteria2",
-        "server": node["server"],
-        "port": int(node["port"]),
-        "password": str(node["password"]),
+        "name": node["name"], "type": "hysteria2",
+        "server": node["server"], "port": int(node["port"]),
+        "password": str(node.get("password", "")),
         "sni": node.get("sni") or node["server"],
         "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
         "alpn": node.get("alpn") or ["h3"],
@@ -175,13 +218,111 @@ def node_to_proxy(node: dict, settings: dict) -> dict:
         p["obfs"] = node["obfs"]
         if node.get("obfs_password"):
             p["obfs-password"] = node["obfs_password"]
-    # fingerprint 必须是 hex 证书指纹，否则 mihomo 启动报错；非 hex 一律丢弃
     fp = str(node.get("fingerprint", "")).replace(":", "").lower()
     if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp):
         p["fingerprint"] = fp
     if node.get("fast_open"):
         p["fast-open"] = True
     return p
+
+
+def _proxy_vless(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "vless",
+        "server": node["server"], "port": int(node["port"]),
+        "uuid": str(node.get("uuid", "")), "udp": True,
+        "tls": bool(node.get("tls", False)),
+    }
+    if node.get("flow"):
+        p["flow"] = node["flow"]
+    if node.get("sni"):
+        p["servername"] = node["sni"]
+    if node.get("alpn"):
+        p["alpn"] = node["alpn"]
+    if node.get("client_fingerprint"):
+        p["client-fingerprint"] = node["client_fingerprint"]
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    if node.get("reality_pbk"):
+        p["reality-opts"] = {"public-key": node["reality_pbk"],
+                             "short-id": node.get("reality_sid", "")}
+    _apply_transport(p, node)
+    return p
+
+
+def _proxy_vmess(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "vmess",
+        "server": node["server"], "port": int(node["port"]),
+        "uuid": str(node.get("uuid", "")), "alterId": int(node.get("alter_id", 0)),
+        "cipher": node.get("cipher") or "auto", "udp": True,
+        "tls": bool(node.get("tls", False)),
+    }
+    if node.get("sni"):
+        p["servername"] = node["sni"]
+    if node.get("alpn"):
+        p["alpn"] = node["alpn"]
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    _apply_transport(p, node)
+    return p
+
+
+def _proxy_trojan(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "trojan",
+        "server": node["server"], "port": int(node["port"]),
+        "password": str(node.get("password", "")), "udp": True,
+        "sni": node.get("sni") or node["server"],
+        "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
+    }
+    if node.get("alpn"):
+        p["alpn"] = node["alpn"]
+    if node.get("client_fingerprint"):
+        p["client-fingerprint"] = node["client_fingerprint"]
+    _apply_transport(p, node)
+    return p
+
+
+def _proxy_ss(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "ss",
+        "server": node["server"], "port": int(node["port"]),
+        "cipher": node.get("cipher") or "aes-256-gcm",
+        "password": str(node.get("password", "")), "udp": True,
+    }
+    if node.get("plugin"):
+        p["plugin"] = node["plugin"]
+        if node.get("plugin_opts"):
+            p["plugin-opts"] = node["plugin_opts"]
+    return p
+
+
+def _proxy_tuic(node: dict, settings: dict) -> dict:
+    p = {
+        "name": node["name"], "type": "tuic",
+        "server": node["server"], "port": int(node["port"]),
+        "uuid": str(node.get("uuid", "")), "password": str(node.get("password", "")),
+        "sni": node.get("sni") or node["server"],
+        "alpn": node.get("alpn") or ["h3"],
+        "congestion-controller": node.get("congestion") or "bbr",
+        "udp-relay-mode": node.get("udp_relay_mode") or "native",
+        "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
+    }
+    return p
+
+
+_PROXY_BUILDERS = {
+    "hysteria2": _proxy_hysteria2, "vless": _proxy_vless, "vmess": _proxy_vmess,
+    "trojan": _proxy_trojan, "ss": _proxy_ss, "tuic": _proxy_tuic,
+}
+
+
+def node_to_proxy(node: dict, settings: dict) -> dict:
+    """节点字典 -> mihomo proxies 条目（按协议分发）。"""
+    builder = _PROXY_BUILDERS.get(node.get("type", "hysteria2"), _proxy_hysteria2)
+    return builder(node, settings)
+
 
 
 def _dedup_names(nodes: list[dict]) -> list[dict]:
@@ -209,7 +350,8 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
 
     cfg: dict = {
         "mixed-port": s["mixed_port"],
-        "allow-lan": s["allow_lan"],
+        # 网关模式或显式 allow_lan 时，混合代理端口/DNS 对局域网开放
+        "allow-lan": bool(s.get("allow_lan") or s.get("gateway_mode")),
         "mode": "rule",
         "log-level": s["log_level"],
         "ipv6": s["ipv6"],
@@ -259,19 +401,21 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
             })
         cfg["proxy-groups"] = groups
 
-    # rules：安全直连 -> 用户规则 -> 兜底
+    # rules：安全直连 -> 用户规则 -> 预设 -> 兜底
+    # 没有任何节点时，引用 PROXY 组的规则都无效，直接跳过用户规则/预设，整体走 DIRECT
     rule_lines = [f"IP-CIDR,{c},DIRECT,no-resolve" for c in _SAFE_DIRECT_CIDRS]
-    for r in (rules or []):
-        if not r.get("value", "").strip():
-            continue
-        try:
-            rule_lines.append(rule_to_mihomo(r))
-        except Exception:
-            continue
+    if nodes:
+        for r in (rules or []):
+            if not r.get("value", "").strip():
+                continue
+            try:
+                rule_lines.append(rule_to_mihomo(r))
+            except Exception:
+                continue
+        rule_lines.extend(expand_presets(s.get("presets", [])))
     final = s.get("final", "PROXY").upper()
     if final not in ("PROXY", "DIRECT"):
         final = "PROXY"
-    # 没有任何节点时，兜底只能 DIRECT，避免引用不存在的策略组
     if not nodes:
         final = "DIRECT"
     rule_lines.append(f"MATCH,{final}")

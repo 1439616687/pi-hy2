@@ -29,16 +29,19 @@ def _new_state() -> dict:
     settings["secret"] = secrets.token_hex(16)       # clash API 密钥
     return {
         "version": 1,
-        "nodes": [],          # 每个节点带一个稳定 id
+        "nodes": [],          # 每个节点带一个稳定 id；来自订阅的带 sub=订阅id
         "rules": list(DEFAULT_RULES),
+        "subscriptions": [],  # [{id,name,url,updated,count}]
         "settings": settings,
         "active": "",         # 当前选中的节点 id（空=未选/用第一个）
+        "sub_interval_hours": 12,   # 订阅自动更新间隔
         "webui": {
             "port": 8088,
             "password": "",   # 空=不鉴权（向导会建议设置）
             "bind": "0.0.0.0",
         },
         "_seq": 0,            # 自增 id 计数
+        "_subseq": 0,
     }
 
 
@@ -120,6 +123,65 @@ class Store:
     def reorder_nodes(self, order: list[str]) -> None:
         idx = {nid: i for i, nid in enumerate(order)}
         self.data["nodes"].sort(key=lambda n: idx.get(n["id"], 1e9))
+
+    # ---------------------------------------------------------------- 订阅
+    def _next_sub_id(self) -> str:
+        self.data["_subseq"] = self.data.get("_subseq", 0) + 1
+        return f"s{self.data['_subseq']}"
+
+    def add_subscription(self, name: str, url: str) -> dict:
+        sub = {"id": self._next_sub_id(), "name": name.strip() or "订阅",
+               "url": url.strip(), "updated": "", "count": 0}
+        self.data.setdefault("subscriptions", []).append(sub)
+        return sub
+
+    def get_subscription(self, sid: str) -> dict | None:
+        return next((s for s in self.data.get("subscriptions", []) if s["id"] == sid), None)
+
+    def delete_subscription(self, sid: str, remove_nodes: bool = True) -> bool:
+        subs = self.data.get("subscriptions", [])
+        if not any(s["id"] == sid for s in subs):
+            return False
+        self.data["subscriptions"] = [s for s in subs if s["id"] != sid]
+        if remove_nodes:
+            keep = [n for n in self.data["nodes"] if n.get("sub") != sid]
+            self.data["nodes"] = keep
+            if self.data.get("active") and not self.get_node(self.data["active"]):
+                self.data["active"] = keep[0]["id"] if keep else ""
+        else:
+            for n in self.data["nodes"]:
+                if n.get("sub") == sid:
+                    n.pop("sub", None)
+        return True
+
+    def set_subscription_nodes(self, sid: str, nodes: list[dict]) -> int:
+        """用新解析的节点替换该订阅下的旧节点，尽量保住“当前节点”。"""
+        sub = self.get_subscription(sid)
+        if not sub:
+            return 0
+        # 记录当前节点的稳定标识（名字可能被机场改/复用，故用 名+服务器+端口）
+        active_node = self.active_node()
+        active_key = None
+        if active_node and active_node.get("sub") == sid:
+            active_key = (active_node.get("name"), active_node.get("server"), active_node.get("port"))
+        # 删掉该订阅旧节点，追加新节点（标记 sub）
+        self.data["nodes"] = [n for n in self.data["nodes"] if n.get("sub") != sid]
+        added = []
+        for nd in nodes:
+            nd = dict(nd)
+            nd["sub"] = sid
+            added.append(self.add_node(nd))
+        # 恢复 active：优先 名+服务器+端口 完全一致，其次同名，最后该订阅第一个
+        if active_key:
+            match = next((n for n in added if (n.get("name"), n.get("server"), n.get("port")) == active_key), None) \
+                or next((n for n in added if n.get("name") == active_key[0]), None)
+            self.data["active"] = (match or (added[0] if added else {})).get("id", self.data.get("active", ""))
+        if self.data.get("active") and not self.get_node(self.data["active"]):
+            self.data["active"] = self.data["nodes"][0]["id"] if self.data["nodes"] else ""
+        import time
+        sub["updated"] = time.strftime("%Y-%m-%d %H:%M")
+        sub["count"] = len(added)
+        return len(added)
 
     # ---------------------------------------------------------------- 规则/设置
     def set_rules(self, rules: list[dict]) -> None:

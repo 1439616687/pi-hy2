@@ -1,20 +1,22 @@
-"""hysteria2 / hy2 节点分享链接解析。
+"""节点分享链接解析（多协议）。
 
-支持：
-  * hysteria2://  与  hy2://  两种 scheme
-  * 密码、SNI、节点名（fragment）的百分号编码自动还原（如 %2F -> /）
-  * 常见参数及其别名：sni/peer、insecure/allowInsecure、obfs、obfs-password、
-    alpn、up/upmbps、down/downmbps、端口跳跃 mport/ports、pinSHA256、fastopen
-  * 一次粘贴多行链接（按行解析）
-  * base64 编码的订阅内容（自动探测并解码）
+支持的 scheme：
+  * hysteria2:// , hy2://     —— hysteria2
+  * vless://                  —— VLESS（含 tls / reality / ws / grpc）
+  * vmess://                  —— VMess（base64(JSON) 形式）
+  * trojan://                 —— Trojan
+  * ss://                     —— Shadowsocks（SIP002 与旧式 base64）
+  * tuic://                   —— TUIC v5
 
-解析结果是一个“节点字典”，字段与 config_gen 中的 mihomo 代理一一对应。
+还支持：百分号编码自动还原、一次粘贴多行、base64 订阅内容自动探测解码。
+解析结果是一个“节点字典”，由 config_gen 映射为 mihomo proxies 条目。
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from urllib.parse import urlsplit, unquote, parse_qs
 
@@ -24,19 +26,28 @@ class ParseError(ValueError):
     pass
 
 
-_SCHEMES = ("hysteria2://", "hy2://")
+_SCHEMES = ("hysteria2://", "hy2://", "vless://", "vmess://",
+            "trojan://", "ss://", "tuic://")
 
 
+# ---------------------------------------------------------------- 通用小工具
 def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int(v, default: int = 0) -> int:
+    """宽松转 int，兼容 "443"/"1.0"/None/非法值，避免脏数据让整次订阅解析崩掉。"""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalize_fingerprint(v: str) -> str:
     """把证书指纹规范化为 mihomo 期望的 64 位小写 hex；不是 hex 则返回 ""。
 
-    注意：分享链接里的 pinSHA256 通常是 ``sha256/<base64>`` 形式的“公钥固定”，
-    与 mihomo 的 ``fingerprint``（证书的 hex SHA-256）是两种不同机制，不能混用，
-    否则 mihomo 启动直接报 ``fingerprint string decode error`` 导致整条配置失效。
+    分享链接里的 pinSHA256 通常是 ``sha256/<base64>`` 公钥固定，与 mihomo 的
+    ``fingerprint``（证书 hex SHA-256）不同，混用会让 mihomo 启动直接报错。
     """
     s = v.strip().replace(":", "").lower()
     if len(s) == 64 and all(c in "0123456789abcdef" for c in s):
@@ -45,7 +56,7 @@ def _normalize_fingerprint(v: str) -> str:
 
 
 def _raw_query(query: str, *keys: str) -> str:
-    """从原始 query 串里取参数值，用 unquote（而非 parse_qs 的 unquote_plus），
+    """从原始 query 串取参数值，用 unquote（而非 parse_qs 的 unquote_plus），
     避免密码里的 '+' 被误解成空格。"""
     wanted = {k.lower() for k in keys}
     for pair in query.split("&"):
@@ -74,88 +85,284 @@ def _split_hostport(hostport: str) -> tuple[str, int]:
         m = re.match(r"^\[(?P<host>[^\]]+)\](?::(?P<port>\d+))?$", hostport)
         if not m:
             raise ParseError(f"无法解析地址：{hostport}")
-        host = m.group("host")
-        port = int(m.group("port")) if m.group("port") else 443
-        return host, port
+        return m.group("host"), int(m.group("port")) if m.group("port") else 443
     if ":" in hostport:
         host, _, port_s = hostport.rpartition(":")
         if not port_s.isdigit():
-            # 冒号但端口非数字 —— 当成没有端口（host 含冒号的情况极少）
             return hostport, 443
         return host, int(port_s)
     return hostport, 443
 
 
-def parse_link(link: str) -> dict:
-    """解析单条 hysteria2/hy2 链接，返回节点字典。失败抛 ParseError。"""
-    link = link.strip()
-    if not link:
-        raise ParseError("空链接")
+def _alpn(raw: str) -> list[str]:
+    return [a.strip() for a in raw.split(",") if a.strip()]
 
-    low = link.lower()
-    if not low.startswith(_SCHEMES):
-        raise ParseError("不是 hysteria2:// 或 hy2:// 链接")
 
-    sr = urlsplit(link)
+def _b64decode(s: str) -> str:
+    """宽松 base64 解码（兼容 url-safe 与缺省 padding）。"""
+    s = s.strip()
+    for variant in (s, s.replace("-", "+").replace("_", "/")):
+        try:
+            return base64.b64decode(variant + "=" * (-len(variant) % 4)).decode("utf-8", "ignore")
+        except (binascii.Error, ValueError):
+            continue
+    raise ParseError("base64 解码失败")
 
-    # 手动从 netloc 取 userinfo（密码）与 host:port，避免 username:password 歧义，
-    # 因为 hy2 的鉴权是“单个密码串”，其本身可能含冒号。
-    netloc = sr.netloc
+
+def _userinfo_hostport(netloc: str) -> tuple[str, str]:
     if "@" in netloc:
         userinfo, hostport = netloc.rsplit("@", 1)
-    else:
-        userinfo, hostport = "", netloc
+        return userinfo, hostport
+    return "", netloc
 
-    host, port = _split_hostport(hostport)
+
+def _base_node(name: str, typ: str, host: str, port: int) -> dict:
     if not host:
         raise ParseError("缺少服务器地址")
+    return {"name": name.strip() or host, "type": typ, "server": host, "port": port}
 
+
+def _net_fields(node: dict, network: str, *,
+                ws_path="", ws_host="", grpc_sn=""):
+    """填充传输层相关字段。仅支持会真正下发 opts 的 ws/httpupgrade/grpc，
+    其余（tcp/h2/http）按 tcp 处理，避免出现“有 network 没 opts”的半截配置。"""
+    network = (network or "tcp").lower()
+    if network in ("ws", "httpupgrade"):
+        node["network"] = network
+        node["ws_path"] = ws_path or "/"
+        node["ws_host"] = ws_host
+    elif network == "grpc":
+        node["network"] = "grpc"
+        node["grpc_service_name"] = grpc_sn
+
+
+# ---------------------------------------------------------------- hysteria2
+def _parse_hysteria2(link: str) -> dict:
+    sr = urlsplit(link)
+    userinfo, hostport = _userinfo_hostport(sr.netloc)
+    host, port = _split_hostport(hostport)
     qs = parse_qs(sr.query, keep_blank_values=True)
 
-    # 密码：优先 userinfo（已 unquote），其次 query 里的 auth/password（用 unquote 取原始值）
     password = unquote(userinfo) if userinfo else _raw_query(sr.query, "auth", "password")
     if not password:
         raise ParseError("缺少密码")
 
-    # SNI：sni / peer，缺省回退到服务器域名
-    sni = _first(qs, "sni", "peer") or host
-
-    # ALPN：逗号分隔，缺省 h3
-    alpn_raw = _first(qs, "alpn")
-    alpn = [a.strip() for a in alpn_raw.split(",") if a.strip()] if alpn_raw else ["h3"]
-
-    # 混淆：仅 hy2 的 salamander
     obfs = _first(qs, "obfs").strip().lower()
-    obfs_password = _first(qs, "obfs-password", "obfs_password", "obfsParam")
-    if obfs and obfs != "salamander":
-        # 未知混淆类型，保留原值让用户在面板里确认（mihomo -t 会校验）
-        pass
-
-    # 证书指纹/公钥固定：链接里的 pinSHA256 多为 sha256/<base64> 公钥固定，
-    # mihomo 的 fingerprint 只接受 hex 证书指纹。仅当确实是 hex 时才用作 fingerprint，
-    # 其余原样保存在 pin_sha256（仅作展示/导出，不下发给 mihomo）以免启动失败。
     pin_raw = _first(qs, "pinSHA256", "pinsha256").strip()
     fingerprint = _normalize_fingerprint(pin_raw)
 
-    node = {
-        "name": unquote(sr.fragment).strip() if sr.fragment else host,
-        "type": "hysteria2",
-        "server": host,
-        "port": port,
-        "ports": _first(qs, "mport", "ports").strip(),  # 端口跳跃，如 443-8443,8888
+    node = _base_node(unquote(sr.fragment), "hysteria2", host, port)
+    node.update({
         "password": password,
-        "sni": sni,
+        "sni": _first(qs, "sni", "peer") or host,
         "skip_cert_verify": _truthy(_first(qs, "insecure", "allowInsecure", default="0")),
-        "alpn": alpn,
-        "obfs": obfs,                       # "" 或 "salamander"
-        "obfs_password": obfs_password,
-        "up": _first(qs, "up", "upmbps").strip(),       # "" 表示用全局默认
+        "alpn": _alpn(_first(qs, "alpn")) or ["h3"],
+        "obfs": obfs,
+        "obfs_password": _first(qs, "obfs-password", "obfs_password", "obfsParam"),
+        "up": _first(qs, "up", "upmbps").strip(),
         "down": _first(qs, "down", "downmbps").strip(),
-        "fingerprint": fingerprint,                     # 仅 hex 证书指纹
-        "pin_sha256": "" if fingerprint else pin_raw,   # 无法被 mihomo 使用的公钥固定，仅保留
+        "ports": _first(qs, "mport", "ports").strip(),
+        "fingerprint": fingerprint,
+        "pin_sha256": "" if fingerprint else pin_raw,
         "fast_open": _truthy(_first(qs, "fastopen", default="0")),
-    }
+    })
     return node
+
+
+# ---------------------------------------------------------------- vless
+def _parse_vless(link: str) -> dict:
+    sr = urlsplit(link)
+    userinfo, hostport = _userinfo_hostport(sr.netloc)
+    uuid = unquote(userinfo)
+    if not uuid:
+        raise ParseError("VLESS 缺少 UUID")
+    host, port = _split_hostport(hostport)
+    qs = parse_qs(sr.query, keep_blank_values=True)
+
+    security = _first(qs, "security").lower()
+    network = _first(qs, "type", "headerType", default="tcp").lower() or "tcp"
+    pbk = _first(qs, "pbk")
+    is_reality = security == "reality" or bool(pbk)   # 有公钥即按 reality 处理
+
+    node = _base_node(unquote(sr.fragment), "vless", host, port)
+    node.update({
+        "uuid": uuid,
+        "tls": security in ("tls", "reality", "xtls") or is_reality,
+        "sni": _first(qs, "sni", "peer"),
+        "flow": _first(qs, "flow"),
+        "client_fingerprint": _first(qs, "fp"),
+        "alpn": _alpn(_first(qs, "alpn")),
+        "skip_cert_verify": _truthy(_first(qs, "allowInsecure", "insecure", default="0")),
+    })
+    if is_reality:
+        node["reality_pbk"] = pbk
+        node["reality_sid"] = _first(qs, "sid")
+    _net_fields(node, network, ws_path=_first(qs, "path"),
+                ws_host=_first(qs, "host"), grpc_sn=_first(qs, "serviceName"))
+    return node
+
+
+# ---------------------------------------------------------------- vmess
+def _parse_vmess(link: str) -> dict:
+    raw = link[len("vmess://"):]
+    try:
+        j = json.loads(_b64decode(raw))
+    except (json.JSONDecodeError, ValueError):
+        raise ParseError("VMess 链接不是合法的 base64(JSON)")
+    host = j.get("add", "")
+    port = _int(j.get("port"), 443)
+    if not host:
+        raise ParseError("VMess 缺少服务器地址")
+    network = str(j.get("net", "tcp")).lower()
+    alpn_raw = j.get("alpn")
+    alpn_str = alpn_raw if isinstance(alpn_raw, str) else (
+        ",".join(str(x) for x in alpn_raw) if isinstance(alpn_raw, (list, tuple)) else "")
+
+    node = _base_node(str(j.get("ps", "")), "vmess", host, port)
+    node.update({
+        "uuid": str(j.get("id", "")),
+        "alter_id": _int(j.get("aid"), 0),
+        "cipher": j.get("scy") or "auto",
+        "tls": str(j.get("tls", "")).lower() in ("tls", "true", "1"),
+        "sni": j.get("sni") or "",
+        "alpn": _alpn(alpn_str),
+        "skip_cert_verify": _truthy(str(j.get("skip-cert-verify", j.get("verify_cert", "0")))),
+    })
+    if not node["uuid"]:
+        raise ParseError("VMess 缺少 UUID")
+    _net_fields(node, network, ws_path=j.get("path", ""),
+                ws_host=j.get("host", ""), grpc_sn=j.get("path", ""))
+    return node
+
+
+# ---------------------------------------------------------------- trojan
+def _parse_trojan(link: str) -> dict:
+    sr = urlsplit(link)
+    userinfo, hostport = _userinfo_hostport(sr.netloc)
+    password = unquote(userinfo) if userinfo else _raw_query(sr.query, "password")
+    if not password:
+        raise ParseError("Trojan 缺少密码")
+    host, port = _split_hostport(hostport)
+    qs = parse_qs(sr.query, keep_blank_values=True)
+    network = _first(qs, "type", default="tcp").lower()
+
+    node = _base_node(unquote(sr.fragment), "trojan", host, port)
+    node.update({
+        "password": password,
+        "sni": _first(qs, "sni", "peer") or host,
+        "skip_cert_verify": _truthy(_first(qs, "allowInsecure", "insecure", default="0")),
+        "alpn": _alpn(_first(qs, "alpn")),
+        "client_fingerprint": _first(qs, "fp"),
+    })
+    _net_fields(node, network, ws_path=_first(qs, "path"),
+                ws_host=_first(qs, "host"), grpc_sn=_first(qs, "serviceName"))
+    return node
+
+
+# ---------------------------------------------------------------- shadowsocks
+def _parse_ss(link: str) -> dict:
+    body = link[len("ss://"):]
+    name = ""
+    if "#" in body:
+        body, frag = body.split("#", 1)
+        name = unquote(frag)
+    query = ""
+    if "?" in body:
+        body, query = body.split("?", 1)
+
+    if "@" in body:                       # SIP002：base64(method:pass)@host:port
+        userinfo, hostport = body.rsplit("@", 1)
+        try:
+            method, password = _b64decode(userinfo).split(":", 1)
+        except (ParseError, ValueError):
+            if ":" in userinfo:           # 少数已是明文
+                method, password = unquote(userinfo).split(":", 1)
+            else:
+                raise ParseError("SS 用户信息无法解析")
+        host, port = _split_hostport(hostport)
+    else:                                 # 旧式：base64(method:pass@host:port)
+        dec = _b64decode(body)
+        if "@" not in dec or ":" not in dec:
+            raise ParseError("SS 链接格式无法识别")
+        cred, hostport = dec.rsplit("@", 1)
+        method, password = cred.split(":", 1)
+        host, port = _split_hostport(hostport)
+
+    node = _base_node(name, "ss", host, port)
+    node.update({"cipher": method, "password": password})
+
+    if query:
+        qs = parse_qs(query, keep_blank_values=True)
+        plugin_raw = _first(qs, "plugin")
+        if plugin_raw:
+            parts = plugin_raw.split(";")
+            pname = parts[0]
+            opts = {}
+            for kv in parts[1:]:
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    opts[k] = v
+                elif kv:
+                    opts[kv] = True
+            if pname in ("obfs-local", "simple-obfs"):
+                node["plugin"] = "obfs"
+                node["plugin_opts"] = {"mode": opts.get("obfs", "http"),
+                                       "host": opts.get("obfs-host", "")}
+            elif pname == "v2ray-plugin":
+                node["plugin"] = "v2ray-plugin"
+                node["plugin_opts"] = {"mode": opts.get("mode", "websocket"),
+                                       "host": opts.get("host", ""),
+                                       "path": opts.get("path", "/")}
+            else:
+                node["plugin"] = pname
+    return node
+
+
+# ---------------------------------------------------------------- tuic
+def _parse_tuic(link: str) -> dict:
+    sr = urlsplit(link)
+    userinfo, hostport = _userinfo_hostport(sr.netloc)
+    if ":" in userinfo:
+        uuid, password = userinfo.split(":", 1)
+    else:
+        uuid, password = userinfo, ""
+    uuid, password = unquote(uuid), unquote(password)
+    if not uuid:
+        raise ParseError("TUIC 缺少 UUID")
+    host, port = _split_hostport(hostport)
+    qs = parse_qs(sr.query, keep_blank_values=True)
+
+    node = _base_node(unquote(sr.fragment), "tuic", host, port)
+    node.update({
+        "uuid": uuid,
+        "password": password,
+        "sni": _first(qs, "sni", "peer") or host,
+        "alpn": _alpn(_first(qs, "alpn")) or ["h3"],
+        "congestion": _first(qs, "congestion_control", "congestion", default="bbr"),
+        "udp_relay_mode": _first(qs, "udp_relay_mode", default="native"),
+        "skip_cert_verify": _truthy(_first(qs, "allow_insecure", "insecure", default="0")),
+    })
+    return node
+
+
+# ---------------------------------------------------------------- 分发
+_PARSERS = {
+    "hysteria2": _parse_hysteria2, "hy2": _parse_hysteria2,
+    "vless": _parse_vless, "vmess": _parse_vmess,
+    "trojan": _parse_trojan, "ss": _parse_ss, "tuic": _parse_tuic,
+}
+
+
+def parse_link(link: str) -> dict:
+    """解析单条分享链接，自动识别协议。失败抛 ParseError。"""
+    link = link.strip()
+    if not link:
+        raise ParseError("空链接")
+    scheme = link.split("://", 1)[0].lower() if "://" in link else ""
+    fn = _PARSERS.get(scheme)
+    if not fn:
+        raise ParseError("不支持的链接类型（支持 hysteria2/hy2/vless/vmess/trojan/ss/tuic）")
+    return fn(link)
 
 
 def _maybe_base64_decode(text: str) -> str | None:
@@ -165,14 +372,13 @@ def _maybe_base64_decode(text: str) -> str | None:
         return None
     if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", compact):
         return None
-    # URL-safe 与标准 base64 都试
     for variant in (compact, compact.replace("-", "+").replace("_", "/")):
         padded = variant + "=" * (-len(variant) % 4)
         try:
             decoded = base64.b64decode(padded).decode("utf-8", "ignore")
         except (binascii.Error, ValueError):
             continue
-        if any(s in decoded.lower() for s in _SCHEMES):
+        if "://" in decoded or "proxies:" in decoded:   # base64 的链接列表或 Clash YAML
             return decoded
     return None
 
@@ -189,30 +395,211 @@ def parse_many(text: str) -> tuple[list[dict], list[str]]:
     if decoded is not None:
         text = decoded
 
+    # 没有任何 scheme 链接、但像 Clash/mihomo YAML 订阅 -> 走 YAML 解析
+    has_link = any("://" in ln and ln.strip().split("://", 1)[0].lower() in _PARSERS
+                   for ln in text.splitlines())
+    if not has_link and "proxies:" in text:
+        return parse_clash_yaml(text)
+
     nodes: list[dict] = []
     errors: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or line.startswith("//"):
             continue
-        if not line.lower().startswith(_SCHEMES):
-            errors.append(f"已跳过（非 hy2 链接）：{line[:40]}")
+        if "://" not in line or line.split("://", 1)[0].lower() not in _PARSERS:
+            errors.append(f"已跳过（不支持的链接）：{line[:40]}")
             continue
         try:
             nodes.append(parse_link(line))
         except ParseError as e:
             errors.append(f"解析失败：{e} —— {line[:40]}")
+        except Exception as e:  # 脏数据兜底：单条异常不拖垮整次解析
+            errors.append(f"解析异常：{e} —— {line[:40]}")
     if not nodes and not errors:
-        errors.append("未发现可用的 hy2 节点链接")
+        errors.append("未发现可用的节点链接")
     return nodes, errors
 
 
+# ---------------------------------------------------------------- Clash YAML
+# mihomo 代理字段 -> 内部节点字段（其余按传输/特殊逻辑单独处理）
+_MIHOMO_FIELD_MAP = {
+    "password": "password", "uuid": "uuid", "cipher": "cipher",
+    "alterId": "alter_id", "flow": "flow", "client-fingerprint": "client_fingerprint",
+    "fingerprint": "fingerprint", "obfs": "obfs", "obfs-password": "obfs_password",
+    "up": "up", "down": "down", "ports": "ports", "plugin": "plugin",
+    "congestion-controller": "congestion", "udp-relay-mode": "udp_relay_mode",
+}
+_SUPPORTED_TYPES = {"hysteria2", "vless", "vmess", "trojan", "ss", "tuic"}
+
+
+def proxy_to_node(p: dict) -> dict:
+    """把一条 mihomo proxies 条目转成内部节点字典。不支持的类型抛 ParseError。"""
+    t = str(p.get("type", "")).lower()
+    t = {"hy2": "hysteria2", "shadowsocks": "ss"}.get(t, t)
+    if t not in _SUPPORTED_TYPES:
+        raise ParseError(f"暂不支持的协议类型：{t or '空'}")
+    server = str(p.get("server", "")).strip()
+    if not server:
+        raise ParseError("缺少服务器地址")
+    node = _base_node(str(p.get("name") or server), t, server, _int(p.get("port"), 443))
+
+    for src, dst in _MIHOMO_FIELD_MAP.items():
+        if p.get(src) not in (None, ""):
+            node[dst] = p[src]
+    if "skip-cert-verify" in p:
+        node["skip_cert_verify"] = bool(p["skip-cert-verify"])
+    if p.get("tls"):
+        node["tls"] = True
+    if p.get("fast-open"):
+        node["fast_open"] = True
+    if "sni" not in node:
+        sni = p.get("sni") or p.get("servername")
+        if sni:
+            node["sni"] = sni
+    alpn = p.get("alpn")
+    if isinstance(alpn, list):
+        node["alpn"] = [str(a) for a in alpn]
+    elif isinstance(alpn, str):
+        node["alpn"] = _alpn(alpn)
+    ro = p.get("reality-opts")
+    if isinstance(ro, dict):
+        node["reality_pbk"] = ro.get("public-key", "")
+        node["reality_sid"] = ro.get("short-id", "")
+        node["tls"] = True
+    net = str(p.get("network", "")).lower()
+    if net in ("ws", "grpc", "httpupgrade"):
+        node["network"] = net
+        ws = p.get("ws-opts")
+        if isinstance(ws, dict):
+            node["ws_path"] = ws.get("path", "/")
+            h = ws.get("headers")
+            if isinstance(h, dict):
+                node["ws_host"] = h.get("Host") or h.get("host") or ""
+        g = p.get("grpc-opts")
+        if isinstance(g, dict):
+            node["grpc_service_name"] = g.get("grpc-service-name", "")
+    po = p.get("plugin-opts")
+    if isinstance(po, dict):
+        node["plugin_opts"] = dict(po)
+    if t in ("vless", "vmess", "tuic") and not node.get("uuid"):
+        raise ParseError(f"{t} 缺少 UUID")
+    return node
+
+
+def parse_clash_yaml(text: str) -> tuple[list[dict], list[str]]:
+    """解析 Clash/mihomo YAML 订阅的 proxies 段。返回 (节点列表, 错误列表)。"""
+    from . import yaml_lite
+    try:
+        doc = yaml_lite.load(text)
+    except yaml_lite.YamlError as e:
+        return [], [f"YAML 解析失败：{e}"]
+    if not isinstance(doc, dict) or not isinstance(doc.get("proxies"), list):
+        return [], ["未找到 proxies 段（不是 Clash 订阅？）"]
+    nodes, errors = [], []
+    for p in doc["proxies"]:
+        if not isinstance(p, dict):
+            continue
+        try:
+            nodes.append(proxy_to_node(p))
+        except ParseError as e:
+            errors.append(f"跳过：{e} —— {p.get('name', '?')}")
+        except Exception as e:
+            errors.append(f"跳过（异常 {e}）：{p.get('name', '?')}")
+    if not nodes and not errors:
+        errors.append("proxies 段为空")
+    return nodes, errors
+
+
+# ---------------------------------------------------------------- 反向导出
 def node_to_link(node: dict) -> str:
-    """把节点字典反向拼成 hysteria2:// 分享链接（用于导出/复制）。"""
+    """把节点字典反向拼成分享链接（用于导出/复制）。"""
     from urllib.parse import quote, urlencode
 
-    params: dict[str, str] = {}
-    if node.get("sni") and node["sni"] != node["server"]:
+    t = node.get("type", "hysteria2")
+    host = node["server"]
+    hostb = f"[{host}]" if ":" in host else host
+    name = node.get("name", "")
+    frag = ("#" + quote(str(name), safe="")) if name else ""
+
+    if t == "vmess":
+        j = {
+            "v": "2", "ps": name, "add": host, "port": str(node["port"]),
+            "id": node.get("uuid", ""), "aid": str(node.get("alter_id", 0)),
+            "scy": node.get("cipher", "auto"), "net": node.get("network", "tcp"),
+            "type": "none", "host": node.get("ws_host", ""),
+            "path": node.get("ws_path", "") or node.get("grpc_service_name", ""),
+            "tls": "tls" if node.get("tls") else "", "sni": node.get("sni", ""),
+        }
+        return "vmess://" + base64.b64encode(
+            json.dumps(j, ensure_ascii=False).encode()).decode()
+
+    if t in ("vless", "trojan", "tuic"):
+        params: dict[str, str] = {}
+        net = node.get("network", "tcp")
+        if t == "vless":
+            cred = quote(node.get("uuid", ""), safe="")
+            params["encryption"] = "none"
+            params["security"] = "reality" if node.get("reality_pbk") else ("tls" if node.get("tls") else "none")
+            params["type"] = net
+            if node.get("flow"):
+                params["flow"] = node["flow"]
+            if node.get("reality_pbk"):
+                params["pbk"] = node["reality_pbk"]
+                if node.get("reality_sid"):
+                    params["sid"] = node["reality_sid"]
+        elif t == "trojan":
+            cred = quote(node.get("password", ""), safe="")
+            if net != "tcp":
+                params["type"] = net
+        else:  # tuic
+            cred = quote(node.get("uuid", ""), safe="") + ":" + quote(node.get("password", ""), safe="")
+            if node.get("congestion"):
+                params["congestion_control"] = node["congestion"]
+            if node.get("udp_relay_mode"):
+                params["udp_relay_mode"] = node["udp_relay_mode"]
+        if node.get("sni"):
+            params["sni"] = node["sni"]
+        if node.get("alpn"):
+            params["alpn"] = ",".join(node["alpn"])
+        if node.get("client_fingerprint"):
+            params["fp"] = node["client_fingerprint"]
+        if node.get("skip_cert_verify"):
+            params["allowInsecure"] = "1"
+        if net == "ws":
+            if node.get("ws_path"):
+                params["path"] = node["ws_path"]
+            if node.get("ws_host"):
+                params["host"] = node["ws_host"]
+        if net == "grpc" and node.get("grpc_service_name"):
+            params["serviceName"] = node["grpc_service_name"]
+        q = ("?" + urlencode(params)) if params else ""
+        return f"{t}://{cred}@{hostb}:{node['port']}{q}{frag}"
+
+    if t == "ss":
+        userinfo = base64.b64encode(
+            f"{node.get('cipher','')}:{node.get('password','')}".encode()).decode().rstrip("=")
+        q = ""
+        if node.get("plugin"):                       # 还原 SIP002 plugin，避免导出丢插件
+            opts = node.get("plugin_opts") or {}
+            if node["plugin"] == "obfs":
+                ps = f"obfs-local;obfs={opts.get('mode', 'http')}"
+                if opts.get("host"):
+                    ps += f";obfs-host={opts['host']}"
+            elif node["plugin"] == "v2ray-plugin":
+                ps = f"v2ray-plugin;mode={opts.get('mode', 'websocket')}"
+                if opts.get("host"):
+                    ps += f";host={opts['host']}"
+                if opts.get("path"):
+                    ps += f";path={opts['path']}"
+            else:
+                ps = node["plugin"]
+            q = "?" + urlencode({"plugin": ps})
+        return f"ss://{userinfo}@{hostb}:{node['port']}{q}{frag}"
+
+    # hysteria2
+    params = {}
+    if node.get("sni") and node["sni"] != host:
         params["sni"] = node["sni"]
     if node.get("skip_cert_verify"):
         params["insecure"] = "1"
@@ -220,27 +607,20 @@ def node_to_link(node: dict) -> str:
         params["obfs"] = node["obfs"]
         if node.get("obfs_password"):
             params["obfs-password"] = node["obfs_password"]
-    alpn = node.get("alpn") or []
-    if alpn and alpn != ["h3"]:
-        params["alpn"] = ",".join(alpn)
+    if node.get("alpn") and node["alpn"] != ["h3"]:
+        params["alpn"] = ",".join(node["alpn"])
     if node.get("ports"):
         params["mport"] = node["ports"]
     if node.get("up"):
         params["up"] = node["up"]
     if node.get("down"):
         params["down"] = node["down"]
-    # 优先导出原始公钥固定；否则导出 hex 证书指纹
     if node.get("pin_sha256"):
         params["pinSHA256"] = node["pin_sha256"]
     elif node.get("fingerprint"):
         params["pinSHA256"] = node["fingerprint"]
     if node.get("fast_open"):
         params["fastopen"] = "1"
-
     auth = quote(str(node["password"]), safe="")
-    host = node["server"]
-    if ":" in host:  # IPv6
-        host = f"[{host}]"
-    query = ("?" + urlencode(params)) if params else ""
-    frag = ("#" + quote(str(node.get("name", "")), safe="")) if node.get("name") else ""
-    return f"hysteria2://{auth}@{host}:{node['port']}/{query}{frag}"
+    q = ("?" + urlencode(params)) if params else ""
+    return f"hysteria2://{auth}@{hostb}:{node['port']}/{q}{frag}"

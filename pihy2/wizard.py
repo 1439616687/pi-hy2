@@ -44,7 +44,7 @@ def ask_yn(prompt: str, default: bool = True) -> bool:
 
 
 def read_links() -> str:
-    _p("粘贴一个或多个 hy2 节点链接（hysteria2:// 或 hy2://，每行一个；")
+    _p("粘贴一个或多个节点分享链接（每行一个，支持 hysteria2/vless/vmess/trojan/ss/tuic；")
     _p("也支持 base64 订阅内容）。粘贴完成后按回车进入空行结束：")
     lines = []
     while True:
@@ -95,7 +95,24 @@ def _run_wizard():
 
     # ---- 1. 节点 ----
     title("第 1 步 / 添加节点")
-    while True:
+    # 1a. 可选：先加订阅地址（之后会定时自动更新）
+    if ask_yn("有订阅地址吗？填了会定时自动更新（没有就跳过）", False):
+        url = ask("订阅 URL")
+        if url:
+            sub = store.add_subscription(ask("给这个订阅起个名字", "我的订阅"), url)
+            _p(f"  {C_DIM}正在拉取订阅…{C_END}")
+            cnt, errs = manager.refresh_subscription(store, sub["id"], log=lambda m: _p("  " + m))
+            for e in errs[:3]:
+                _p(f"  {C_WARN}{e}{C_END}")
+            if cnt:
+                _p(f"  {C_OK}订阅添加成功，{cnt} 个节点{C_END}")
+            else:
+                _p(f"  {C_WARN}订阅暂未取到节点，可稍后在面板重试{C_END}")
+    # 1b. 手动粘贴链接（已有订阅节点时可跳过）
+    want_manual = True
+    if store.data["nodes"]:
+        want_manual = ask_yn("再手动粘贴一些链接吗？", False)
+    while want_manual:
         text = read_links()
         nodes, errs = parser.parse_many(text)
         for e in errs:
@@ -109,10 +126,10 @@ def _run_wizard():
         else:
             _p(f"{C_ERR}没有解析到节点。{C_END}")
         if not ask_yn("重新粘贴？", True):
-            if not store.data["nodes"]:
-                _p("没有任何节点，已退出。")
-                return
             break
+    if not store.data["nodes"]:
+        _p("没有任何节点，已退出。")
+        return
 
     # ---- 2. 默认带宽 ----
     title("第 2 步 / 默认带宽（影响 hy2 速度，填接近你实际宽带的值）")
@@ -138,6 +155,11 @@ def _run_wizard():
         store.data["settings"]["final"] = "PROXY"
     else:
         store.data["settings"]["final"] = "DIRECT"
+
+    _p(f"{C_DIM}全屋网关：让局域网里别的设备也走代理。开启后两种用法——{C_END}")
+    _p(f"{C_DIM}  ① 最稳：在设备上把 HTTP/SOCKS 代理填成 树莓派IP:7890（即开即用）；{C_END}")
+    _p(f"{C_DIM}  ② 进阶：把设备网关指向树莓派做透明代理（依赖 TUN 转发，设好后请用该设备验证出口IP）。{C_END}")
+    store.data["settings"]["gateway_mode"] = ask_yn("开启全屋网关模式吗？", False)
 
     # ---- 4. WebUI ----
     title("第 4 步 / WebUI 管理面板")
@@ -181,7 +203,8 @@ def _run_wizard():
     _p(f"  {C_OK}配置校验通过{C_END}")
 
     _p("· 安装系统服务并设为开机自启")
-    manager.install_services(log=lambda m: _p("  " + m))
+    manager.install_services_with_timer(
+        hours=store.data.get("sub_interval_hours", 12), log=lambda m: _p("  " + m))
     manager.enable_start("mihomo", log=lambda m: _p("  " + m))
     manager.enable_start("pihy2-web", log=lambda m: _p("  " + m))
 

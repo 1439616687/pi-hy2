@@ -109,6 +109,14 @@ legend { padding: 0 8px; color: var(--primary); font-weight: 600; }
 .modal-card h3 { margin-top: 0; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 
+.speed { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.conn-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.conn-table th, .conn-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.conn-table th { color: var(--muted); font-weight: 500; }
+.conn-table td:nth-child(4), .conn-table td:nth-child(5),
+.conn-table th:nth-child(4), .conn-table th:nth-child(5) { text-align: right; white-space: nowrap; }
+.conn-table td:first-child { word-break: break-all; }
+
 .codebox {
   background: #0a0e12; border: 1px solid var(--line); border-radius: var(--radius);
   padding: 14px; overflow: auto; max-height: 60vh; font-size: 12px; white-space: pre-wrap; word-break: break-all;

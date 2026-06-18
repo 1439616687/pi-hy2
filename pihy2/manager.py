@@ -270,6 +270,11 @@ WantedBy=multi-user.target
     log("systemd 服务已写入")
 
 
+def install_services_with_timer(hours: int = 12, log=print) -> None:
+    install_services(log)
+    install_sub_timer(hours, log)
+
+
 def service_action(name: str, action: str, log=print) -> subprocess.CompletedProcess:
     r = run(["systemctl", action, name])
     if r.returncode != 0 and (r.stderr.strip()):
@@ -283,9 +288,45 @@ def enable_start(name: str, log=print) -> None:
 
 
 # ---------------------------------------------------------------- 应用配置
+SYSCTL_FILE = "/etc/sysctl.d/99-pihy2.conf"
+
+
+def set_ip_forward(on: bool, log=print) -> None:
+    """开/关全屋网关所需内核参数（IP 转发 + 宽松反向路径过滤）。
+    rp_filter=2(loose) 是透明网关常见的关键项：TUN 代理下进出路径不对称，
+    严格 rp_filter 会丢回程包。已是目标状态则跳过，避免每次 apply 写盘。"""
+    have = os.path.exists(SYSCTL_FILE)
+    if on == have:
+        return
+    try:
+        if on:
+            with open(SYSCTL_FILE, "w") as f:
+                f.write("net.ipv4.ip_forward=1\n"
+                        "net.ipv4.conf.all.rp_filter=2\n"
+                        "net.ipv4.conf.default.rp_filter=2\n")
+            run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+            run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
+        else:
+            os.remove(SYSCTL_FILE)
+            run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
+    except OSError as e:
+        log(f"设置网关内核参数失败：{e}")
+
+
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
-    """渲染 -> 校验 -> 落盘 -> 重启 mihomo。校验失败则不落盘。"""
+    """渲染 -> 校验 -> 落盘 -> 重启 mihomo。校验失败则不落盘。
+    与现有配置完全一致时跳过落盘与重启，避免（如订阅定时任务）无谓地断开连接。"""
     text = store.render_config()
+    current = ""
+    if os.path.exists(MIHOMO_CONFIG):
+        try:
+            with open(MIHOMO_CONFIG, "r", encoding="utf-8") as f:
+                current = f.read()
+        except OSError:
+            pass
+    set_ip_forward(bool(store.data["settings"].get("gateway_mode")), log)
+    if text == current:
+        return True, "配置无变化，未重启"
     ok, out = test_config(text)
     if not ok:
         return False, f"配置校验失败，已保留原配置：\n{out}"
@@ -293,6 +334,94 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
     if restart and os.path.exists(MIHOMO_SERVICE):
         service_action("mihomo", "restart", log)
     return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
+
+
+# ---------------------------------------------------------------- 订阅
+SUB_SERVICE = "/etc/systemd/system/pihy2-sub-update.service"
+SUB_TIMER = "/etc/systemd/system/pihy2-sub-update.timer"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise urllib.error.HTTPError(a[0].full_url, 399, "订阅地址发生跳转，已拒绝", {}, None)
+
+
+def _assert_public_host(url: str):
+    """订阅是 root 进程发起的服务端请求，拒绝指向内网/本机，避免 SSRF。"""
+    import ipaddress
+    import socket
+    host = urllib.parse.urlparse(url).hostname or ""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise ValueError("无法解析订阅域名")
+    for fam, _, _, _, sa in infos:
+        ip = ipaddress.ip_address(sa[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise ValueError("订阅地址不能指向内网/本机地址")
+
+
+def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024) -> str:
+    """拉取订阅内容。拒绝内网地址与跳转（防 SSRF），并限制大小。"""
+    _assert_public_host(url)
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": "pihy2/1.0"})
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read(max_bytes).decode("utf-8", "ignore")
+
+
+def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
+    """拉取并解析一个订阅，替换其名下节点。返回 (节点数, 错误列表)。"""
+    from . import parser
+    sub = store.get_subscription(sid)
+    if not sub:
+        return 0, ["订阅不存在"]
+    try:
+        text = fetch_text(sub["url"])
+    except Exception as e:
+        return 0, [f"拉取失败：{e}"]
+    try:
+        nodes, errors = parser.parse_many(text)
+    except Exception as e:                    # 解析器兜底，任何脏数据都不该拖垮定时更新
+        return 0, [f"解析失败：{e}"]
+    if not nodes:
+        return 0, (errors or ["订阅里没有可解析的节点（可能是返回了登录页/空内容，或全是暂不支持的协议）"])
+    n = store.set_subscription_nodes(sid, nodes)
+    log(f"订阅「{sub['name']}」更新 {n} 个节点")
+    return n, errors
+
+
+def refresh_all_subscriptions(store, log=print) -> dict:
+    return {s["id"]: refresh_subscription(store, s["id"], log)[0]
+            for s in list(store.data.get("subscriptions", []))}
+
+
+def install_sub_timer(hours: int = 12, log=print) -> None:
+    """写入并启用订阅定时更新 timer。"""
+    py = sys.executable or "/usr/bin/python3"
+    _write(SUB_SERVICE, f"""[Unit]
+Description=pihy2 订阅更新
+After=network-online.target mihomo.service
+
+[Service]
+Type=oneshot
+WorkingDirectory={INSTALL_DIR}
+Environment=PYTHONPATH={INSTALL_DIR}
+ExecStart={py} -m pihy2 sub update all --apply
+""")
+    _write(SUB_TIMER, f"""[Unit]
+Description=pihy2 订阅定时更新
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec={max(1, int(hours))}h
+
+[Install]
+WantedBy=timers.target
+""")
+    run(["systemctl", "daemon-reload"])
+    service_action("pihy2-sub-update.timer", "enable", log)
+    service_action("pihy2-sub-update.timer", "start", log)
 
 
 # ---------------------------------------------------------------- 状态/排错
@@ -372,14 +501,31 @@ def clash_delay(name: str, settings: dict, timeout: int = 5000) -> int | None:
         return None
 
 
+def clash_connections(settings: dict, timeout: int = 5) -> dict | None:
+    """取当前连接快照（含累计上下行字节与活动连接列表）。失败返回 None。"""
+    try:
+        return _clash_request("GET", "/connections", settings, timeout=timeout)
+    except Exception:
+        return None
+
+
+def clash_close_all(settings: dict) -> bool:
+    try:
+        _clash_request("DELETE", "/connections", settings)
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------- 卸载
 def uninstall(purge: bool = False, log=print) -> None:
-    for svc in ("pihy2-web", "mihomo"):
+    for svc in ("pihy2-sub-update.timer", "pihy2-web", "mihomo"):
         service_action(svc, "disable", log)
         service_action(svc, "stop", log)
-    for path in (MIHOMO_SERVICE, WEBUI_SERVICE):
+    for path in (MIHOMO_SERVICE, WEBUI_SERVICE, SUB_SERVICE, SUB_TIMER):
         if os.path.exists(path):
             os.remove(path)
+    set_ip_forward(False, log)            # 关掉网关模式开的 IP 转发
     run(["systemctl", "daemon-reload"])
     if purge:
         from .store import STATE_DIR
