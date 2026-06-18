@@ -164,6 +164,28 @@ class Handler(BaseHTTPRequestHandler):
             s = store.data["settings"]
             out = {n["id"]: manager.clash_delay(n["name"], s) for n in store.data["nodes"]}
             return self._json({"ok": True, "delays": out})
+        if path == "/api/traffic":  # 实时流量/连接快照
+            data = manager.clash_connections(store.data["settings"]) or {}
+            conns = data.get("connections") or []
+            top = sorted(conns, key=lambda x: (x.get("upload", 0) + x.get("download", 0)),
+                         reverse=True)[:40]
+            brief = []
+            for c in top:
+                md = c.get("metadata", {}) or {}
+                brief.append({
+                    "host": md.get("host") or md.get("destinationIP") or "",
+                    "dest": (md.get("destinationIP", "") + (":" + str(md.get("destinationPort", "")) if md.get("destinationPort") else "")),
+                    "net": md.get("network", ""),
+                    "chain": (c.get("chains") or [""])[0],
+                    "rule": c.get("rule", ""),
+                    "up": c.get("upload", 0), "down": c.get("download", 0),
+                })
+            return self._json({"ok": True, "running": bool(data),
+                               "up_total": data.get("uploadTotal", 0),
+                               "down_total": data.get("downloadTotal", 0),
+                               "count": len(conns), "conns": brief})
+        if path == "/api/logs":
+            return self._json({"ok": True, "logs": manager.journal("mihomo", 60)})
         if path == "/api/config":  # 预览当前会生成的配置（隐去 clash 密钥）
             cfg = store.render_config()
             sec = store.data["settings"].get("secret")
@@ -253,6 +275,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._err("非法操作")
                 manager.service_action("mihomo", action)
                 return self._json({"ok": True})
+
+            if path == "/api/connections/close":
+                return self._json({"ok": manager.clash_close_all(store.data["settings"])})
 
             if path == "/api/subs":              # 添加订阅并立即拉取
                 url = (body.get("url") or "").strip()

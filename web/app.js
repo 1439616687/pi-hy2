@@ -118,6 +118,7 @@ function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.add('hidden'));
   el('tab-' + name).classList.remove('hidden');
+  if (name === 'traffic') startTraffic(); else stopTraffic();   // 仅在流量页轮询
 }
 
 // ----------------------------------------------------------------- 状态栏
@@ -458,6 +459,45 @@ async function serviceAction(action) {
   if (action !== 'restart' && !confirm(`确定 ${action} mihomo 服务？`)) return;
   const r = await api('POST', '/api/service', { action });
   if (done(r, '已执行 ' + action)) setTimeout(refreshStatus, 1200);
+}
+
+// ----------------------------------------------------------------- 流量面板
+function humanBytes(n) {
+  n = n || 0; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(2)) + u[i];
+}
+let trafficTimer = null, prevTraffic = null;
+async function pollTraffic() {
+  const r = await api('GET', '/api/traffic').catch(() => ({}));
+  if (!r.ok) return;
+  const now = Date.now();
+  if (!r.running) { el('traffic-hint').textContent = 'mihomo 未运行或 clash API 不可用。'; return; }
+  el('traffic-hint').textContent = '数据每 2 秒刷新。';
+  if (prevTraffic) {
+    const dt = (now - prevTraffic.t) / 1000 || 1;
+    el('sp-up').textContent = humanBytes((r.up_total - prevTraffic.up) / dt);
+    el('sp-down').textContent = humanBytes((r.down_total - prevTraffic.down) / dt);
+  }
+  prevTraffic = { up: r.up_total, down: r.down_total, t: now };
+  el('sp-count').textContent = r.count;
+  el('sp-upt').textContent = humanBytes(r.up_total);
+  el('sp-downt').textContent = humanBytes(r.down_total);
+  el('conn-body').innerHTML = (r.conns || []).map(c => `<tr>
+    <td>${esc(c.host || c.dest)}</td><td>${esc(c.rule || '')}${c.chain ? ' · ' + esc(c.chain) : ''}</td>
+    <td>${esc(c.net)}</td><td>${humanBytes(c.up)}</td><td>${humanBytes(c.down)}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">暂无活动连接</td></tr>';
+}
+function startTraffic() { stopTraffic(); prevTraffic = null; pollTraffic(); trafficTimer = setInterval(pollTraffic, 2000); }
+function stopTraffic() { if (trafficTimer) { clearInterval(trafficTimer); trafficTimer = null; } }
+async function refreshLogs() {
+  const r = await api('GET', '/api/logs');
+  el('log-box').textContent = (r.logs || r.error || '（无）');
+}
+async function closeAllConns() {
+  if (!confirm('断开当前全部连接？')) return;
+  const r = await api('POST', '/api/connections/close');
+  done(r, '已断开'); pollTraffic();
 }
 
 // 离开页面时若有未保存的路由修改则提醒

@@ -36,6 +36,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="nodes" onclick="switchTab('nodes')">节点</button>
     <button class="tab" data-tab="rules" onclick="switchTab('rules')">路由分流</button>
+    <button class="tab" data-tab="traffic" onclick="switchTab('traffic')">流量</button>
     <button class="tab" data-tab="settings" onclick="switchTab('settings')">设置</button>
     <button class="tab" data-tab="tools" onclick="switchTab('tools')">工具</button>
   </nav>
@@ -94,6 +95,27 @@
         </label>
         <button class="btn primary" onclick="saveRules()">保存路由</button>
       </div>
+    </section>
+
+    <!-- 流量 -->
+    <section id="tab-traffic" class="tab-pane hidden">
+      <div class="bar">
+        <div class="speed">
+          <span class="pill ok">↑ <b id="sp-up">0</b>/s</span>
+          <span class="pill ok">↓ <b id="sp-down">0</b>/s</span>
+          <span class="pill">连接 <b id="sp-count">0</b></span>
+          <span class="muted small">累计 ↑<span id="sp-upt">0</span> ↓<span id="sp-downt">0</span></span>
+        </div>
+        <div>
+          <button class="btn" onclick="refreshLogs()">刷新日志</button>
+          <button class="btn warn" onclick="closeAllConns()">断开全部连接</button>
+        </div>
+      </div>
+      <table class="conn-table"><thead><tr><th>目标</th><th>规则/出口</th><th>类型</th><th>↑</th><th>↓</th></tr></thead>
+        <tbody id="conn-body"></tbody></table>
+      <p id="traffic-hint" class="muted small">需要 mihomo 正在运行；数据每 2 秒刷新。</p>
+      <details style="margin-top:14px"><summary class="muted">最近日志</summary>
+        <pre id="log-box" class="codebox" style="margin-top:8px">点“刷新日志”加载…</pre></details>
     </section>
 
     <!-- 设置 -->

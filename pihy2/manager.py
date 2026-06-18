@@ -461,6 +461,22 @@ def clash_delay(name: str, settings: dict, timeout: int = 5000) -> int | None:
         return None
 
 
+def clash_connections(settings: dict, timeout: int = 5) -> dict | None:
+    """取当前连接快照（含累计上下行字节与活动连接列表）。失败返回 None。"""
+    try:
+        return _clash_request("GET", "/connections", settings, timeout=timeout)
+    except Exception:
+        return None
+
+
+def clash_close_all(settings: dict) -> bool:
+    try:
+        _clash_request("DELETE", "/connections", settings)
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------- 卸载
 def uninstall(purge: bool = False, log=print) -> None:
     for svc in ("pihy2-sub-update.timer", "pihy2-web", "mihomo"):
