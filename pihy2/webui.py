@@ -15,7 +15,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import manager, parser
+from . import manager, parser, config_gen
 from .store import Store
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
@@ -139,6 +139,8 @@ class Handler(BaseHTTPRequestHandler):
                 "rules": store.data["rules"],
                 "subscriptions": store.data.get("subscriptions", []),
                 "sub_interval_hours": store.data.get("sub_interval_hours", 12),
+                "preset_catalog": [{"key": k, "name": v[0], "desc": v[1]}
+                                   for k, v in config_gen.RULE_PRESETS.items()],
                 "settings": {k: v for k, v in store.data["settings"].items()
                              if k != "secret"},
                 "webui": {"port": store.data["webui"]["port"],

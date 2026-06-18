@@ -26,6 +26,7 @@ DEFAULT_SETTINGS = {
     "dns_china": ["223.5.5.5", "119.29.29.29"],
     "default_up": "20 Mbps",
     "default_down": "100 Mbps",
+    "presets": [],                   # 启用的一键分流预设 key 列表
     "final": "PROXY",                # 兜底策略：PROXY 或 DIRECT
     "external_controller": "127.0.0.1:9090",  # clash API，供面板做实时切换/测速
     "secret": "",                    # clash API 密钥（首次安装随机生成）
@@ -36,6 +37,36 @@ _SAFE_DIRECT_CIDRS = [
     "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12",
     "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10",
 ]
+
+# 一键分流预设：key -> (显示名, 说明, [mihomo 规则行])。GEOSITE/GEOIP 需地理库，
+# mihomo 运行时会自动下载（走代理），故预设只建议在部署完成后开启。
+RULE_PRESETS = {
+    "ads":      ("广告拦截", "拦截广告与追踪域名", ["GEOSITE,category-ads-all,REJECT"]),
+    "streaming": ("流媒体走代理", "Netflix/YouTube/Disney 等强制走节点",
+                  ["GEOSITE,netflix,PROXY", "GEOSITE,youtube,PROXY", "GEOSITE,disney,PROXY",
+                   "GEOSITE,bahamut,PROXY", "GEOSITE,hbo,PROXY", "GEOSITE,spotify,PROXY"]),
+    "google":   ("Google 走代理", "Google 全系走节点", ["GEOSITE,google,PROXY"]),
+    "telegram": ("Telegram 走代理", "Telegram 域名与 IP 走节点",
+                 ["GEOIP,telegram,PROXY,no-resolve", "GEOSITE,telegram,PROXY"]),
+    "apple_cn": ("Apple 国内直连", "Apple 中国区资源直连", ["GEOSITE,apple-cn,DIRECT"]),
+    "cn_direct": ("大陆直连(IP+域名)", "中国大陆 IP 与域名直连（比默认更全）",
+                  ["GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT"]),
+}
+# 应用顺序（靠前优先级高）：拦截 -> 强制代理类 -> 直连类
+_PRESET_ORDER = ["ads", "streaming", "google", "telegram", "apple_cn", "cn_direct"]
+
+
+def expand_presets(enabled) -> list[str]:
+    """把启用的预设 key 展开成 mihomo 规则行（按既定优先级排序，去重）。"""
+    enabled = set(enabled or [])
+    out, seen = [], set()
+    for key in _PRESET_ORDER:
+        if key in enabled and key in RULE_PRESETS:
+            for line in RULE_PRESETS[key][2]:
+                if line not in seen:
+                    seen.add(line)
+                    out.append(line)
+    return out
 
 
 # ---------------------------------------------------------------- YAML 序列化
@@ -368,19 +399,21 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
             })
         cfg["proxy-groups"] = groups
 
-    # rules：安全直连 -> 用户规则 -> 兜底
+    # rules：安全直连 -> 用户规则 -> 预设 -> 兜底
+    # 没有任何节点时，引用 PROXY 组的规则都无效，直接跳过用户规则/预设，整体走 DIRECT
     rule_lines = [f"IP-CIDR,{c},DIRECT,no-resolve" for c in _SAFE_DIRECT_CIDRS]
-    for r in (rules or []):
-        if not r.get("value", "").strip():
-            continue
-        try:
-            rule_lines.append(rule_to_mihomo(r))
-        except Exception:
-            continue
+    if nodes:
+        for r in (rules or []):
+            if not r.get("value", "").strip():
+                continue
+            try:
+                rule_lines.append(rule_to_mihomo(r))
+            except Exception:
+                continue
+        rule_lines.extend(expand_presets(s.get("presets", [])))
     final = s.get("final", "PROXY").upper()
     if final not in ("PROXY", "DIRECT"):
         final = "PROXY"
-    # 没有任何节点时，兜底只能 DIRECT，避免引用不存在的策略组
     if not nodes:
         final = "DIRECT"
     rule_lines.append(f"MATCH,{final}")

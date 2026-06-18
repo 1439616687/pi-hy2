@@ -69,6 +69,11 @@
 
     <!-- 路由 -->
     <section id="tab-rules" class="tab-pane hidden">
+      <fieldset style="margin-bottom:16px">
+        <legend>一键分流预设</legend>
+        <p class="muted small">勾选即用常见分流规则；底层用 mihomo 的 GEOSITE/GEOIP，开启后会自动下载地理库（走代理）。</p>
+        <div id="preset-list" class="grid"></div>
+      </fieldset>
       <div class="bar">
         <h3>路由分流规则</h3>
         <button class="btn primary" onclick="addRuleRow()">+ 添加规则</button>
