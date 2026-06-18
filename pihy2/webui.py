@@ -137,6 +137,8 @@ class Handler(BaseHTTPRequestHandler):
                 "need_auth": self._need_auth(store),
                 "nodes": store.data["nodes"],
                 "rules": store.data["rules"],
+                "subscriptions": store.data.get("subscriptions", []),
+                "sub_interval_hours": store.data.get("sub_interval_hours", 12),
                 "settings": {k: v for k, v in store.data["settings"].items()
                              if k != "secret"},
                 "webui": {"port": store.data["webui"]["port"],
@@ -250,6 +252,25 @@ class Handler(BaseHTTPRequestHandler):
                 manager.service_action("mihomo", action)
                 return self._json({"ok": True})
 
+            if path == "/api/subs":              # 添加订阅并立即拉取
+                url = (body.get("url") or "").strip()
+                if not url.lower().startswith(("http://", "https://")):
+                    return self._err("订阅地址需以 http(s):// 开头")
+                sub = store.add_subscription(body.get("name", ""), url)
+                cnt, errs = manager.refresh_subscription(store, sub["id"])
+                store.save()
+                return self._json({"ok": True, "sub": sub, "count": cnt, "errors": errs})
+
+            if path == "/api/subs/update":       # 更新某个或全部订阅
+                sid = body.get("id", "all")
+                if sid == "all":
+                    res = manager.refresh_all_subscriptions(store)
+                    store.save()
+                    return self._json({"ok": True, "count": sum(res.values())})
+                cnt, errs = manager.refresh_subscription(store, sid)
+                store.save()
+                return self._json({"ok": True, "count": cnt, "errors": errs})
+
         return self._err("not found", 404)
 
     # ----------------------------------------------------------- PUT API
@@ -285,6 +306,11 @@ class Handler(BaseHTTPRequestHandler):
                 if mir and not mir.lower().startswith("https://"):
                     return self._err("下载镜像必须以 https:// 开头")
                 store.set_settings(settings)
+                if "sub_interval_hours" in body:     # 订阅自动更新间隔，顺带重写 timer
+                    h = int(body["sub_interval_hours"]) if str(body["sub_interval_hours"]).isdigit() else 12
+                    store.data["sub_interval_hours"] = max(1, h)
+                    if os.path.exists(manager.SUB_TIMER):
+                        manager.install_sub_timer(store.data["sub_interval_hours"])
                 store.save()
                 return self._json({"ok": True})
             if path == "/api/webui":
@@ -310,6 +336,11 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/nodes/"):
                 nid = path.rsplit("/", 1)[-1]
                 ok = store.delete_node(nid)
+                store.save()
+                return self._json({"ok": ok})
+            if path.startswith("/api/subs/"):
+                sid = path.rsplit("/", 1)[-1]
+                ok = store.delete_subscription(sid, remove_nodes=True)
                 store.save()
                 return self._json({"ok": ok})
         return self._err("not found", 404)

@@ -60,8 +60,52 @@ async function loadState() {
   const keepRules = rulesDirty ? STATE.rules : null;   // 保住未保存的路由编辑，避免被覆盖丢失
   STATE = s;
   if (keepRules) STATE.rules = keepRules;
-  renderNodes(); renderRules(); renderSettings();
+  renderNodes(); renderRules(); renderSettings(); renderSubs();
   return true;
+}
+
+// ----------------------------------------------------------------- 订阅
+function renderSubs() {
+  const box = el('sub-list'); if (!box) return;
+  const subs = STATE.subscriptions || [];
+  box.innerHTML = subs.length ? subs.map(s => `
+    <div class="node" style="padding:8px 12px">
+      <div class="info"><div class="name">${esc(s.name)}</div>
+        <div class="addr">${esc(s.url)}</div>
+        <div class="muted small">节点 ${s.count || 0} · 更新于 ${esc(s.updated || '从未')}</div></div>
+      <button class="btn small" onclick="updateSub('${s.id}')">更新</button>
+      <button class="btn small danger" onclick="delSub('${s.id}','${esc(s.name)}')">删除</button>
+    </div>`).join('') : '<p class="muted small">暂无订阅。粘贴订阅链接，会定时自动更新节点。</p>';
+  if (el('sub-interval')) el('sub-interval').value = STATE.sub_interval_hours || 12;
+}
+async function addSub() {
+  const url = el('sub-url').value.trim();
+  if (!url) { toast('请填订阅链接', 'err'); return; }
+  toast('正在拉取订阅…');
+  const r = await api('POST', '/api/subs', { url, name: el('sub-name').value.trim() });
+  if (r.ok) { el('sub-url').value = ''; el('sub-name').value = ''; await loadState(); toast(`订阅已添加，${r.count} 个节点，记得“应用配置”`, 'ok'); }
+  else toast('添加失败：' + (r.error || ''), 'err');
+}
+async function updateSub(id) {
+  toast('更新中…');
+  const r = await api('POST', '/api/subs/update', { id });
+  await loadState(); done(r, `已更新 ${r.count || 0} 个节点，记得“应用配置”`);
+}
+async function updateAllSubs() {
+  if (!(STATE.subscriptions || []).length) { toast('没有订阅', 'err'); return; }
+  toast('更新中…');
+  const r = await api('POST', '/api/subs/update', { id: 'all' });
+  await loadState(); done(r, `已更新，共 ${r.count || 0} 个节点，记得“应用配置”`);
+}
+async function delSub(id, name) {
+  if (!confirm(`删除订阅「${name}」及其节点？`)) return;
+  const r = await api('DELETE', '/api/subs/' + id);
+  await loadState(); done(r, '已删除，记得“应用配置”');
+}
+async function saveSubInterval() {
+  const h = parseInt(el('sub-interval').value) || 12;
+  const r = await api('PUT', '/api/settings', { settings: {}, sub_interval_hours: h });
+  done(r, '已保存（下次部署/重装生效；也可改 systemd timer）');
 }
 
 // ----------------------------------------------------------------- 标签页
@@ -114,6 +158,7 @@ function renderNodes() {
     const tags = [esc((n.type || 'hysteria2').toUpperCase())];
     if (n.network && n.network !== 'tcp') tags.push(esc(n.network));
     if (n.reality_pbk) tags.push('reality');
+    if (n.sub) { const s = (STATE.subscriptions || []).find(x => x.id === n.sub); tags.push('订阅:' + esc(s ? s.name : n.sub)); }
     if (n.obfs) tags.push('混淆:' + esc(n.obfs));
     if (n.ports) tags.push('端口跳跃:' + esc(n.ports));
     if (n.skip_cert_verify) tags.push('跳过证书校验');

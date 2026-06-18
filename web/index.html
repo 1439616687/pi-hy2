@@ -43,6 +43,19 @@
   <main>
     <!-- 节点 -->
     <section id="tab-nodes" class="tab-pane">
+      <fieldset style="margin-bottom:16px">
+        <legend>订阅 <span class="muted small">（会定时自动更新）</span></legend>
+        <div id="sub-list"></div>
+        <div class="bar" style="margin-top:8px">
+          <input id="sub-url" type="text" placeholder="订阅链接 https://..." style="flex:1;min-width:180px">
+          <input id="sub-name" type="text" placeholder="名称(可空)" style="width:130px">
+          <button class="btn" onclick="addSub()">+ 添加订阅</button>
+          <button class="btn" onclick="updateAllSubs()">全部更新</button>
+        </div>
+        <div class="bar"><span class="muted small">自动更新间隔（小时）：</span>
+          <input id="sub-interval" type="number" min="1" style="width:90px">
+          <button class="btn small" onclick="saveSubInterval()">保存间隔</button></div>
+      </fieldset>
       <div class="bar">
         <h3>节点列表 <span id="node-count" class="muted"></span></h3>
         <div>
@@ -51,7 +64,7 @@
         </div>
       </div>
       <div id="node-list" class="list"></div>
-      <p class="muted small">点击节点名前的圆点设为当前出口；拖动可调整顺序（顺序即测速/选择优先级）。</p>
+      <p class="muted small">点击节点名前的圆点设为当前出口；拖动或 ↑↓ 调整顺序（顺序即测速/选择优先级）。订阅节点带有来源标记。</p>
     </section>
 
     <!-- 路由 -->

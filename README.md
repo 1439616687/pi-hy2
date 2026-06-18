@@ -13,6 +13,7 @@
 - **一键部署向导**：准备 TUN → 下载 mihomo → 生成并校验配置 → 建服务开机自启 → 验证出口 IP，全程提示式。
 - **多协议 · 粘贴即解析**：支持 **hysteria2 / vless / vmess / trojan / ss / tuic**，直接贴分享链接
   （或 base64 订阅）即自动识别协议并提取所有字段（含 reality / ws / grpc 传输、混淆、端口跳跃等）。
+- **订阅自动更新**：填订阅链接，systemd timer **定时拉取更新**节点（更新时走代理）；面板可手动“全部更新”。
 - **多节点管理**：可视化增/删/改、拖动排序、一键测速、点选切换当前出口（尽量免重启）。
 - **路由分流**：指定哪些域名/IP 走直连、哪些走代理，**支持通配符**（`*.cn`、`github.com`、`1.2.3.0/24`），
   自动判别规则类型；私有网段始终直连，**保证 SSH 永不掉线**。
@@ -65,6 +66,9 @@ sudo bash install.sh
 pihy2 install            # 重新运行部署向导
 pihy2 add 'hy2://...'    # 快速加节点（也可管道：echo 链接 | pihy2 add）
 pihy2 add 'hy2://...' --apply   # 加完直接应用
+pihy2 sub add 'https://订阅URL' --name 机场 --apply   # 添加订阅（定时自动更新）
+pihy2 sub update all --apply    # 立即更新全部订阅
+pihy2 sub list                  # 查看订阅
 pihy2 status --ip        # 查看服务状态 + 出口 IP
 pihy2 apply              # 重新生成并应用配置
 pihy2 config             # 打印将生成的 mihomo 配置
