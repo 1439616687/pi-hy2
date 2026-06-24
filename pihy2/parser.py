@@ -78,19 +78,29 @@ def _first(qs: dict, *keys: str, default: str = "") -> str:
     return default
 
 
+def _port_or_default(port_s: str, default: int = 443) -> int:
+    """端口须为 1..65535 的数字，否则回落默认值。"""
+    if port_s.isdigit():
+        p = int(port_s)
+        if 1 <= p <= 65535:
+            return p
+    return default
+
+
 def _split_hostport(hostport: str) -> tuple[str, int]:
-    """拆分 host:port，兼容 IPv6 字面量（[::1]:443）与缺省端口。"""
+    """拆分 host:port，兼容 IPv6 字面量（[::1]:443 与裸 2001:db8::1）与缺省端口。"""
     hostport = hostport.strip()
-    if hostport.startswith("["):  # IPv6
+    if hostport.startswith("["):  # 带方括号的 IPv6（可带端口）
         m = re.match(r"^\[(?P<host>[^\]]+)\](?::(?P<port>\d+))?$", hostport)
         if not m:
             raise ParseError(f"无法解析地址：{hostport}")
-        return m.group("host"), int(m.group("port")) if m.group("port") else 443
+        return m.group("host"), _port_or_default(m.group("port") or "")
+    # 裸 IPv6 字面量（无方括号、含 ≥2 个冒号）：整体视为地址，端口缺省
+    if hostport.count(":") >= 2:
+        return hostport, 443
     if ":" in hostport:
         host, _, port_s = hostport.rpartition(":")
-        if not port_s.isdigit():
-            return hostport, 443
-        return host, int(port_s)
+        return host, _port_or_default(port_s)
     return hostport, 443
 
 
@@ -484,6 +494,11 @@ def proxy_to_node(p: dict) -> dict:
         node["plugin_opts"] = dict(po)
     if t in ("vless", "vmess", "tuic") and not node.get("uuid"):
         raise ParseError(f"{t} 缺少 UUID")
+    # YAML 里未加引号的纯数字 password/uuid/short-id 会被解析成 int，统一转回字符串，
+    # 避免前导零丢失式的语义损坏与下游 quote()/拼接的 TypeError。
+    for f in ("password", "uuid", "obfs_password", "reality_sid", "sni", "cipher"):
+        if f in node and not isinstance(node[f], str):
+            node[f] = str(node[f])
     return node
 
 
@@ -517,20 +532,29 @@ def node_to_link(node: dict) -> str:
     from urllib.parse import quote, urlencode
 
     t = node.get("type", "hysteria2")
-    host = node["server"]
+    host = str(node.get("server", ""))
+    if not host:
+        raise ParseError("缺少服务器地址")
     hostb = f"[{host}]" if ":" in host else host
+    port = node.get("port", 443)
     name = node.get("name", "")
     frag = ("#" + quote(str(name), safe="")) if name else ""
 
     if t == "vmess":
+        net = node.get("network", "tcp")
+        # 按传输类型只携带对应字段，避免 grpc/ws 串字段
+        ws_host = node.get("ws_host", "") if net in ("ws", "httpupgrade") else ""
+        path = (node.get("ws_path", "") if net in ("ws", "httpupgrade")
+                else node.get("grpc_service_name", "") if net == "grpc" else "")
         j = {
-            "v": "2", "ps": name, "add": host, "port": str(node["port"]),
-            "id": node.get("uuid", ""), "aid": str(node.get("alter_id", 0)),
-            "scy": node.get("cipher", "auto"), "net": node.get("network", "tcp"),
-            "type": "none", "host": node.get("ws_host", ""),
-            "path": node.get("ws_path", "") or node.get("grpc_service_name", ""),
+            "v": "2", "ps": name, "add": host, "port": str(port),
+            "id": str(node.get("uuid", "")), "aid": str(node.get("alter_id", 0)),
+            "scy": node.get("cipher", "auto"), "net": net,
+            "type": "none", "host": ws_host, "path": path,
             "tls": "tls" if node.get("tls") else "", "sni": node.get("sni", ""),
         }
+        if node.get("alpn"):                       # round-trip 不丢 alpn
+            j["alpn"] = ",".join(str(a) for a in node["alpn"])
         return "vmess://" + base64.b64encode(
             json.dumps(j, ensure_ascii=False).encode()).decode()
 
@@ -538,7 +562,7 @@ def node_to_link(node: dict) -> str:
         params: dict[str, str] = {}
         net = node.get("network", "tcp")
         if t == "vless":
-            cred = quote(node.get("uuid", ""), safe="")
+            cred = quote(str(node.get("uuid", "")), safe="")
             params["encryption"] = "none"
             params["security"] = "reality" if node.get("reality_pbk") else ("tls" if node.get("tls") else "none")
             params["type"] = net
@@ -549,11 +573,12 @@ def node_to_link(node: dict) -> str:
                 if node.get("reality_sid"):
                     params["sid"] = node["reality_sid"]
         elif t == "trojan":
-            cred = quote(node.get("password", ""), safe="")
+            cred = quote(str(node.get("password", "")), safe="")
             if net != "tcp":
                 params["type"] = net
         else:  # tuic
-            cred = quote(node.get("uuid", ""), safe="") + ":" + quote(node.get("password", ""), safe="")
+            cred = (quote(str(node.get("uuid", "")), safe="") + ":"
+                    + quote(str(node.get("password", "")), safe=""))
             if node.get("congestion"):
                 params["congestion_control"] = node["congestion"]
             if node.get("udp_relay_mode"):
@@ -574,7 +599,7 @@ def node_to_link(node: dict) -> str:
         if net == "grpc" and node.get("grpc_service_name"):
             params["serviceName"] = node["grpc_service_name"]
         q = ("?" + urlencode(params)) if params else ""
-        return f"{t}://{cred}@{hostb}:{node['port']}{q}{frag}"
+        return f"{t}://{cred}@{hostb}:{port}{q}{frag}"
 
     if t == "ss":
         userinfo = base64.b64encode(
@@ -595,7 +620,7 @@ def node_to_link(node: dict) -> str:
             else:
                 ps = node["plugin"]
             q = "?" + urlencode({"plugin": ps})
-        return f"ss://{userinfo}@{hostb}:{node['port']}{q}{frag}"
+        return f"ss://{userinfo}@{hostb}:{port}{q}{frag}"
 
     # hysteria2
     params = {}
@@ -621,6 +646,6 @@ def node_to_link(node: dict) -> str:
         params["pinSHA256"] = node["fingerprint"]
     if node.get("fast_open"):
         params["fastopen"] = "1"
-    auth = quote(str(node["password"]), safe="")
+    auth = quote(str(node.get("password", "")), safe="")
     q = ("?" + urlencode(params)) if params else ""
-    return f"hysteria2://{auth}@{hostb}:{node['port']}/{q}{frag}"
+    return f"hysteria2://{auth}@{hostb}:{port}/{q}{frag}"

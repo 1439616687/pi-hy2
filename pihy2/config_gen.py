@@ -82,33 +82,48 @@ def _yaml_scalar(v) -> str:
     return json.dumps(str(v), ensure_ascii=False)
 
 
+_SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+def _yaml_key(k) -> str:
+    """安全输出 dict 的 key：普通键原样，含 ':'/'#'/空白/空串等不安全键用引号包裹转义。
+    来自不可信订阅的 plugin-opts 等键可能含特殊字符，不处理会生成非法/被注入的 YAML。"""
+    k = str(k)
+    if k and _SAFE_KEY_RE.match(k):
+        return k
+    return json.dumps(k, ensure_ascii=False)
+
+
 def to_yaml(data, indent: int = 0) -> str:
     pad = "  " * indent
     lines: list[str] = []
     if isinstance(data, dict):
         for k, v in data.items():
+            key = _yaml_key(k)
             if isinstance(v, dict) and v:
-                lines.append(f"{pad}{k}:")
+                lines.append(f"{pad}{key}:")
                 lines.append(to_yaml(v, indent + 1))
             elif isinstance(v, list) and v:
-                lines.append(f"{pad}{k}:")
+                lines.append(f"{pad}{key}:")
                 lines.append(to_yaml(v, indent + 1))
             elif isinstance(v, (dict, list)):  # 空容器
-                lines.append(f"{pad}{k}: {'{}' if isinstance(v, dict) else '[]'}")
+                lines.append(f"{pad}{key}: {'{}' if isinstance(v, dict) else '[]'}")
             else:
-                lines.append(f"{pad}{k}: {_yaml_scalar(v)}")
+                lines.append(f"{pad}{key}: {_yaml_scalar(v)}")
     elif isinstance(data, list):
         for item in data:
-            if isinstance(item, dict):
+            if isinstance(item, dict) and item:
                 # 列表里的字典：第一个键跟在 '- ' 后，其余对齐
                 inner = to_yaml(item, indent + 1)
                 inner_lines = inner.split("\n")
                 first = inner_lines[0][len(pad) + 2:]
                 lines.append(f"{pad}- {first}")
                 lines.extend(inner_lines[1:])
-            elif isinstance(item, list):
+            elif isinstance(item, list) and item:
                 lines.append(f"{pad}-")
                 lines.append(to_yaml(item, indent + 1))
+            elif isinstance(item, (dict, list)):  # 空容器，避免退化成 None
+                lines.append(f"{pad}- {'{}' if isinstance(item, dict) else '[]'}")
             else:
                 lines.append(f"{pad}- {_yaml_scalar(item)}")
     return "\n".join(lines)
@@ -131,6 +146,10 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
     """
     value = value.strip()
     rtype = (rtype or "auto").strip().lower()
+    # 带方括号的 IPv6 字面量（[2001:db8::1] 或 [2001:db8::1]/64）先剥括号，便于判别
+    mb = re.match(r"^\[([0-9A-Fa-f:]+)\](/\d+)?$", value)
+    if mb:
+        value = mb.group(1) + (mb.group(2) or "")
 
     explicit = {
         "domain": "DOMAIN",
@@ -150,7 +169,11 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
         kind = explicit[rtype]
         if kind == "IP-CIDR":
             net = _is_ip_or_cidr(value)
-            if net is not None and "/" not in value:
+            if net is None:
+                # 显式标为 IP 却不是合法 IP/CIDR：抛错，由 build_config 兜底跳过该规则，
+                # 避免把任意字符串当 IP-CIDR 下发导致 mihomo 校验失败。
+                raise ValueError(f"非法 IP/CIDR：{value}")
+            if "/" not in value:
                 value = f"{value}/32" if "." in value else f"{value}/128"
         return kind, value
 
@@ -325,13 +348,20 @@ def node_to_proxy(node: dict, settings: dict) -> dict:
 
 
 
+# mihomo 保留策略/策略组名：节点若同名会与策略组/内建策略冲突，导致 config 校验失败
+_RESERVED_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE",
+                   "GLOBAL", "PROXY", "AUTO"}
+
+
 def _dedup_names(nodes: list[dict]) -> list[dict]:
-    """节点名去重（同名追加 #2、#3…），不改原对象。"""
+    """节点名去重（同名追加 #2、#3…），并规避 mihomo 保留名，不改原对象。"""
     seen: dict[str, int] = {}
     out = []
     for n in nodes:
         n = dict(n)
         base = (n.get("name") or n.get("server") or "节点").strip() or "节点"
+        if base.upper() in _RESERVED_NAMES:
+            base = base + "·"          # 避免与策略组名 PROXY/AUTO、内建 DIRECT 等冲突
         if base in seen:
             seen[base] += 1
             n["name"] = f"{base} #{seen[base]}"
@@ -361,12 +391,19 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         if s.get("secret"):
             cfg["secret"] = s["secret"]
 
+    lan_open = bool(s.get("allow_lan") or s.get("gateway_mode"))
+    # default-nameserver 必须是纯 IP（不能是 DoH 域名），用作解析上游域名/引导 DNS，
+    # 否则 fake-ip 下自定义的域名型 DoH nameserver 可能无法自举解析、mihomo 起不来。
+    bootstrap = [ip for ip in s["dns_china"] if _is_ip_or_cidr(ip) is not None] \
+        or ["223.5.5.5", "119.29.29.29"]
     cfg["dns"] = {
         "enable": True,
-        "listen": "0.0.0.0:1053",
+        # 仅在开放局域网（allow-lan/网关模式）时监听 0.0.0.0，否则收敛到回环，减少暴露面
+        "listen": ("0.0.0.0:1053" if lan_open else "127.0.0.1:1053"),
         "enhanced-mode": "fake-ip",
         "fake-ip-range": s["fake_ip_range"],
         "fake-ip-filter": ["*.lan", "*.local", "+.pool.ntp.org", "time.*.com"],
+        "default-nameserver": bootstrap,
         "nameserver": list(s["dns_nameservers"]),
         "proxy-server-nameserver": list(s["dns_china"]),
     }
@@ -385,6 +422,7 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         names = [n["name"] for n in nodes]  # 已按“当前节点优先”排序
         # 当前选中的节点放在选择器最前 -> 重启后默认就是它；AUTO 仅作为可选项跟在后面
         select_list = names + (["AUTO"] if len(names) > 1 else []) + ["DIRECT"]
+        select_list = list(dict.fromkeys(select_list))  # 去重保序，防节点名与 AUTO/DIRECT 撞
         groups = [{
             "name": "PROXY",
             "type": "select",

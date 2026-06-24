@@ -88,7 +88,7 @@
       <div id="rule-list"></div>
       <div class="bar" style="margin-top:14px">
         <label>兜底策略（未命中任何规则的流量）：
-          <select id="final-policy">
+          <select id="final-policy" onchange="finalChanged()">
             <option value="PROXY">走代理</option>
             <option value="DIRECT">直连</option>
           </select>

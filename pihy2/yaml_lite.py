@@ -5,14 +5,23 @@
   * 块状序列（- item / - key: value）
   * 流式 {a: b, c: [d, e]} 与 [a, b]
   * 单/双引号标量、布尔/null/整数/浮点、UTF-8（中文节点名）
+  * 块标量 | 与 >（尽力而为，避免含证书/多行内容的订阅整体解析失败）
+  * 锚点 &name / 别名 *name / 合并键 <<:（常见于聚合配置）
+  * 多文档（--- 分隔）：只取第一个文档，避免后文档键覆盖前文档丢节点
 不追求完整 YAML 规范；解析失败时调用方应回退到“暂不支持”，不影响其它功能。
 """
 
 from __future__ import annotations
 
+import re
+
 
 class YamlError(ValueError):
     pass
+
+
+# 块标量起始记号：| 或 >，可带 chomping/缩进指示（如 |-、>+、|2），且其后无其它内容
+_BLOCK_SCALAR_RE = re.compile(r"^[|>][+-]?\d*$")
 
 
 def _strip_comment(line: str) -> str:
@@ -167,11 +176,17 @@ class _Reader:
         self.lines = []
         for raw in text.replace("\t", "    ").splitlines():
             s = _strip_comment(raw)
-            if not s.strip() or s.strip() in ("---", "..."):
+            stripped = s.strip()
+            if stripped in ("---", "..."):
+                if self.lines:        # 多文档：只解析第一个，避免后文档键覆盖前者丢节点
+                    break
+                continue
+            if not stripped:
                 continue
             indent = len(s) - len(s.lstrip(" "))
-            self.lines.append((indent, s.strip()))
+            self.lines.append((indent, stripped))
         self.i = 0
+        self.anchors: dict[str, object] = {}
 
     def parse(self):
         if not self.lines:
@@ -184,6 +199,37 @@ class _Reader:
             return self._seq(indent)
         return self._map(indent)
 
+    # 合并键 <<:（把别名指向的映射并入当前 dict，已存在的键不覆盖）
+    def _assign(self, d: dict, key: str, value):
+        if key == "<<":
+            merges = value if isinstance(value, list) else [value]
+            for m in merges:
+                if isinstance(m, dict):
+                    for k, v in m.items():
+                        d.setdefault(k, v)
+            return
+        d[key] = value
+
+    # 标量位置：解析 &anchor 定义 / *alias 引用 / 普通标量
+    def _resolve_scalar(self, val: str):
+        val = val.strip()
+        if val.startswith("&"):
+            name, _, rest = val[1:].partition(" ")
+            v = _scalar(rest) if rest.strip() else None
+            self.anchors[name] = v
+            return v
+        if val.startswith("*"):
+            return self.anchors.get(val[1:].strip())
+        return _scalar(val)
+
+    def _block_scalar(self, indent: int) -> str:
+        """收集所有缩进大于 indent 的后续行作为块标量字符串（尽力而为）。"""
+        parts = []
+        while self.i < len(self.lines) and self.lines[self.i][0] > indent:
+            parts.append(self.lines[self.i][1])
+            self.i += 1
+        return "\n".join(parts)
+
     def _map(self, indent: int):
         d = {}
         while self.i < len(self.lines):
@@ -194,16 +240,34 @@ class _Reader:
                 raise YamlError(f"缩进异常: {text!r}")
             key, val = _split_kv(text)
             key = _unquote(key)
-            if val is None or val == "":
-                self.i += 1
-                if self.i < len(self.lines) and self.lines[self.i][0] > indent:
-                    d[key] = self._block(self.lines[self.i][0])
-                else:
-                    d[key] = None
-            else:
-                d[key] = _scalar(val)
-                self.i += 1
+            self._consume_value(d, key, val, indent)
         return d
+
+    def _consume_value(self, container: dict, key: str, val: str | None, col: int):
+        """把 `key: val` 的值（含 None/块/块标量/锚点/别名）写入 container[key]。
+        调用时 self.i 指向 key 所在行；返回时 self.i 指向下一条待处理行。"""
+        if val is None or val == "":
+            self.i += 1
+            if self.i < len(self.lines) and self.lines[self.i][0] > col:
+                self._assign(container, key, self._block(self.lines[self.i][0]))
+            else:
+                self._assign(container, key, None)
+        elif _BLOCK_SCALAR_RE.match(val):
+            self.i += 1
+            self._assign(container, key, self._block_scalar(col))
+        elif val.startswith("&") and len(val.split()) == 1:
+            # 块级锚点：&name 后接缩进子块
+            name = val[1:]
+            self.i += 1
+            if self.i < len(self.lines) and self.lines[self.i][0] > col:
+                block = self._block(self.lines[self.i][0])
+            else:
+                block = None
+            self.anchors[name] = block
+            self._assign(container, key, block)
+        else:
+            self._assign(container, key, self._resolve_scalar(val))
+            self.i += 1
 
     def _seq(self, indent: int):
         items = []
@@ -226,33 +290,37 @@ class _Reader:
             else:
                 k, v = _split_kv(rest)
                 if v is None:                       # 纯标量项
-                    items.append(_scalar(rest))
+                    items.append(self._resolve_scalar(rest))
                     self.i += 1
                 else:                               # `- key: value`：行内映射起始
-                    item = {}
+                    item: dict = {}
                     # key 的实际列 = "- " 之后的列
                     key_col = ind + (len(text) - len(rest))
-                    item[_unquote(k)] = _scalar(v) if v != "" else self._inline_nested(key_col)
-                    self.i += 1
+                    kk0 = _unquote(k)
+                    if v == "":
+                        # 首键无行内值：可能后接缩进子块。_inline_nested 在消费子块时
+                        # 会自行推进 self.i，故仅在它未推进时才补一次自增（修复吞行 bug）。
+                        before = self.i
+                        self._assign(item, kk0, self._inline_nested(key_col))
+                        if self.i == before:
+                            self.i += 1
+                    elif _BLOCK_SCALAR_RE.match(v):
+                        self.i += 1
+                        self._assign(item, kk0, self._block_scalar(key_col))
+                    else:
+                        self._assign(item, kk0, self._resolve_scalar(v))
+                        self.i += 1
                     # 同一映射的后续键，缩进 = key_col
                     while self.i < len(self.lines) and self.lines[self.i][0] == key_col \
                             and not self.lines[self.i][1].startswith("- "):
                         kk, vv = _split_kv(self.lines[self.i][1])
                         kk = _unquote(kk)
-                        if vv is None or vv == "":
-                            self.i += 1
-                            if self.i < len(self.lines) and self.lines[self.i][0] > key_col:
-                                item[kk] = self._block(self.lines[self.i][0])
-                            else:
-                                item[kk] = None
-                        else:
-                            item[kk] = _scalar(vv)
-                            self.i += 1
+                        self._consume_value(item, kk, vv, key_col)
                     items.append(item)
         return items
 
     def _inline_nested(self, key_col: int):
-        # `- key:` 后面跟缩进子块（少见），返回该子块
+        # `- key:` 后面跟缩进子块（少见），返回该子块并把 self.i 停在子块之后
         if self.i + 1 < len(self.lines) and self.lines[self.i + 1][0] > key_col:
             self.i += 1
             return self._block(self.lines[self.i][0])
@@ -263,5 +331,5 @@ def load(text: str):
     """解析 YAML 文本为 Python 对象；失败抛 YamlError。"""
     try:
         return _Reader(text).parse()
-    except (IndexError, ValueError) as e:
+    except (IndexError, ValueError, RecursionError) as e:
         raise YamlError(str(e))

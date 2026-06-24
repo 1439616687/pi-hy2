@@ -57,12 +57,14 @@ async function doLogin(e) {
 async function loadState() {
   const s = await api('GET', '/api/state');
   if (!s.ok) return false;
-  // 保住未保存的路由/预设编辑，避免被后台 loadState 覆盖丢失
+  // 保住未保存的路由/预设/兜底策略编辑，避免被后台 loadState 覆盖丢失
   const keepRules = rulesDirty ? STATE.rules : null;
   const keepPresets = rulesDirty ? ((STATE.settings || {}).presets || []) : null;
+  const keepFinal = rulesDirty ? ((STATE.settings || {}).final) : null;
   STATE = s;
   if (keepRules) STATE.rules = keepRules;
   if (keepPresets) { if (!STATE.settings) STATE.settings = {}; STATE.settings.presets = keepPresets; }
+  if (keepFinal) { if (!STATE.settings) STATE.settings = {}; STATE.settings.final = keepFinal; }
   renderNodes(); renderRules(); renderSettings(); renderSubs();
   return true;
 }
@@ -77,7 +79,7 @@ function renderSubs() {
         <div class="addr">${esc(s.url)}</div>
         <div class="muted small">节点 ${s.count || 0} · 更新于 ${esc(s.updated || '从未')}</div></div>
       <button class="btn small" onclick="updateSub('${s.id}')">更新</button>
-      <button class="btn small danger" onclick="delSub('${s.id}','${esc(s.name)}')">删除</button>
+      <button class="btn small danger" onclick="delSub('${s.id}')">删除</button>
     </div>`).join('') : '<p class="muted small">暂无订阅。粘贴订阅链接，会定时自动更新节点。</p>';
   if (el('sub-interval')) el('sub-interval').value = STATE.sub_interval_hours || 12;
 }
@@ -100,8 +102,10 @@ async function updateAllSubs() {
   const r = await api('POST', '/api/subs/update', { id: 'all' });
   await loadState(); done(r, `已更新共 ${r.count || 0} 个节点并生效`);
 }
-async function delSub(id, name) {
-  if (!confirm(`删除订阅「${name}」及其节点？`)) return;
+async function delSub(id) {
+  // 名字从 STATE 查，不拼进内联事件，避免订阅名里的引号造成存储型 XSS
+  const sub = (STATE.subscriptions || []).find(x => x.id === id);
+  if (!confirm(`删除订阅「${sub ? sub.name : id}」及其节点？`)) return;
   const r = await api('DELETE', '/api/subs/' + id);
   await loadState(); done(r, '已删除，记得“应用配置”');
 }
@@ -254,15 +258,17 @@ async function commitNodes() {
 // 编辑节点：按协议显示对应字段
 const COMMON = [['name', '名称'], ['server', '服务器'], ['port', '端口', 'number']];
 const NET = [['network', '传输(tcp/ws/grpc)'], ['ws_path', 'ws 路径'], ['ws_host', 'ws Host'], ['grpc_service_name', 'grpc 服务名']];
+const ALPN = ['alpn', 'ALPN(逗号分隔,如 h3,h2)'];
 const FIELDS_BY_TYPE = {
   hysteria2: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['ports', '端口跳跃(如 443-9000)'],
-    ['obfs', '混淆(salamander/空)'], ['obfs_password', '混淆密码'], ['up', '上行(留空默认)'], ['down', '下行(留空默认)'], ['fingerprint', '证书指纹(64位hex)']],
+    ['obfs', '混淆(salamander/空)'], ['obfs_password', '混淆密码'], ['up', '上行(留空默认)'], ['down', '下行(留空默认)'],
+    ALPN, ['fingerprint', '证书指纹(64位hex)'], ['pin_sha256', '公钥固定 pinSHA256(可空)']],
   vless: [...COMMON, ['uuid', 'UUID'], ['sni', 'SNI'], ['flow', 'flow'], ['client_fingerprint', '指纹(chrome..)'],
-    ['reality_pbk', 'reality 公钥'], ['reality_sid', 'reality shortId'], ...NET],
-  vmess: [...COMMON, ['uuid', 'UUID'], ['alter_id', 'alterId', 'number'], ['cipher', '加密(auto..)'], ['sni', 'SNI'], ...NET],
-  trojan: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['client_fingerprint', '指纹'], ...NET],
+    ['reality_pbk', 'reality 公钥'], ['reality_sid', 'reality shortId'], ALPN, ...NET],
+  vmess: [...COMMON, ['uuid', 'UUID'], ['alter_id', 'alterId', 'number'], ['cipher', '加密(auto..)'], ['sni', 'SNI'], ALPN, ...NET],
+  trojan: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['client_fingerprint', '指纹'], ALPN, ...NET],
   ss: [...COMMON, ['cipher', '加密方式'], ['password', '密码']],
-  tuic: [...COMMON, ['uuid', 'UUID'], ['password', '密码'], ['sni', 'SNI'], ['congestion', '拥塞控制(bbr)'], ['udp_relay_mode', 'UDP中继(native)']],
+  tuic: [...COMMON, ['uuid', 'UUID'], ['password', '密码'], ['sni', 'SNI'], ALPN, ['congestion', '拥塞控制(bbr)'], ['udp_relay_mode', 'UDP中继(native)']],
 };
 const TLS_TYPES = ['vless', 'vmess', 'trojan'];
 function editNode(id) {
@@ -286,9 +292,11 @@ function editNode(id) {
 async function saveNode(id) {
   const patch = {};
   el('modal-card').querySelectorAll('input[data-k]').forEach(i => {
-    let v = i.value;
-    if (i.dataset.k === 'port' || i.dataset.k === 'alter_id') v = parseInt(v) || (i.dataset.k === 'port' ? 443 : 0);
-    patch[i.dataset.k] = v;
+    const k = i.dataset.k;
+    const v = i.value;
+    if (k === 'port' || k === 'alter_id') { patch[k] = parseInt(v) || (k === 'port' ? 443 : 0); return; }
+    if (k === 'alpn') { const arr = v.split(',').map(x => x.trim()).filter(Boolean); if (arr.length) patch.alpn = arr; return; }
+    if (v !== '') patch[k] = v;     // 空串不回写，避免把没填的字段污染成 ""（保留原值/类型）
   });
   patch.skip_cert_verify = el('ed-skip').checked;
   if (el('ed-tls')) patch.tls = el('ed-tls').checked;
@@ -323,14 +331,17 @@ const RULE_TYPES = [['auto', '自动判别'], ['domain-suffix', '域名后缀'],
   ['domain-keyword', '关键词'], ['domain-wildcard', '通配符'], ['ip-cidr', 'IP段'], ['geoip', 'GEOIP'], ['geosite', 'GEOSITE']];
 
 // 与服务端 config_gen.classify_rule 保持一致，确保“生成规则”预览即最终结果
-function isIPv4(v) { const p = v.split('/')[0].split('.'); return p.length === 4 && p.every(o => /^\d+$/.test(o) && +o <= 255); }
+// 前导零（如 010.0.0.1）被 Python ipaddress 视为非法，前端也一并拒绝以对齐判别
+function isIPv4(v) { const p = v.split('/')[0].split('.'); return p.length === 4 && p.every(o => /^\d+$/.test(o) && +o <= 255 && (o === '0' || o[0] !== '0')); }
 function isIPv6(v) { const h = v.split('/')[0]; return h.includes(':') && /^[0-9a-fA-F:]+$/.test(h); }
 function classifyRule(value, rtype) {
   value = (value || '').trim(); rtype = (rtype || 'auto').toLowerCase();
   const map = { domain: 'DOMAIN', 'domain-suffix': 'DOMAIN-SUFFIX', suffix: 'DOMAIN-SUFFIX', 'domain-keyword': 'DOMAIN-KEYWORD', keyword: 'DOMAIN-KEYWORD', 'domain-wildcard': 'DOMAIN-WILDCARD', wildcard: 'DOMAIN-WILDCARD', 'ip-cidr': 'IP-CIDR', ip: 'IP-CIDR', geoip: 'GEOIP', geosite: 'GEOSITE', 'process-name': 'PROCESS-NAME' };
   if (rtype !== 'auto' && map[rtype]) {       // 已知显式类型
     let kind = map[rtype];
-    if (kind === 'IP-CIDR' && !value.includes('/')) value += isIPv6(value) ? '/128' : '/32';
+    // 仅在确为合法 IP 时补 /32//128，与服务端一致（服务端对非法显式 IP 会丢弃该规则）
+    if (kind === 'IP-CIDR' && !value.includes('/') && (isIPv4(value) || isIPv6(value)))
+      value += isIPv6(value) ? '/128' : '/32';
     return [kind, value];
   }
   // auto（未知显式类型也回退到此，和服务端一致）
@@ -380,6 +391,12 @@ function presetChanged() {
   rulesDirty = true;
   if (!STATE.settings) STATE.settings = {};
   STATE.settings.presets = [...document.querySelectorAll('.preset-cb:checked')].map(c => c.value);
+}
+// 兜底策略改动也纳入 dirty 保护，避免后台 loadState 静默丢弃未保存的 final
+function finalChanged() {
+  rulesDirty = true;
+  if (!STATE.settings) STATE.settings = {};
+  STATE.settings.final = el('final-policy').value;
 }
 function ruleEdited(i, key, val) {
   STATE.rules[i][key] = val;

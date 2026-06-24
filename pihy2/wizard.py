@@ -172,7 +172,9 @@ def _run_wizard():
     try:
         pw = getpass.getpass("设置访问密码（直接回车=自动生成）: ").strip()
     except Exception:
-        pw = ask("设置访问密码（留空=自动生成）")
+        # 无法隐藏输入的环境（如某些管道/无 tty）：不退回明文 input 回显密码，直接自动生成
+        _p(f"{C_WARN}  当前环境无法隐藏输入，将自动生成随机密码以避免明文回显。{C_END}")
+        pw = ""
     store.data["webui"]["password"] = pw or secrets.token_urlsafe(9)
     if not pw:
         _p(f"  已生成随机密码：{C_OK}{store.data['webui']['password']}{C_END}")
