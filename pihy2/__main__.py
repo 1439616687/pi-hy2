@@ -17,7 +17,7 @@ import argparse
 import sys
 
 from . import __version__, manager
-from .store import Store
+from .store import Store, state_lock
 
 
 def cmd_install(args):
@@ -31,8 +31,9 @@ def cmd_web(args):
 
 
 def cmd_apply(args):
-    store = Store()
-    ok, msg = manager.apply_config(store, restart=not args.no_restart)
+    with state_lock():                       # 与 WebUI/订阅定时更新互斥，读到一致快照
+        store = Store()
+        ok, msg = manager.apply_config(store, restart=not args.no_restart)
     print(msg)
     sys.exit(0 if ok else 1)
 
@@ -69,14 +70,15 @@ def cmd_add(args):
     if not nodes:
         print("没有解析到节点")
         sys.exit(1)
-    store = Store()
-    added = store.add_nodes(nodes)
-    store.save()
-    for n in added:
-        print(f"已添加：{n['name']}  {n['server']}:{n['port']}")
-    if args.apply:
-        ok, msg = manager.apply_config(store)
-        print(msg)
+    with state_lock():
+        store = Store()
+        added = store.add_nodes(nodes)
+        store.save()
+        for n in added:
+            print(f"已添加：{n['name']}  {n['server']}:{n['port']}")
+        if args.apply:
+            ok, msg = manager.apply_config(store)
+            print(msg)
 
 
 def cmd_uninstall(args):
@@ -84,15 +86,22 @@ def cmd_uninstall(args):
 
 
 def cmd_sub(args):
-    store = Store()
     action = args.sub_action
     if action == "list":
+        store = Store()
         subs = store.data.get("subscriptions", [])
         if not subs:
             print("（无订阅）")
         for s in subs:
             print(f"  {s['id']}  {s['name']}  节点{s['count']}  更新于 {s['updated'] or '从未'}\n      {s['url']}")
         return
+    # 改动类操作与 WebUI/其它进程互斥，避免并发读改写丢更新
+    with state_lock():
+        store = Store()
+        _cmd_sub_mutate(args, store, action)
+
+
+def _cmd_sub_mutate(args, store, action):
     if action == "add":
         sub = store.add_subscription(args.name or "订阅", args.url)
         cnt, errs = manager.refresh_subscription(store, sub["id"])

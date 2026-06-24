@@ -11,12 +11,17 @@
 from __future__ import annotations
 
 import gzip
+import http.client
+import ipaddress
 import json
 import os
 import platform
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -125,11 +130,18 @@ def _binary_ok(path: str) -> bool:
     return r.returncode == 0 and ("Mihomo" in r.stdout or "Meta" in r.stdout)
 
 
+_MAX_BIN_BYTES = 200 * 1024 * 1024     # 解压体积上限，防压缩炸弹耗尽磁盘
+
+
 def install_mihomo(mirror: str = "", log=print) -> str:
     """下载校验并原子安装 mihomo 到 MIHOMO_BIN。返回版本号或 'existing'。
 
-    安全要点：只允许 https 镜像；固定版本校验 SHA-256；安装前先 `-v` 验证；
-    先落临时文件再 os.replace 原子替换，避免半截/损坏的 root 可执行文件留存。
+    安全要点：
+      * 只允许 https 镜像；且镜像不可信，使用镜像时强制走「内置 SHA-256 的固定版本」，
+        无内置校验和的架构（如 armv7）配镜像直接拒绝，避免投递任意可运行二进制。
+      * 固定版本校验 SHA-256；不可校验时明确告警仅依赖 TLS + `-v`。
+      * 下载落到 mkstemp 的唯一文件（O_EXCL），避开 /tmp 固定名 symlink 攻击与多实例竞争。
+      * 解压设体积上限防压缩炸弹；先落临时文件再 os.replace 原子替换。
     """
     if os.path.exists(MIHOMO_BIN):
         if _binary_ok(MIHOMO_BIN):
@@ -139,38 +151,65 @@ def install_mihomo(mirror: str = "", log=print) -> str:
 
     arch = detect_arch()
     log(f"检测到架构：{arch}")
-    try:
-        url, ver = resolve_download_url(arch)
-        log(f"最新版本：{ver}")
-    except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError, OSError) as e:
-        log(f"在线解析失败（{e}），回退到已知版本 {PINNED_VERSION}")
+
+    if mirror:
+        if arch not in PINNED_SHA256:
+            raise RuntimeError(
+                f"{arch} 架构未内置校验和，使用下载镜像时无法保证完整性；"
+                "请清除镜像改用 GitHub 直链，或手动安装 mihomo 到 /usr/local/bin/mihomo。")
         url, ver = fallback_url(arch)
+        log(f"使用下载镜像 + 固定版本 {ver}（将校验 SHA-256）")
+    else:
+        try:
+            url, ver = resolve_download_url(arch)
+            log(f"最新版本：{ver}")
+        except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError, OSError) as e:
+            log(f"在线解析失败（{e}），回退到已知版本 {PINNED_VERSION}")
+            url, ver = fallback_url(arch)
 
-    gz = "/tmp/mihomo.gz"
-    log(f"下载：{url}")
-    try:
-        _download(url, gz, mirror=mirror)
-    except Exception as e:
-        # 直链失败再试一次固定版本
-        log(f"下载失败（{e}），改用固定版本 {PINNED_VERSION}")
-        url, ver = fallback_url(arch)
-        _download(url, gz, mirror=mirror)
-
-    # 固定版本校验 SHA-256（在线最新版无法预知 hash，依赖 GitHub TLS + 下面的 -v 验证）
-    if ver == PINNED_VERSION and arch in PINNED_SHA256:
-        got = _sha256(gz)
-        if got != PINNED_SHA256[arch]:
-            os.remove(gz)
-            raise RuntimeError(f"下载校验失败：SHA-256 不匹配（期望 {PINNED_SHA256[arch][:12]}…，"
-                               f"实际 {got[:12]}…），已中止以防被替换。")
-        log("SHA-256 校验通过")
-
-    log("解压并安装…")
+    fd, gz = tempfile.mkstemp(prefix="mihomo-", suffix=".gz")
+    os.close(fd)
     tmp_bin = MIHOMO_BIN + ".new"
-    with gzip.open(gz, "rb") as fin, open(tmp_bin, "wb") as fout:
-        shutil.copyfileobj(fin, fout)
+    try:
+        log(f"下载：{url}")
+        try:
+            _download(url, gz, mirror=mirror)
+        except Exception as e:
+            if mirror:
+                raise                              # 镜像路径不静默回退到未校验直链
+            log(f"下载失败（{e}），改用固定版本 {PINNED_VERSION}")
+            url, ver = fallback_url(arch)
+            _download(url, gz, mirror=mirror)
+
+        if ver == PINNED_VERSION and arch in PINNED_SHA256:
+            got = _sha256(gz)
+            if got != PINNED_SHA256[arch]:
+                raise RuntimeError(f"下载校验失败：SHA-256 不匹配（期望 {PINNED_SHA256[arch][:12]}…，"
+                                   f"实际 {got[:12]}…），已中止以防被替换。")
+            log("SHA-256 校验通过")
+        else:
+            log("注意：该下载未做 SHA-256 比对，仅依赖 GitHub TLS 与下面的可运行性校验。")
+
+        log("解压并安装…")
+        total = 0
+        with gzip.open(gz, "rb") as fin, open(tmp_bin, "wb") as fout:
+            while True:
+                chunk = fin.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_BIN_BYTES:
+                    raise RuntimeError("解压体积超过上限，疑似异常文件，已中止。")
+                fout.write(chunk)
+    except Exception:
+        if os.path.exists(tmp_bin):
+            os.remove(tmp_bin)
+        raise
+    finally:
+        if os.path.exists(gz):
+            os.remove(gz)
+
     os.chmod(tmp_bin, 0o755)
-    os.remove(gz)
     if not _binary_ok(tmp_bin):
         r = run([tmp_bin, "-v"], timeout=15)
         os.remove(tmp_bin)
@@ -294,23 +333,31 @@ SYSCTL_FILE = "/etc/sysctl.d/99-pihy2.conf"
 def set_ip_forward(on: bool, log=print) -> None:
     """开/关全屋网关所需内核参数（IP 转发 + 宽松反向路径过滤）。
     rp_filter=2(loose) 是透明网关常见的关键项：TUN 代理下进出路径不对称，
-    严格 rp_filter 会丢回程包。已是目标状态则跳过，避免每次 apply 写盘。"""
-    have = os.path.exists(SYSCTL_FILE)
-    if on == have:
-        return
+    严格 rp_filter 会丢回程包。
+
+    以运行期实际值为准：每次都用 sysctl -w 确保生效，文件仅用于持久化（仅在内容变化时写），
+    不再以「sysctl 文件是否存在」推断当前状态——那并不等于内核运行值，判断不可靠。"""
+    desired = ("net.ipv4.ip_forward=1\n"
+               "net.ipv4.conf.all.rp_filter=2\n"
+               "net.ipv4.conf.default.rp_filter=2\n")
     try:
         if on:
-            with open(SYSCTL_FILE, "w") as f:
-                f.write("net.ipv4.ip_forward=1\n"
-                        "net.ipv4.conf.all.rp_filter=2\n"
-                        "net.ipv4.conf.default.rp_filter=2\n")
-            run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
-            run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
-        else:
+            cur = ""
+            if os.path.exists(SYSCTL_FILE):
+                with open(SYSCTL_FILE) as f:
+                    cur = f.read()
+            if cur != desired:                 # 内容无变化则不写盘，避免每次 apply churn
+                with open(SYSCTL_FILE, "w") as f:
+                    f.write(desired)
+        elif os.path.exists(SYSCTL_FILE):
             os.remove(SYSCTL_FILE)
-            run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
     except OSError as e:
-        log(f"设置网关内核参数失败：{e}")
+        log(f"持久化网关内核参数失败：{e}")
+    # 运行期值每次都应用，保证与目标状态一致
+    run(["sysctl", "-w", f"net.ipv4.ip_forward={1 if on else 0}"])
+    if on:
+        run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
+        run(["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"])
 
 
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
@@ -341,33 +388,103 @@ SUB_SERVICE = "/etc/systemd/system/pihy2-sub-update.service"
 SUB_TIMER = "/etc/systemd/system/pihy2-sub-update.timer"
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        raise urllib.error.HTTPError(a[0].full_url, 399, "订阅地址发生跳转，已拒绝", {}, None)
+# 运营商级 NAT(CGNAT, RFC6598)：is_private 等标志不覆盖，需显式拦截
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
-def _assert_public_host(url: str):
-    """订阅是 root 进程发起的服务端请求，拒绝指向内网/本机，避免 SSRF。"""
-    import ipaddress
-    import socket
-    host = urllib.parse.urlparse(url).hostname or ""
+def _validate_ip(ipstr: str) -> str:
+    """校验解析出的 IP 不指向内网/本机/保留/CGNAT 地址；IPv4-mapped 先还原。"""
+    ip = ipaddress.ip_address(ipstr)
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified or ip in _CGNAT):
+        raise ValueError("订阅地址不能指向内网/本机/保留地址")
+    return str(ip)
+
+
+def _resolve_public(host: str) -> tuple[int, str]:
+    """解析域名并校验所有返回地址；返回钉死用的 (family, ip)。任一内网地址即整体拒绝。"""
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
         raise ValueError("无法解析订阅域名")
+    chosen = None
     for fam, _, _, _, sa in infos:
-        ip = ipaddress.ip_address(sa[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            raise ValueError("订阅地址不能指向内网/本机地址")
+        ok = _validate_ip(sa[0])
+        if chosen is None:
+            chosen = (fam, ok)
+    if chosen is None:
+        raise ValueError("订阅域名无解析结果")
+    return chosen
 
 
-def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024) -> str:
-    """拉取订阅内容。拒绝内网地址与跳转（防 SSRF），并限制大小。"""
-    _assert_public_host(url)
-    opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, headers={"User-Agent": "pihy2/1.0"})
-    with opener.open(req, timeout=timeout) as resp:
-        return resp.read(max_bytes).decode("utf-8", "ignore")
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """连接到已校验并钉死的 IP，杜绝 getaddrinfo 二次解析（DNS rebinding/TOCTOU）。"""
+
+    def __init__(self, host, ip, **kw):
+        super().__init__(host, **kw)
+        self._ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._ip, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, ip, **kw):
+        super().__init__(host, **kw)
+        self._ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        # SNI/证书校验仍用真实域名 host，连接目标却是钉死的已校验 IP
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024,
+               _max_redirects: int = 5) -> str:
+    """拉取订阅内容。订阅是 root 进程发起的服务端请求，须防 SSRF：
+
+    每一跳都先解析+校验域名、再把连接钉死到该公网 IP（消除校验与连接之间的二次解析
+    TOCTOU / DNS rebinding）；跳转有限跟随且逐跳复检；超大小直接报错而非静默截断。
+    """
+    for _ in range(_max_redirects + 1):
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError("订阅地址必须以 http(s):// 开头")
+        host = parts.hostname or ""
+        if not host:
+            raise ValueError("订阅地址缺少主机名")
+        port = parts.port or (443 if scheme == "https" else 80)
+        _fam, ip = _resolve_public(host)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        if scheme == "https":
+            conn = _PinnedHTTPSConnection(host, ip, port=port, timeout=timeout,
+                                          context=ssl.create_default_context())
+        else:
+            conn = _PinnedHTTPConnection(host, ip, port=port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "pihy2/1.0", "Host": host})
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                if not loc:
+                    raise ValueError("订阅地址跳转缺少 Location")
+                url = urllib.parse.urljoin(url, loc)
+                continue                       # 下一跳重新解析+校验+钉死
+            if resp.status != 200:
+                raise ValueError(f"订阅返回 HTTP {resp.status}")
+            data = resp.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise ValueError("订阅内容超过大小限制")
+            return data.decode("utf-8", "ignore")
+        finally:
+            conn.close()
+    raise ValueError("订阅地址跳转次数过多")
 
 
 def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:

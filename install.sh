@@ -3,6 +3,8 @@
 #   把本项目复制到 /opt/pihy2，创建 pihy2 命令，然后启动交互式部署向导。
 # 用法（树莓派上，root）：
 #   sudo bash install.sh
+# 若被 `sh install.sh`（dash）调用，BASH_SOURCE 与 pipefail 会失效，这里自动切回 bash
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 
 INSTALL_DIR=/opt/pihy2

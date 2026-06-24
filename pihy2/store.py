@@ -6,14 +6,57 @@ WebUI 与命令行向导都读写它，再调用 config_gen 渲染并 apply。
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import secrets
+
+try:
+    import fcntl                       # Linux（树莓派）才有；缺失时锁退化为无操作
+except ImportError:                    # pragma: no cover
+    fcntl = None
 
 from . import config_gen
 
 STATE_DIR = os.environ.get("PIHY2_DIR", "/etc/pihy2")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
+LOCK_FILE = STATE_FILE + ".lock"
+
+
+@contextlib.contextmanager
+def state_lock():
+    """跨进程互斥锁，保护 state.json 的「读-改-写」临界区。
+
+    CLI（如订阅定时更新进程）与 WebUI 进程会并发改写同一份 state.json，
+    仅靠各自的原子写无法防丢更新。调用方应以
+        with state_lock():
+            store = Store(); ...修改...; store.save()
+    形式把整个读改写包起来。拿不到锁文件时退化为无锁，至少不阻断功能。
+    """
+    if fcntl is None:
+        yield
+        return
+    try:
+        os.makedirs(os.path.dirname(LOCK_FILE) or ".", mode=0o700, exist_ok=True)
+        f = open(LOCK_FILE, "w")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def _id_num(id_str) -> int:
+    """取 id 末尾数字（n12 -> 12，s3 -> 3）；无数字返回 0。"""
+    m = re.search(r"(\d+)$", str(id_str or ""))
+    return int(m.group(1)) if m else 0
 
 # 内置的常用直连规则（首次初始化时写入，用户可在面板里增删）。
 # 刻意只用“不依赖 geodata”的规则：GEOIP/GEOSITE 需要 geoip.metadb/GeoSite.dat，
@@ -52,14 +95,18 @@ class Store:
 
     # ---------------------------------------------------------------- 读写
     def load(self) -> dict:
-        if os.path.exists(self.path):
+        if not os.path.exists(self.path):
+            return _new_state()
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return self._migrate(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            # 损坏/不可读：先把原文件改名备份，避免随后一次 save 用空状态把可抢救的数据覆盖清零
             try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return self._migrate(data)
-            except (json.JSONDecodeError, OSError):
+                os.replace(self.path, self.path + ".bad")
+            except OSError:
                 pass
-        return _new_state()
+            return _new_state()
 
     def save(self) -> None:
         # state.json 含明文密码/密钥，目录与文件都收紧权限到仅 root 可读
@@ -70,11 +117,12 @@ class Store:
         except OSError:
             pass
         tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        # 用 O_CREAT|0o600 创建，文件从诞生即为仅 root 可读，不存在可读窗口
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())          # 防掉电写一半
-        os.chmod(tmp, 0o600)              # 替换前就设好权限，避免出现可读窗口
         os.replace(tmp, self.path)        # 原子替换，避免写一半损坏
 
     def _migrate(self, data: dict) -> dict:
@@ -85,6 +133,11 @@ class Store:
         if not base["settings"].get("secret"):
             base["settings"]["secret"] = secrets.token_hex(16)
         base["webui"] = {**_new_state()["webui"], **data.get("webui", {})}
+        # 回填自增计数，避免（外部编辑/导入缺 _seq 的旧状态后）新 id 与既有 id 撞号
+        base["_seq"] = max([base.get("_seq") or 0]
+                           + [_id_num(n.get("id")) for n in base.get("nodes", [])])
+        base["_subseq"] = max([base.get("_subseq") or 0]
+                              + [_id_num(s.get("id")) for s in base.get("subscriptions", [])])
         return base
 
     # ---------------------------------------------------------------- 节点

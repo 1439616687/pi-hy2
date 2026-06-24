@@ -7,6 +7,7 @@ Authorization: Bearer <token>；未设密码则不鉴权（界面会提示风险
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import secrets
@@ -16,7 +17,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import manager, parser, config_gen
-from .store import Store
+from .store import Store, state_lock
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -27,6 +28,15 @@ LOGIN_LOCK_SECS = 60          # 触发上限后锁定时长
 _lock = threading.Lock()
 _tokens: dict[str, float] = {}          # token -> 过期时间戳
 _login_fails: dict[str, list] = {}      # ip -> [失败次数, 最近失败时间]
+
+
+def _sweep_locked():
+    """清理过期 token 与陈旧的登录失败计数，防字典无界增长（调用方须持有 _lock）。"""
+    now = time.time()
+    for t in [k for k, exp in _tokens.items() if exp < now]:
+        _tokens.pop(t, None)
+    for ip in [k for k, v in _login_fails.items() if now - v[1] > LOGIN_LOCK_SECS]:
+        _login_fails.pop(ip, None)
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -83,16 +93,53 @@ class Handler(BaseHTTPRequestHandler):
             return True
         auth = self.headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
-        exp = _tokens.get(token)
-        if exp is None:
-            return False
-        if exp < time.time():           # 过期则清除
-            _tokens.pop(token, None)
-            return False
+        with _lock:                     # _tokens 在多线程下读改写须持锁
+            exp = _tokens.get(token)
+            if exp is None:
+                return False
+            if exp < time.time():       # 过期则清除
+                _tokens.pop(token, None)
+                return False
         return True
 
     def _client_ip(self) -> str:
         return self.client_address[0] if self.client_address else "?"
+
+    # ----------------------------------------------------------- 防 CSRF / DNS rebinding
+    def _host_only(self) -> str:
+        h = (self.headers.get("Host", "") or "").strip()
+        if h.startswith("["):                       # [ipv6]:port
+            return h[1:h.index("]")] if "]" in h else h
+        return h.rsplit(":", 1)[0] if ":" in h else h
+
+    def _guard_write(self, store: Store) -> bool:
+        """状态变更请求的防护：
+
+        1) 带 Origin/Referer 时须与 Host 同源（挡跨站 CSRF）。
+        2) 未设访问密码时，额外要求 Host 为 IP/localhost——此时写操作无凭证，
+           DNS rebinding（把攻击者域名重绑到 127.0.0.1）是主要风险，拒绝域名 Host 即可遏制；
+           而设了密码时，token 存于「面板真实源」的 localStorage，攻击者源读不到，
+           rebinding 自然拿不到 token、写操作会被 401 挡下，故放行主机名访问（不误伤 *.local）。
+        """
+        host = self._host_only()
+        origin = self.headers.get("Origin") or self.headers.get("Referer")
+        if origin:
+            oh = urllib.parse.urlparse(origin).hostname or ""
+            if oh and oh != host:
+                self._err("拒绝：跨站请求", 403)
+                return False
+        if not store.data["webui"].get("password"):
+            host_ok = host == "localhost"
+            if not host_ok:
+                try:
+                    ipaddress.ip_address(host)
+                    host_ok = True
+                except ValueError:
+                    host_ok = False
+            if not host_ok:
+                self._err("拒绝：未设密码时请用本机 IP 或 localhost 访问面板（防 DNS rebinding）", 403)
+                return False
+        return True
 
     # ----------------------------------------------------------- 路由
     def do_GET(self):
@@ -104,16 +151,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
+        if not self._guard_write(self._store()):
+            return
         return self._api_post(self.path.split("?", 1)[0])
 
     def do_PUT(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
+        if not self._guard_write(self._store()):
+            return
         return self._api_put(self.path.split("?", 1)[0])
 
     def do_DELETE(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
+        if not self._guard_write(self._store()):
+            return
         return self._api_delete(self.path.split("?", 1)[0])
 
     # ----------------------------------------------------------- 静态文件
@@ -195,8 +248,13 @@ class Handler(BaseHTTPRequestHandler):
             if sec:
                 cfg = cfg.replace(sec, "******")
             return self._json({"ok": True, "config": cfg})
-        if path == "/api/export":  # 导出所有节点链接
-            links = [parser.node_to_link(n) for n in store.data["nodes"]]
+        if path == "/api/export":  # 导出所有节点链接（逐个兜底，单条坏数据不拖垮整次导出）
+            links = []
+            for n in store.data["nodes"]:
+                try:
+                    links.append(parser.node_to_link(n))
+                except Exception:
+                    continue
             return self._json({"ok": True, "links": links})
         return self._err("not found", 404)
 
@@ -208,6 +266,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/login":
             ip = self._client_ip()
             with _lock:
+                _sweep_locked()                 # 顺手清理过期 token / 陈旧失败计数
                 fails = _login_fails.get(ip, [0, 0.0])
                 # 锁定窗口内拒绝继续尝试，遏制暴力破解
                 if fails[0] >= LOGIN_MAX_FAILS and time.time() - fails[1] < LOGIN_LOCK_SECS:
@@ -228,7 +287,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logout":
             auth = self.headers.get("Authorization", "")
             tok = auth[7:] if auth.startswith("Bearer ") else ""
-            _tokens.pop(tok, None)
+            with _lock:
+                _tokens.pop(tok, None)
             return self._json({"ok": True})
 
         if not self._authed(store):
@@ -238,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
             nodes, errs = parser.parse_many(body.get("text", ""))
             return self._json({"ok": True, "nodes": nodes, "errors": errs})
 
-        with _lock:
+        with _lock, state_lock():               # 进程内 + 跨进程，保护读改写不丢更新
             store = self._store()
             if path == "/api/nodes":
                 if body.get("text"):  # 从链接批量添加
@@ -314,7 +374,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed(store):
             return self._err("未登录", 401)
         body = self._body()
-        with _lock:
+        with _lock, state_lock():
             store = self._store()
             if path.startswith("/api/nodes/"):
                 nid = path.rsplit("/", 1)[-1]
@@ -328,7 +388,11 @@ class Handler(BaseHTTPRequestHandler):
                 store.save()
                 return self._json({"ok": True})
             if path == "/api/settings":
-                settings = dict(body.get("settings", {}))
+                # 仅接受面向用户的已知设置键，显式拒绝 secret 等内部字段被覆盖/注入
+                allowed = set(config_gen.DEFAULT_SETTINGS) | {"github_mirror"}
+                allowed.discard("secret")
+                settings = {k: v for k, v in dict(body.get("settings", {})).items()
+                            if k in allowed}
                 # external_controller 必须是回环地址，否则带密钥外发会造成 SSRF/密钥外泄
                 ec = settings.get("external_controller")
                 if ec is not None:
@@ -366,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self._store()
         if not self._authed(store):
             return self._err("未登录", 401)
-        with _lock:
+        with _lock, state_lock():
             store = self._store()
             if path.startswith("/api/nodes/"):
                 nid = path.rsplit("/", 1)[-1]

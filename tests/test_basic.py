@@ -239,6 +239,128 @@ g_on = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", 
 check("网关关 -> allow-lan: false", "allow-lan: false" in g_off)
 check("网关开 -> allow-lan: true", "allow-lan: true" in g_on)
 
+print("== 回归：YAML 解析 ==")
+from pihy2 import yaml_lite  # noqa: E402
+# H1：块状子键作为列表项首键时，兄弟键不被吞
+_h1 = yaml_lite.load("proxies:\n  - ws-opts:\n      path: /a\n    server: s\n    port: 443\n")
+check("YAML 首键为块状子键时兄弟键保留", _h1["proxies"][0].get("server") == "s", str(_h1))
+# H1：紧随的第二个列表项不被吞掉
+_h1b = yaml_lite.load("proxies:\n  - ws-opts:\n      path: /a\n    server: s1\n  - name: second\n    server: s2\n")
+check("YAML 第二个列表项不被吞", len(_h1b["proxies"]) == 2 and _h1b["proxies"][1].get("server") == "s2", str(_h1b))
+# 多文档只取第一个
+_md = yaml_lite.load("proxies:\n  - {name: a, type: ss, server: x.com, port: 1, cipher: aes-256-gcm, password: p}\n"
+                     "---\nproxies:\n  - {name: b, type: ss, server: y.com, port: 2, cipher: aes-256-gcm, password: q}\n")
+check("多文档 YAML 只取第一个", len(_md["proxies"]) == 1 and _md["proxies"][0]["name"] == "a")
+# 块标量 | 不致整体解析失败
+_bsn, _ = parser.parse_many("proxies:\n  - name: c\n    type: vless\n    server: z.com\n    port: 443\n"
+                            "    ca-str: |\n      LINE1\n      LINE2\n    uuid: u-uuid\n")
+check("块标量不致整体解析失败", _bsn and _bsn[0]["uuid"] == "u-uuid", str(_bsn))
+# 锚点 + 合并键
+_ann, _ = parser.parse_many("base: &b\n  type: ss\n  cipher: aes-256-gcm\nproxies:\n  - name: A\n    server: a.com\n"
+                            "    port: 1\n    password: pa\n    <<: *b\n")
+check("锚点+合并键展开", _ann and _ann[0]["type"] == "ss" and _ann[0]["cipher"] == "aes-256-gcm", str(_ann))
+# 深嵌套不冒泡 RecursionError
+_deep = "a:\n" + "".join("  " * i + "b:\n" for i in range(1, 4000))
+try:
+    yaml_lite.load(_deep); check("深嵌套不崩", True)
+except yaml_lite.YamlError:
+    check("深嵌套归一为 YamlError", True)
+except RecursionError:
+    check("深嵌套 RecursionError 泄漏", False)
+
+
+print("== 回归：parser 健壮性 ==")
+check("裸 IPv6 不被截断", parser._split_hostport("2001:db8::1") == ("2001:db8::1", 443),
+      str(parser._split_hostport("2001:db8::1")))
+check("方括号 IPv6 带端口", parser._split_hostport("[2001:db8::1]:8443") == ("2001:db8::1", 8443))
+check("非数字端口回落 443", parser._split_hostport("h.com:abc") == ("h.com", 443))
+check("端口越界回落 443", parser._split_hostport("h.com:99999") == ("h.com", 443))
+try:
+    parser.node_to_link({"name": "x", "type": "hysteria2", "server": "h.com", "port": 443})
+    check("缺 password 导出不崩", True)
+except KeyError:
+    check("缺 password 导出 KeyError", False)
+try:
+    parser.node_to_link({"name": "x", "type": "ss", "port": 1}); check("缺 server 抛 ParseError", False)
+except parser.ParseError:
+    check("缺 server 抛 ParseError", True)
+_vmrt = parser.parse_link(parser.node_to_link(
+    {"name": "v", "type": "vmess", "server": "m.com", "port": 443, "uuid": "u1", "alpn": ["h2", "h3"], "network": "tcp"}))
+check("vmess alpn round-trip 不丢", _vmrt.get("alpn") == ["h2", "h3"], str(_vmrt.get("alpn")))
+_pwn, _ = parser.parse_many("proxies:\n  - {name: z, type: ss, server: s.com, port: 8388, cipher: aes-256-gcm, password: 12345}\n")
+check("YAML 纯数字 password 转字符串", _pwn and isinstance(_pwn[0]["password"], str))
+parser.node_to_link(_pwn[0]); check("数字 password 导出不崩", True)
+
+
+print("== 回归：config_gen ==")
+_rn = config_gen.build_config(
+    [{"name": "PROXY", "type": "hysteria2", "server": "a.com", "port": 443, "password": "x"}], [], {"secret": "s"})
+check("节点名 PROXY 被改名规避冲突",
+      "PROXY" not in [p["name"] for p in _rn["proxies"]] and "PROXY" in [g["name"] for g in _rn["proxy-groups"]],
+      str([p["name"] for p in _rn["proxies"]]))
+check("to_yaml 转义危险 key", '"a: b"' in config_gen.to_yaml({"a: b": "v"}), config_gen.to_yaml({"a: b": "v"}))
+_ti = config_gen.render([n], [{"value": "notanip", "policy": "PROXY", "type": "ip-cidr"}],
+                        dict(config_gen.DEFAULT_SETTINGS, secret="x"))
+check("显式非法 IP 规则被丢弃", "notanip" not in _ti)
+_dns_off = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", gateway_mode=False))
+_dns_on = config_gen.render([n], [], dict(config_gen.DEFAULT_SETTINGS, secret="x", gateway_mode=True))
+check("DNS 非网关绑回环", "127.0.0.1:1053" in _dns_off)
+check("DNS 网关绑 0.0.0.0", "0.0.0.0:1053" in _dns_on)
+check("含 default-nameserver 引导", "default-nameserver" in _dns_off)
+check("方括号 IPv6 规则判别为 IP-CIDR", config_gen.classify_rule("[2001:db8::1]", "auto")[0] == "IP-CIDR")
+
+
+print("== 回归：store ==")
+import json as _json2  # noqa: E402
+from pihy2 import store as _store  # noqa: E402
+_sd = tempfile.mkdtemp(prefix="pihy2-st-")
+_sp = os.path.join(_sd, "state.json")
+with open(_sp, "w") as f:                       # 外部写入缺 _seq 的旧状态
+    _json2.dump({"version": 1, "nodes": [{"id": "n5", "name": "a", "server": "h", "port": 1, "type": "hysteria2"}]}, f)
+_n6 = _store.Store(_sp).add_node({"name": "b", "server": "h2", "port": 2, "type": "hysteria2"})
+check("_seq 回填避免 id 撞号", _n6["id"] == "n6", _n6["id"])
+with open(_sp, "w") as f:
+    f.write("{ not json")
+_store.Store(_sp)
+check("损坏 state 被备份而非清零", os.path.exists(_sp + ".bad"))
+_st2 = _store.Store(_sp); _st2.save()
+check("state.json 权限 0600", (os.stat(_sp).st_mode & 0o777) == 0o600, oct(os.stat(_sp).st_mode & 0o777))
+
+
+print("== 回归：manager SSRF ==")
+from pihy2 import manager as _mgr  # noqa: E402
+_ssrf_ok = True
+for _bad in ("127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0"):
+    try:
+        _mgr._validate_ip(_bad); _ssrf_ok = False
+    except ValueError:
+        pass
+check("SSRF 内网/CGNAT/映射地址全部拒绝", _ssrf_ok)
+check("SSRF 放行公网", _mgr._validate_ip("1.1.1.1") == "1.1.1.1")
+try:
+    _mgr.fetch_text("http://127.0.0.1/x", timeout=2); check("fetch 拒绝内网", False)
+except ValueError:
+    check("fetch 拒绝内网", True)
+try:
+    _mgr.fetch_text("ftp://x/y"); check("fetch 拒绝非 http(s)", False)
+except ValueError:
+    check("fetch 拒绝非 http(s)", True)
+
+
+print("== 回归：CLI 参数绑定 ==")
+from pihy2.__main__ import build_parser  # noqa: E402
+_cp = build_parser()
+_pa = _cp.parse_args(["web", "--port", "9000"])
+check("web 子命令绑定 func/port", _pa.func.__name__ == "cmd_web" and _pa.port == 9000)
+_pa = _cp.parse_args(["sub", "update", "all"])
+check("sub update 默认 all", _pa.sub_action == "update" and _pa.id == "all")
+check("restart 绑定 action", _cp.parse_args(["restart"]).action == "restart")
+try:
+    _cp.parse_args(["sub"]); check("sub 缺子命令报错", False)
+except SystemExit:
+    check("sub 缺子命令报错", True)
+
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):

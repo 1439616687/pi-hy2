@@ -6,6 +6,26 @@
 
 ---
 
+## 修复状态（全量修复已完成）
+
+已对全部确认项实施修复，并新增 33 条回归测试（共 99 项全绿），用 PyYAML 校验了
+多/单/零节点、网关、预设五种配置形态均生成合法 YAML。逐项：
+
+- **高危 5/5 全修**：YAML 吞行（`_inline_nested` 自增修正）、订阅名 XSS（去内联拼接）、
+  导出 KeyError（`.get` + 逐节点兜底）、SSRF rebinding（解析后**钉死 IP 连接**）、保留词节点名（改名规避）。
+- **中危 13/13 全修**：裸 IPv6、vmess alpn、YAML key 转义、多文档、数字标量、`_seq` 回填、
+  跨进程文件锁、损坏 state 备份、CGNAT 拦截、armv7/镜像下载完整性、`/tmp` mkstemp、未鉴权写 + 反 rebinding 守卫。
+- **低危/提示**：大部分已修（IPv6 端口、TUIC、显式 IP 校验、default-nameserver、DNS 收敛、
+  块标量/锚点/递归、save 权限、压缩炸弹、redirect 复检、sysctl 实判、token/login 清理与加锁、
+  设置白名单、前端规则一致性、final 脏保护、可编辑 alpn/pin、空串不回写、install.sh、getpass、测试覆盖…）。
+- **4 条低危按设计保留并说明**：L20（TUIC 空密码——保持宽松以兼容 token 式 TUIC，仅确保不崩）、
+  L37（改密并发的毫秒级窗口——影响可忽略）、L38（耗时 IO 仍在锁内——为跨进程一致性刻意取舍）、
+  L45（`saveSubInterval` 与 `/api/settings` 复用——已被设置白名单化解为无害空操作）。
+
+> 详见 git 历史与各文件改动；运行 `python3 tests/test_basic.py`（或带 `MIHOMO=<二进制>` 做真实 `-t` 校验）。
+
+---
+
 ## 一、高危（建议优先修）
 
 ### H1. YAML 列表项首键为块状子映射时，解析器吞行/错并节点 — `pihy2/yaml_lite.py:235-236`
