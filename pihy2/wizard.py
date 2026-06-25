@@ -10,7 +10,7 @@ import secrets
 import sys
 
 from . import manager, parser
-from .store import Store
+from .store import Store, state_lock
 
 C_TITLE = "\033[1;36m"
 C_OK = "\033[32m"
@@ -164,7 +164,12 @@ def _run_wizard():
     # ---- 4. WebUI ----
     title("第 4 步 / WebUI 管理面板")
     port = ask("WebUI 端口", str(store.data["webui"]["port"]))
-    store.data["webui"]["port"] = int(port) if port.isdigit() else 8088
+    pnum = int(port) if port.isdigit() else 0
+    if not 1 <= pnum <= 65535:               # 越界（如 0 / 99999）会让 pihy2-web 启动崩溃，回落默认
+        if port:
+            _p(f"{C_WARN}  端口 {port} 非法（需 1..65535），改用 8088。{C_END}")
+        pnum = 8088
+    store.data["webui"]["port"] = pnum
     # 面板能以 root 改系统代理，必须有密码——否则只监听回环，无法局域网访问。
     _p(f"{C_WARN}面板以 root 运行、能改系统代理，必须设访问密码才会开放到局域网。{C_END}")
     import getpass
@@ -178,7 +183,8 @@ def _run_wizard():
     store.data["webui"]["password"] = pw or secrets.token_urlsafe(9)
     if not pw:
         _p(f"  已生成随机密码：{C_OK}{store.data['webui']['password']}{C_END}")
-    store.save()
+    with state_lock():        # 与订阅定时器/面板的并发写互斥，避免它们的更新被本次保存覆盖丢失
+        store.save()
 
     # ---- 5. 安装 ----
     title("第 5 步 / 开始部署")

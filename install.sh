@@ -32,6 +32,9 @@ grn "python3: $(python3 --version 2>&1)"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 grn "安装目录：$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
+# 升级/重装：先删旧的包与 web 子树再复制，避免上个版本里已删除/改名的 .py 残留并被导入
+# （cp -r 是“合并”进已存在目录，不会替换，否则旧模块会与新代码共存造成诡异 bug）
+rm -rf "$INSTALL_DIR/pihy2" "$INSTALL_DIR/web"
 # 仅复制需要的内容，排除 .git 与测试缓存
 for item in pihy2 web README.md docs; do
   [ -e "$SRC_DIR/$item" ] && cp -r "$SRC_DIR/$item" "$INSTALL_DIR/"

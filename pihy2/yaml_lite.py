@@ -174,8 +174,12 @@ def _split_kv(text: str) -> tuple[str, str | None]:
 class _Reader:
     def __init__(self, text: str):
         self.lines = []
-        for raw in text.replace("\t", "    ").splitlines():
-            s = _strip_comment(raw)
+        for raw in text.splitlines():
+            # 仅把行首缩进里的 tab 折算成空格；行内（尤其是引号字符串里的真实 \t，
+            # 如 header/password）原样保留，避免被悄悄替换成 4 个空格造成数据损坏
+            body = raw.lstrip(" \t")
+            lead = raw[:len(raw) - len(body)].replace("\t", "    ")
+            s = _strip_comment(lead + body)
             stripped = s.strip()
             if stripped in ("---", "..."):
                 if self.lines:        # 多文档：只解析第一个，避免后文档键覆盖前者丢节点

@@ -112,7 +112,7 @@ async function delSub(id) {
 async function saveSubInterval() {
   const h = parseInt(el('sub-interval').value) || 12;
   const r = await api('PUT', '/api/settings', { settings: {}, sub_interval_hours: h });
-  done(r, '已保存（下次部署/重装生效；也可改 systemd timer）');
+  done(r, '已保存，自动更新间隔已生效');
 }
 
 // ----------------------------------------------------------------- 标签页
@@ -262,7 +262,7 @@ const ALPN = ['alpn', 'ALPN(逗号分隔,如 h3,h2)'];
 const FIELDS_BY_TYPE = {
   hysteria2: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['ports', '端口跳跃(如 443-9000)'],
     ['obfs', '混淆(salamander/空)'], ['obfs_password', '混淆密码'], ['up', '上行(留空默认)'], ['down', '下行(留空默认)'],
-    ALPN, ['fingerprint', '证书指纹(64位hex)'], ['pin_sha256', '公钥固定 pinSHA256(可空)']],
+    ALPN, ['fingerprint', '证书指纹(64位hex)'], ['pin_sha256', '公钥固定 pinSHA256(仅记录·mihomo 不强制)']],
   vless: [...COMMON, ['uuid', 'UUID'], ['sni', 'SNI'], ['flow', 'flow'], ['client_fingerprint', '指纹(chrome..)'],
     ['reality_pbk', 'reality 公钥'], ['reality_sid', 'reality shortId'], ALPN, ...NET],
   vmess: [...COMMON, ['uuid', 'UUID'], ['alter_id', 'alterId', 'number'], ['cipher', '加密(auto..)'], ['sni', 'SNI'], ALPN, ...NET],
@@ -332,16 +332,36 @@ const RULE_TYPES = [['auto', '自动判别'], ['domain-suffix', '域名后缀'],
 
 // 与服务端 config_gen.classify_rule 保持一致，确保“生成规则”预览即最终结果
 // 前导零（如 010.0.0.1）被 Python ipaddress 视为非法，前端也一并拒绝以对齐判别
-function isIPv4(v) { const p = v.split('/')[0].split('.'); return p.length === 4 && p.every(o => /^\d+$/.test(o) && +o <= 255 && (o === '0' || o[0] !== '0')); }
-function isIPv6(v) { const h = v.split('/')[0]; return h.includes(':') && /^[0-9a-fA-F:]+$/.test(h); }
+// 校验 IPv4(/掩码)：4 段 0-255、无前导零；掩码 0-32。与 Python ipaddress 边界对齐
+function isIPv4(v) {
+  const parts = v.split('/'); if (parts.length > 2) return false;
+  const p = parts[0].split('.');
+  if (!(p.length === 4 && p.every(o => /^\d+$/.test(o) && +o <= 255 && (o === '0' || o[0] !== '0')))) return false;
+  return parts[1] === undefined || (/^\d+$/.test(parts[1]) && +parts[1] <= 32);
+}
+// 校验 IPv6(/掩码)：最多一个 '::'，否则需正好 8 段；掩码 0-128。拒绝 dead:beef 这类不完整地址
+function isIPv6(v) {
+  const parts = v.split('/'); if (parts.length > 2) return false;
+  if (parts[1] !== undefined && !(/^\d+$/.test(parts[1]) && +parts[1] <= 128)) return false;
+  const h = parts[0];
+  if (!h.includes(':') || !/^[0-9a-fA-F:]+$/.test(h)) return false;
+  if (h.split('::').length > 2) return false;
+  const groups = h.split(':').filter(x => x !== '');
+  return h.includes('::') ? groups.length <= 7 : (h.split(':').length === 8 && groups.length === 8);
+}
 function classifyRule(value, rtype) {
   value = (value || '').trim(); rtype = (rtype || 'auto').toLowerCase();
+  const mb = value.match(/^\[([0-9a-fA-F:]+)\](\/\d+)?$/);   // 先剥 [..] IPv6 字面量（与服务端一致）
+  if (mb) value = mb[1] + (mb[2] || '');
+  value = value.replace(/%[^/]+/, '');                       // 去 IPv6 zone-id（%eth0），与服务端一致
   const map = { domain: 'DOMAIN', 'domain-suffix': 'DOMAIN-SUFFIX', suffix: 'DOMAIN-SUFFIX', 'domain-keyword': 'DOMAIN-KEYWORD', keyword: 'DOMAIN-KEYWORD', 'domain-wildcard': 'DOMAIN-WILDCARD', wildcard: 'DOMAIN-WILDCARD', 'ip-cidr': 'IP-CIDR', ip: 'IP-CIDR', geoip: 'GEOIP', geosite: 'GEOSITE', 'process-name': 'PROCESS-NAME' };
   if (rtype !== 'auto' && map[rtype]) {       // 已知显式类型
     let kind = map[rtype];
-    // 仅在确为合法 IP 时补 /32//128，与服务端一致（服务端对非法显式 IP 会丢弃该规则）
-    if (kind === 'IP-CIDR' && !value.includes('/') && (isIPv4(value) || isIPv6(value)))
-      value += isIPv6(value) ? '/128' : '/32';
+    if (kind === 'IP-CIDR') {
+      // 显式 IP 但取值非法：服务端会直接丢弃该规则，预览如实提示而非伪装成有效 IP-CIDR
+      if (!(isIPv4(value) || isIPv6(value))) return ['(非法 IP/CIDR · 会被忽略)', value];
+      if (!value.includes('/')) value += isIPv6(value) ? '/128' : '/32';
+    }
     return [kind, value];
   }
   // auto（未知显式类型也回退到此，和服务端一致）
