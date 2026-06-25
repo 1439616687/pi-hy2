@@ -30,6 +30,29 @@ _tokens: dict[str, float] = {}          # token -> 过期时间戳
 _login_fails: dict[str, list] = {}      # ip -> [失败次数, 最近失败时间]
 
 
+def _valid_listen_port(v):
+    """监听端口校验：返回 1..65535 的 int，否则 None。
+    防止把 0/越界/非数字写进 state.json，导致下次 pihy2-web 重启 bind 崩溃、面板永久失联。"""
+    try:
+        p = int(v)
+    except (TypeError, ValueError):
+        return None
+    return p if 1 <= p <= 65535 else None
+
+
+def _valid_bind(v):
+    """监听地址校验：返回合法 IP 或 'localhost'，否则 None。
+    防止把无法解析的 bind 写进 state.json，导致下次重启 ThreadingHTTPServer 抛 gaierror。"""
+    b = str(v or "").strip()
+    if b == "localhost":
+        return b
+    try:
+        ipaddress.ip_address(b)
+        return b
+    except ValueError:
+        return None
+
+
 def _sweep_locked():
     """清理过期 token 与陈旧的登录失败计数，防字典无界增长（调用方须持有 _lock）。"""
     now = time.time()
@@ -418,10 +441,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if path == "/api/webui":
                 w = store.data["webui"]
-                if "port" in body and str(body["port"]).isdigit():
-                    w["port"] = int(body["port"])
+                if "port" in body:
+                    p = _valid_listen_port(body["port"])
+                    if p is None:
+                        return self._err("监听端口必须是 1..65535 的整数")
+                    w["port"] = p
                 if "bind" in body:
-                    w["bind"] = body["bind"]
+                    b = _valid_bind(body["bind"])
+                    if b is None:
+                        return self._err("监听地址必须是 IP 或 localhost")
+                    w["bind"] = b
                 if "password" in body:  # 空字符串=取消密码
                     w["password"] = body["password"]
                     _tokens.clear()

@@ -144,8 +144,8 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
 
     rtype 为 'auto' 时自动判别；否则按显式类型。返回如 ('DOMAIN-SUFFIX', 'google.com')。
     """
-    value = value.strip()
-    rtype = (rtype or "auto").strip().lower()
+    value = str(value).strip()
+    rtype = str(rtype or "auto").strip().lower()
     # 带方括号的 IPv6 字面量（[2001:db8::1] 或 [2001:db8::1]/64）先剥括号，便于判别
     mb = re.match(r"^\[([0-9A-Fa-f:]+)\](/\d+)?$", value)
     if mb:
@@ -200,7 +200,7 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
 def rule_to_mihomo(rule: dict) -> str:
     """单条规则字典 -> mihomo 规则行字符串。"""
     kind, value = classify_rule(rule.get("value", ""), rule.get("type", "auto"))
-    policy = rule.get("policy", "PROXY").strip().upper()
+    policy = str(rule.get("policy", "PROXY")).strip().upper()
     if policy not in ("DIRECT", "PROXY", "REJECT"):
         policy = "PROXY"
     # 仅 IP-CIDR 加 no-resolve：纯 IP 规则无需触发 DNS。
@@ -210,6 +210,20 @@ def rule_to_mihomo(rule: dict) -> str:
 
 
 # ---------------------------------------------------------------- 节点 -> proxy
+def _safe_int(v, default: int) -> int:
+    """宽松转 int，容忍 "443"/"1.0"/None/非法值，避免脏字段让整份配置生成崩掉。"""
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _port(node: dict) -> int:
+    """节点端口规整为 1..65535 的 int；缺失/非法回落 443，render 永不因脏 port 崩。"""
+    p = _safe_int(node.get("port"), 443)
+    return p if 1 <= p <= 65535 else 443
+
+
 def _bandwidth(value, default: str) -> str:
     """规整带宽字符串：必须含数字，否则回落默认。
     避免 UI 清空带宽框时拼出 ' Mbps' 这类无数字的非法值被原样下发给 mihomo。"""
@@ -234,7 +248,7 @@ def _apply_transport(p: dict, node: dict):
 def _proxy_hysteria2(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "hysteria2",
-        "server": node["server"], "port": int(node["port"]),
+        "server": node["server"], "port": _port(node),
         "password": str(node.get("password", "")),
         "sni": node.get("sni") or node["server"],
         "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
@@ -259,7 +273,7 @@ def _proxy_hysteria2(node: dict, settings: dict) -> dict:
 def _proxy_vless(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "vless",
-        "server": node["server"], "port": int(node["port"]),
+        "server": node["server"], "port": _port(node),
         "uuid": str(node.get("uuid", "")), "udp": True,
         "tls": bool(node.get("tls", False)),
     }
@@ -283,8 +297,8 @@ def _proxy_vless(node: dict, settings: dict) -> dict:
 def _proxy_vmess(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "vmess",
-        "server": node["server"], "port": int(node["port"]),
-        "uuid": str(node.get("uuid", "")), "alterId": int(node.get("alter_id", 0)),
+        "server": node["server"], "port": _port(node),
+        "uuid": str(node.get("uuid", "")), "alterId": _safe_int(node.get("alter_id"), 0),
         "cipher": node.get("cipher") or "auto", "udp": True,
         "tls": bool(node.get("tls", False)),
     }
@@ -301,7 +315,7 @@ def _proxy_vmess(node: dict, settings: dict) -> dict:
 def _proxy_trojan(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "trojan",
-        "server": node["server"], "port": int(node["port"]),
+        "server": node["server"], "port": _port(node),
         "password": str(node.get("password", "")), "udp": True,
         "sni": node.get("sni") or node["server"],
         "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
@@ -317,7 +331,7 @@ def _proxy_trojan(node: dict, settings: dict) -> dict:
 def _proxy_ss(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "ss",
-        "server": node["server"], "port": int(node["port"]),
+        "server": node["server"], "port": _port(node),
         "cipher": node.get("cipher") or "aes-256-gcm",
         "password": str(node.get("password", "")), "udp": True,
     }
@@ -331,7 +345,7 @@ def _proxy_ss(node: dict, settings: dict) -> dict:
 def _proxy_tuic(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "tuic",
-        "server": node["server"], "port": int(node["port"]),
+        "server": node["server"], "port": _port(node),
         "uuid": str(node.get("uuid", "")), "password": str(node.get("password", "")),
         "sni": node.get("sni") or node["server"],
         "alpn": node.get("alpn") or ["h3"],
@@ -406,12 +420,17 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
     # 否则 fake-ip 下自定义的域名型 DoH nameserver 可能无法自举解析、mihomo 起不来。
     bootstrap = [ip for ip in china_dns if _is_ip_or_cidr(ip) is not None] \
         or ["223.5.5.5", "119.29.29.29"]
+    # fake-ip 网段必须是合法 CIDR：用户在面板清空或填非法值时回落默认，
+    # 否则空值被持久化后，每次 apply（含订阅定时器）都会卡在 mihomo -t 校验失败。
+    fake_ip = str(s.get("fake_ip_range") or "").strip()
+    if _is_ip_or_cidr(fake_ip) is None:
+        fake_ip = DEFAULT_SETTINGS["fake_ip_range"]
     cfg["dns"] = {
         "enable": True,
         # 仅在开放局域网（allow-lan/网关模式）时监听 0.0.0.0，否则收敛到回环，减少暴露面
         "listen": ("0.0.0.0:1053" if lan_open else "127.0.0.1:1053"),
         "enhanced-mode": "fake-ip",
-        "fake-ip-range": s["fake_ip_range"],
+        "fake-ip-range": fake_ip,
         "fake-ip-filter": ["*.lan", "*.local", "+.pool.ntp.org", "time.*.com"],
         "default-nameserver": bootstrap,
         "nameserver": nameservers,
@@ -426,9 +445,18 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         "auto-detect-interface": True,
     }
 
-    # proxies
+    # proxies —— 单个坏节点（字段类型异常等）跳过而非拖垮整份配置；
+    # 全部失败时按“零节点”处理（兜底 DIRECT），与下方规则/final 逻辑保持一致
+    built_proxies, kept_nodes = [], []
+    for n in nodes:
+        try:
+            built_proxies.append(node_to_proxy(n, s))
+            kept_nodes.append(n)
+        except Exception:
+            continue
+    nodes = kept_nodes
     if nodes:
-        cfg["proxies"] = [node_to_proxy(n, s) for n in nodes]
+        cfg["proxies"] = built_proxies
         names = [n["name"] for n in nodes]  # 已按“当前节点优先”排序
         # 当前选中的节点放在选择器最前 -> 重启后默认就是它；AUTO 仅作为可选项跟在后面
         select_list = names + (["AUTO"] if len(names) > 1 else []) + ["DIRECT"]
@@ -454,14 +482,15 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
     rule_lines = [f"IP-CIDR,{c},DIRECT,no-resolve" for c in _SAFE_DIRECT_CIDRS]
     if nodes:
         for r in (rules or []):
-            if not r.get("value", "").strip():
+            rv = r.get("value")
+            if rv is None or not str(rv).strip():
                 continue
             try:
                 rule_lines.append(rule_to_mihomo(r))
             except Exception:
                 continue
         rule_lines.extend(expand_presets(s.get("presets", [])))
-    final = s.get("final", "PROXY").upper()
+    final = str(s.get("final", "PROXY")).upper()
     if final not in ("PROXY", "DIRECT"):
         final = "PROXY"
     if not nodes:

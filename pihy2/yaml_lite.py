@@ -246,13 +246,31 @@ class _Reader:
             self._consume_value(d, key, val, indent)
         return d
 
+    def _child_block_indent(self, col: int):
+        """key 行已被消费、self.i 指向下一行时，判断该行是否是本 key 的块状值。
+
+        返回应下钻的缩进列，或 None（无子块，值为 null）。子块有两种合法形态：
+          1) 更深缩进的子映射/子序列（indent > col）；
+          2) 与 key **同列**的块状序列——`- ` 标记本身提供缩进，YAML 允许
+             `proxies:\\n- a\\n- b` 这种零缩进列表（PyYAML 默认导出 / 多数订阅商格式）。
+        """
+        if self.i >= len(self.lines):
+            return None
+        nind, ntext = self.lines[self.i]
+        if nind > col:
+            return nind
+        if nind == col and (ntext.startswith("- ") or ntext == "-"):
+            return nind
+        return None
+
     def _consume_value(self, container: dict, key: str, val: str | None, col: int):
         """把 `key: val` 的值（含 None/块/块标量/锚点/别名）写入 container[key]。
         调用时 self.i 指向 key 所在行；返回时 self.i 指向下一条待处理行。"""
         if val is None or val == "":
             self.i += 1
-            if self.i < len(self.lines) and self.lines[self.i][0] > col:
-                self._assign(container, key, self._block(self.lines[self.i][0]))
+            cind = self._child_block_indent(col)
+            if cind is not None:
+                self._assign(container, key, self._block(cind))
             else:
                 self._assign(container, key, None)
         elif _BLOCK_SCALAR_RE.match(val):
@@ -262,10 +280,8 @@ class _Reader:
             # 块级锚点：&name 后接缩进子块
             name = val[1:]
             self.i += 1
-            if self.i < len(self.lines) and self.lines[self.i][0] > col:
-                block = self._block(self.lines[self.i][0])
-            else:
-                block = None
+            cind = self._child_block_indent(col)
+            block = self._block(cind) if cind is not None else None
             self.anchors[name] = block
             self._assign(container, key, block)
         else:
