@@ -168,7 +168,8 @@ def _parse_hysteria2(link: str) -> dict:
         "skip_cert_verify": _truthy(_first(qs, "insecure", "allowInsecure", default="0")),
         "alpn": _alpn(_first(qs, "alpn")) or ["h3"],
         "obfs": obfs,
-        "obfs_password": _first(qs, "obfs-password", "obfs_password", "obfsParam"),
+        # 与主密码同样走 _raw_query（unquote 而非 unquote_plus），避免混淆密码里的 '+' 被吃成空格
+        "obfs_password": _raw_query(sr.query, "obfs-password", "obfs_password", "obfsParam"),
         "up": _first(qs, "up", "upmbps").strip(),
         "down": _first(qs, "down", "downmbps").strip(),
         "ports": _first(qs, "mport", "ports").strip(),

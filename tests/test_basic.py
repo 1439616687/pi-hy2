@@ -5,7 +5,9 @@
     MIHOMO=/tmp/mihomo python3 tests/test_basic.py   # 指定 mihomo 二进制做真实语法校验
 """
 
+import glob
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -267,6 +269,9 @@ except yaml_lite.YamlError:
     check("深嵌套归一为 YamlError", True)
 except RecursionError:
     check("深嵌套 RecursionError 泄漏", False)
+# 顶层即流式映射/序列的文档被正确解析（而非把 '{' 当成 key 的一部分）
+check("顶层流式映射文档", yaml_lite.load("{a: 1, b: 2}") == {"a": 1, "b": 2}, str(yaml_lite.load("{a: 1, b: 2}")))
+check("顶层流式序列文档", yaml_lite.load("[1, 2, 3]") == [1, 2, 3], str(yaml_lite.load("[1, 2, 3]")))
 
 
 print("== 回归：parser 健壮性 ==")
@@ -290,6 +295,9 @@ check("vmess alpn round-trip 不丢", _vmrt.get("alpn") == ["h2", "h3"], str(_vm
 _pwn, _ = parser.parse_many("proxies:\n  - {name: z, type: ss, server: s.com, port: 8388, cipher: aes-256-gcm, password: 12345}\n")
 check("YAML 纯数字 password 转字符串", _pwn and isinstance(_pwn[0]["password"], str))
 parser.node_to_link(_pwn[0]); check("数字 password 导出不崩", True)
+# obfs-password 里的 '+' 不被 parse_qs 吃成空格（与主密码一致走 _raw_query）
+_obfsp = parser.parse_link("hysteria2://pw@h.com:443?obfs=salamander&obfs-password=a%2Bb#x")
+check("obfs-password 的 + 不丢", _obfsp["obfs_password"] == "a+b", repr(_obfsp["obfs_password"]))
 
 
 print("== 回归：config_gen ==")
@@ -308,6 +316,19 @@ check("DNS 非网关绑回环", "127.0.0.1:1053" in _dns_off)
 check("DNS 网关绑 0.0.0.0", "0.0.0.0:1053" in _dns_on)
 check("含 default-nameserver 引导", "default-nameserver" in _dns_off)
 check("方括号 IPv6 规则判别为 IP-CIDR", config_gen.classify_rule("[2001:db8::1]", "auto")[0] == "IP-CIDR")
+# 清空 DNS 列表回落默认，避免 nameserver: []
+_dns_empty = config_gen.build_config(
+    [{"name": "a", "type": "hysteria2", "server": "h", "port": 443, "password": "p"}], [],
+    dict(config_gen.DEFAULT_SETTINGS, secret="x", dns_nameservers=[], dns_china=[]))
+check("空 DNS 回落默认", len(_dns_empty["dns"]["nameserver"]) > 0
+      and len(_dns_empty["dns"]["proxy-server-nameserver"]) > 0)
+# 带宽留空（拼成 ' Mbps'）回落为含数字的合法值
+import re as _re
+_bw = config_gen.node_to_proxy(
+    {"name": "a", "type": "hysteria2", "server": "h", "port": 443, "password": "p"},
+    dict(config_gen.DEFAULT_SETTINGS, default_up=" Mbps", default_down=""))
+check("空带宽回落合法值", bool(_re.search(r"\d", _bw["up"])) and bool(_re.search(r"\d", _bw["down"])),
+      str((_bw["up"], _bw["down"])))
 
 
 print("== 回归：store ==")
@@ -345,6 +366,49 @@ try:
     _mgr.fetch_text("ftp://x/y"); check("fetch 拒绝非 http(s)", False)
 except ValueError:
     check("fetch 拒绝非 http(s)", True)
+
+
+print("== 回归：manager 网关/下载安全 ==")
+# #7 下载镜像主机做 SSRF 校验：内网拒绝、公网放行（用字面量 IP，离线可测）
+try:
+    _mgr._apply_mirror("https://github.com/x", "https://127.0.0.1/"); check("镜像指向内网被拒", False)
+except ValueError:
+    check("镜像指向内网被拒", True)
+check("镜像公网主机放行", _mgr._apply_mirror("u", "https://1.1.1.1/") == "https://1.1.1.1/u")
+
+# #2 test_config 用完即删临时目录（生产里 mihomo 已装才会走到 mkdtemp）
+_save_bin = _mgr.MIHOMO_BIN
+_mgr.MIHOMO_BIN = "/bin/true"           # 让存在性检查通过；-t 输出不含 success 不影响清理验证
+try:
+    _pat = os.path.join(tempfile.gettempdir(), "pihy2-*")
+    _before = set(glob.glob(_pat))
+    for _ in range(3):
+        _mgr.test_config("dummy: 1\n")
+    _leak = set(glob.glob(_pat)) - _before
+    check("test_config 不泄漏临时目录", len(_leak) == 0, str(_leak))
+    for _d in _leak:
+        shutil.rmtree(_d, ignore_errors=True)
+finally:
+    _mgr.MIHOMO_BIN = _save_bin
+
+# #1 关闭网关不强制改写全局 ip_forward（否则每次 apply 会踩 Docker 等其它转发用户）
+_calls = []
+_save_run, _save_sx = _mgr.run, _mgr.SYSCTL_FILE
+_sx_dir = tempfile.mkdtemp(prefix="pihy2-sx-")
+_mgr.run = lambda cmd, *a, **k: (_calls.append([str(x) for x in cmd]),
+                                 subprocess.CompletedProcess(cmd, 0, "", ""))[1]
+_mgr.SYSCTL_FILE = os.path.join(_sx_dir, "99-pihy2.conf")
+try:
+    _mgr.set_ip_forward(False, log=lambda *_: None)
+    check("关闭网关不执行 sysctl ip_forward",
+          not any("ip_forward" in " ".join(c) for c in _calls), str(_calls))
+    _calls.clear()
+    _mgr.set_ip_forward(True, log=lambda *_: None)
+    check("开启网关设 ip_forward=1",
+          any("net.ipv4.ip_forward=1" in " ".join(c) for c in _calls), str(_calls))
+finally:
+    _mgr.run, _mgr.SYSCTL_FILE = _save_run, _save_sx
+    shutil.rmtree(_sx_dir, ignore_errors=True)
 
 
 print("== 回归：CLI 参数绑定 ==")

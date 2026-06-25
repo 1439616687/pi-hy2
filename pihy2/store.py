@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import time
 
 try:
     import fcntl                       # Linux（树莓派）才有；缺失时锁退化为无操作
@@ -231,7 +232,6 @@ class Store:
             self.data["active"] = (match or (added[0] if added else {})).get("id", self.data.get("active", ""))
         if self.data.get("active") and not self.get_node(self.data["active"]):
             self.data["active"] = self.data["nodes"][0]["id"] if self.data["nodes"] else ""
-        import time
         sub["updated"] = time.strftime("%Y-%m-%d %H:%M")
         sub["count"] = len(added)
         return len(added)
