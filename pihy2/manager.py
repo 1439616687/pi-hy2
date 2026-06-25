@@ -22,6 +22,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -32,6 +33,10 @@ MIHOMO_CONFIG = os.path.join(MIHOMO_DIR, "config.yaml")
 MIHOMO_SERVICE = "/etc/systemd/system/mihomo.service"
 WEBUI_SERVICE = "/etc/systemd/system/pihy2-web.service"
 INSTALL_DIR = "/opt/pihy2"
+
+# 串行化 apply：渲染->写盘->重启 是对共享 OS 资源（config.yaml / mihomo 服务 / 转发）的非原子操作，
+# 多线程（面板多请求）并发 apply 会互相打架。进程内一把锁覆盖 WebUI 的并发；CLI 各为独立短进程，竞争极小。
+_APPLY_LOCK = threading.Lock()
 
 # 在线获取失败时退回到这个已知可用版本（与 README 验证一致）
 PINNED_VERSION = "v1.19.27"
@@ -131,15 +136,15 @@ def _download_to_file(url: str, dest: str, timeout: int = 600, _max_redirects: i
         if not host:
             raise ValueError("下载地址缺少主机名")
         port = parts.port or (443 if scheme == "https" else 80)
-        _fam, ip = _resolve_public(host)
+        ips = _resolve_public(host)
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
         if scheme == "https":
-            conn = _PinnedHTTPSConnection(host, ip, port=port, timeout=timeout,
+            conn = _PinnedHTTPSConnection(host, ips, port=port, timeout=timeout,
                                           context=ssl.create_default_context())
         else:
-            conn = _PinnedHTTPConnection(host, ip, port=port, timeout=timeout)
+            conn = _PinnedHTTPConnection(host, ips, port=port, timeout=timeout)
         try:
             conn.request("GET", path, headers={"User-Agent": "pihy2/1.0", "Host": host})
             resp = conn.getresponse()
@@ -451,36 +456,41 @@ def wait_active(name: str, timeout: float = 6.0) -> bool:
 
 
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
-    """渲染 -> 校验 -> 落盘 -> （动系统转发）-> 重启并确认 mihomo 真起来了。
-    校验失败则不落盘、也不改系统转发。与现有配置完全一致时跳过落盘与重启。"""
-    text = store.render_config()
-    current = ""
-    if os.path.exists(MIHOMO_CONFIG):
-        try:
-            with open(MIHOMO_CONFIG, "r", encoding="utf-8") as f:
-                current = f.read()
-        except OSError:
-            pass
-    gw = bool(store.data["settings"].get("gateway_mode"))
-    warn = dns_conflict_warning()
-    if warn:
-        log("⚠️  " + warn)
-    if text == current:
-        set_ip_forward(gw, log)          # 无配置变化也把网关内核参数对齐到期望（幂等），但不重启
-        return True, "配置无变化，未重启"
-    ok, out = test_config(text)
-    if not ok:
-        # 校验失败：不写配置、也不动系统转发，保持原状——避免开了转发却没应用网关配置导致流量裸奔
-        return False, f"配置校验失败，已保留原配置：\n{out}"
-    write_config(text)
-    set_ip_forward(gw, log)              # 仅在配置确实通过校验并落盘后，才提交系统级转发等副作用
-    if restart and os.path.exists(MIHOMO_SERVICE):
-        r = service_action("mihomo", "restart", log)
-        if r.returncode != 0 or not wait_active("mihomo"):
-            # -t 不绑定端口，真启动才会暴露端口占用（9090/7890/1053）等问题；如实回报失败 + 日志
+    """渲染 -> 校验 -> 落盘 -> 重启并确认 mihomo 真起来了 -> 仅在确认运行后才动系统转发。
+    校验失败则不落盘、也不改系统转发。与现有配置完全一致时跳过落盘与重启。
+    多线程/多进程并发 apply 用 _APPLY_LOCK 串行化，避免两次 render/写盘/重启互相打架。"""
+    with _APPLY_LOCK:
+        text = store.render_config()
+        current = ""
+        if os.path.exists(MIHOMO_CONFIG):
+            try:
+                with open(MIHOMO_CONFIG, "r", encoding="utf-8") as f:
+                    current = f.read()
+            except OSError:
+                pass
+        gw = bool(store.data["settings"].get("gateway_mode"))
+        warn = dns_conflict_warning(store.data["settings"])
+        if warn:
+            log("⚠️  " + warn)
+        if text == current:
+            set_ip_forward(gw, log)          # 无配置变化也把网关内核参数对齐到期望（幂等），但不重启
+            return True, "配置无变化，未重启"
+        ok, out = test_config(text)
+        if not ok:
+            # 校验失败：不写配置、也不动系统转发，保持原状——避免开了转发却没应用网关配置导致流量裸奔
+            return False, f"配置校验失败，已保留原配置：\n{out}"
+        write_config(text)
+        started = True
+        if restart and os.path.exists(MIHOMO_SERVICE):
+            r = service_action("mihomo", "restart", log)
+            # -t 不绑定端口，真启动才会暴露端口占用（9090/7890/1053）等问题
+            started = r.returncode == 0 and wait_active("mihomo")
+        if not started:
+            # mihomo 没真正起来：不要开 IP 转发，否则网关模式下流量会经一个死代理裸奔/黑洞
             return False, ("配置已写入，但 mihomo 未能启动（常见原因：控制器/代理/DNS 端口被占用，"
                            "如 9090/7890/1053）。最近日志：\n" + journal("mihomo", 12))
-    return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
+        set_ip_forward(gw, log)              # 仅在 mihomo 确认运行后，才提交系统级转发等副作用
+        return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
 
 
 # ---------------------------------------------------------------- 订阅
@@ -504,40 +514,53 @@ def _validate_ip(ipstr: str) -> str:
     return str(ip)
 
 
-def _resolve_public(host: str) -> tuple[int, str]:
-    """解析域名并校验所有返回地址；返回钉死用的 (family, ip)。任一内网地址即整体拒绝。"""
+def _resolve_public(host: str) -> list[str]:
+    """解析域名并校验所有返回地址；返回钉死用的 IP 列表（IPv4 优先，去重保序）。
+    任一内网地址即整体拒绝（保留反 DNS-rebinding 防御）。返回多地址是为了在首选地址不可达
+    （如本机有 IPv6 地址但无 IPv6 路由）时能回退，避免下载/订阅抓取卡死在唯一被钉死的死 IP 上。"""
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
         raise ValueError("无法解析订阅域名")
-    chosen = None
+    v4, v6 = [], []
     for fam, _, _, _, sa in infos:
-        ok = _validate_ip(sa[0])
-        if chosen is None:
-            chosen = (fam, ok)
-    if chosen is None:
+        ok = _validate_ip(sa[0])              # 任一地址内网即在此抛错、整体拒绝
+        (v4 if fam == socket.AF_INET else v6).append(ok)
+    ips = list(dict.fromkeys(v4 + v6))
+    if not ips:
         raise ValueError("订阅域名无解析结果")
-    return chosen
+    return ips
+
+
+def _create_pinned_sock(ips, port, timeout):
+    """按序尝试已校验的多个 IP，返回首个连上的 socket；全失败则抛最后一个错误。"""
+    last = None
+    for ip in ips:
+        try:
+            return socket.create_connection((ip, port), timeout)
+        except OSError as e:
+            last = e
+    raise last or OSError("无可用地址")
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """连接到已校验并钉死的 IP，杜绝 getaddrinfo 二次解析（DNS rebinding/TOCTOU）。"""
+    """连接到已校验并钉死的 IP（列表，按序回退），杜绝 getaddrinfo 二次解析（DNS rebinding/TOCTOU）。"""
 
-    def __init__(self, host, ip, **kw):
+    def __init__(self, host, ips, **kw):
         super().__init__(host, **kw)
-        self._ip = ip
+        self._ips = ips if isinstance(ips, list) else [ips]
 
     def connect(self):
-        self.sock = socket.create_connection((self._ip, self.port), self.timeout)
+        self.sock = _create_pinned_sock(self._ips, self.port, self.timeout)
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, ip, **kw):
+    def __init__(self, host, ips, **kw):
         super().__init__(host, **kw)
-        self._ip = ip
+        self._ips = ips if isinstance(ips, list) else [ips]
 
     def connect(self):
-        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        sock = _create_pinned_sock(self._ips, self.port, self.timeout)
         # SNI/证书校验仍用真实域名 host，连接目标却是钉死的已校验 IP
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
@@ -570,15 +593,15 @@ def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024,
         if not host:
             raise ValueError("订阅地址缺少主机名")
         port = parts.port or (443 if scheme == "https" else 80)
-        _fam, ip = _resolve_public(host)
+        ips = _resolve_public(host)
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
         if scheme == "https":
-            conn = _PinnedHTTPSConnection(host, ip, port=port, timeout=timeout,
+            conn = _PinnedHTTPSConnection(host, ips, port=port, timeout=timeout,
                                           context=ssl.create_default_context())
         else:
-            conn = _PinnedHTTPConnection(host, ip, port=port, timeout=timeout)
+            conn = _PinnedHTTPConnection(host, ips, port=port, timeout=timeout)
         try:
             conn.request("GET", path, headers={"User-Agent": "pihy2/1.0", "Host": host})
             resp = conn.getresponse()
@@ -664,9 +687,16 @@ WantedBy=timers.target
 
 
 # ---------------------------------------------------------------- 状态/排错
-def dns_conflict_warning() -> str:
-    """检测本机是否已运行占用 :53 的 DNS 服务（systemd-resolved/dnsmasq/Pi-hole）。
-    有则返回一句中文告警（TUN 的 dns-hijack any:53 会劫持它们的查询），否则返回 ''。"""
+def dns_conflict_warning(settings: dict | None = None) -> str:
+    """若 TUN 仍以 any:53 宽泛劫持 DNS，且本机已运行占用 :53 的服务（systemd-resolved/
+    dnsmasq/Pi-hole），返回一句中文告警；否则返回 ''。
+
+    若用户已把 tun_dns_hijack 改成仅 TUN 接口或清空（不再宽泛抢 :53），则不再误报。"""
+    hijack = (settings or {}).get("tun_dns_hijack", ["any:53"])
+    if not isinstance(hijack, list):
+        hijack = ["any:53"]
+    if not any(str(h).strip().lower() == "any:53" for h in hijack):
+        return ""                                  # 未宽泛劫持 :53，不会与本机 DNS 服务冲突
     for svc, label in (("systemd-resolved", "systemd-resolved"),
                        ("dnsmasq", "dnsmasq"),
                        ("pihole-FTL", "Pi-hole")):

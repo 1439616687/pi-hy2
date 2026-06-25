@@ -289,14 +289,22 @@ function editNode(id) {
     </div>`;
   el('modal').classList.remove('hidden');
 }
+const SUPPORTED_NET = ['', 'tcp', 'ws', 'grpc', 'httpupgrade'];
 async function saveNode(id) {
   const patch = {};
-  el('modal-card').querySelectorAll('input[data-k]').forEach(i => {
+  const inputs = [...el('modal-card').querySelectorAll('input[data-k]')];
+  // 传输类型只支持这些；h2/http/quic 写进去会被静默当 tcp 连而失败，提前拦下并提示
+  const netI = inputs.find(i => i.dataset.k === 'network');
+  if (netI && !SUPPORTED_NET.includes(netI.value.trim().toLowerCase())) {
+    toast('传输只支持 tcp/ws/grpc/httpupgrade', 'err'); return;
+  }
+  inputs.forEach(i => {
     const k = i.dataset.k;
     const v = i.value;
     if (k === 'port' || k === 'alter_id') { patch[k] = parseInt(v) || (k === 'port' ? 443 : 0); return; }
-    if (k === 'alpn') { const arr = v.split(',').map(x => x.trim()).filter(Boolean); if (arr.length) patch.alpn = arr; return; }
-    if (v !== '') patch[k] = v;     // 空串不回写，避免把没填的字段污染成 ""（保留原值/类型）
+    if (k === 'alpn') { patch.alpn = v.split(',').map(x => x.trim()).filter(Boolean); return; }
+    // 表单内渲染的字段一律回写（含空串），让用户能清空某字段；服务端各 builder 对空值有兜底
+    patch[k] = v;
   });
   patch.skip_cert_verify = el('ed-skip').checked;
   if (el('ed-tls')) patch.tls = el('ed-tls').checked;
@@ -344,7 +352,8 @@ function isIPv6(v) {
   const parts = v.split('/'); if (parts.length > 2) return false;
   if (parts[1] !== undefined && !(/^\d+$/.test(parts[1]) && +parts[1] <= 128)) return false;
   const h = parts[0];
-  if (!h.includes(':') || !/^[0-9a-fA-F:]+$/.test(h)) return false;
+  // 允许 '.'：覆盖 IPv4-mapped/嵌入式 IPv6（如 ::ffff:1.2.3.4），与服务端 ipaddress 一致
+  if (!h.includes(':') || !/^[0-9a-fA-F:.]+$/.test(h)) return false;
   if (h.split('::').length > 2) return false;
   const groups = h.split(':').filter(x => x !== '');
   return h.includes('::') ? groups.length <= 7 : (h.split(':').length === 8 && groups.length === 8);

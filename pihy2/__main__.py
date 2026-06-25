@@ -95,43 +95,60 @@ def cmd_sub(args):
         for s in subs:
             print(f"  {s['id']}  {s['name']}  节点{s['count']}  更新于 {s['updated'] or '从未'}\n      {s['url']}")
         return
-    # 改动类操作与 WebUI/其它进程互斥，避免并发读改写丢更新
-    with state_lock():
-        store = Store()
-        _cmd_sub_mutate(args, store, action)
+    # 与 webui 一致：网络抓取/apply 等慢 IO 放锁外，state_lock 只罩内存读改写+存盘，
+    # 避免订阅定时器在锁内做长时间抓取而阻塞面板（跨进程 fcntl 锁）。
+    _cmd_sub_mutate(args, action)
 
 
-def _cmd_sub_mutate(args, store, action):
+def _apply_outside_lock():
+    print(manager.apply_config(Store())[1])
+
+
+def _cmd_sub_mutate(args, action):
     if action == "add":
-        sub = store.add_subscription(args.name or "订阅", args.url)
-        cnt, errs = manager.refresh_subscription(store, sub["id"])
-        store.save()
+        nodes, errs = manager.fetch_sub_nodes(args.url) if args.url else ([], ["缺少订阅 URL"])
+        with state_lock():
+            store = Store()
+            sub = store.add_subscription(args.name or "订阅", args.url)
+            cnt = store.set_subscription_nodes(sub["id"], nodes) if nodes else 0
+            store.save()
         for e in errs[:3]:
             print("  " + e)
         print(f"已添加订阅 {sub['id']}（{cnt} 个节点）")
         if args.apply:
-            print(manager.apply_config(store)[1])
+            _apply_outside_lock()
         return
     if action == "update":
         target = args.id or "all"
+        subs = Store().data.get("subscriptions", [])     # 锁外读快照
+        targets = subs if target == "all" else [s for s in subs if s["id"] == target]
+        total = 0
+        for s in targets:
+            nodes, errs = manager.fetch_sub_nodes(s["url"])   # 锁外抓取
+            if not nodes:
+                for e in errs[:2]:
+                    print("  " + e)
+                continue
+            with state_lock():                            # 锁内仅写回
+                store = Store()
+                if store.get_subscription(s["id"]):
+                    total += store.set_subscription_nodes(s["id"], nodes)
+                    store.save()
         if target == "all":
-            res = manager.refresh_all_subscriptions(store)
-            print(f"已更新 {len(res)} 个订阅，共 {sum(res.values())} 个节点")
+            print(f"已更新 {len(targets)} 个订阅，共 {total} 个节点")
         else:
-            cnt, errs = manager.refresh_subscription(store, target)
-            for e in errs[:3]:
-                print("  " + e)
-            print(f"已更新 {cnt} 个节点")
-        store.save()
+            print(f"已更新 {total} 个节点" if targets else "订阅不存在")
         if args.apply:
-            print(manager.apply_config(store)[1])
+            _apply_outside_lock()
         return
     if action == "del":
-        ok = store.delete_subscription(args.id, remove_nodes=not args.keep_nodes)
-        store.save()
+        with state_lock():
+            store = Store()
+            ok = store.delete_subscription(args.id, remove_nodes=not args.keep_nodes)
+            store.save()
         print("已删除" if ok else "订阅不存在")
         if ok and args.apply:
-            print(manager.apply_config(store)[1])
+            _apply_outside_lock()
 
 
 def cmd_version(args):

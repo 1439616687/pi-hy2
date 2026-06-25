@@ -483,6 +483,10 @@ def proxy_to_node(p: dict) -> dict:
         node["reality_sid"] = ro.get("short-id", "")
         node["tls"] = True
     net = str(p.get("network", "")).lower()
+    # 与分享链接解析（_net_fields）对称：h2/http/quic 需专门 opts，本项目不下发，
+    # 静默按 tcp 连必然失败，故在 YAML 导入时也明确报错、跳过该节点而非生成坏配置。
+    if net in ("h2", "http", "quic", "xhttp"):
+        raise ParseError(f"暂不支持 {net} 传输（仅支持 tcp/ws/grpc/httpupgrade）")
     if net in ("ws", "grpc", "httpupgrade"):
         node["network"] = net
         ws = p.get("ws-opts")
@@ -499,6 +503,10 @@ def proxy_to_node(p: dict) -> dict:
         node["plugin_opts"] = dict(po)
     if t in ("vless", "vmess", "tuic") and not node.get("uuid"):
         raise ParseError(f"{t} 缺少 UUID")
+    # 'fingerprint'（证书 hex SHA-256）只有 hysteria2 builder 会下发；其它协议 config_gen
+    # 不消费它（用 client-fingerprint），留着会误导用户以为生效，故仅 hysteria2 保留。
+    if t != "hysteria2":
+        node.pop("fingerprint", None)
     # YAML 里未加引号的纯数字 password/uuid/short-id 会被解析成 int，统一转回字符串，
     # 避免前导零丢失式的语义损坏与下游 quote()/拼接的 TypeError。
     for f in ("password", "uuid", "obfs_password", "reality_sid", "sni", "cipher"):
@@ -575,7 +583,7 @@ def node_to_link(node: dict) -> str:
             params["encryption"] = "none"
             params["security"] = "reality" if node.get("reality_pbk") else ("tls" if node.get("tls") else "none")
             params["type"] = net
-            if node.get("flow"):
+            if node.get("flow") and net in ("tcp", ""):   # flow 仅 TCP/REALITY 有效，导出时同样别带到 ws/grpc
                 params["flow"] = node["flow"]
             if node.get("reality_pbk"):
                 params["pbk"] = node["reality_pbk"]
