@@ -500,6 +500,10 @@ def proxy_to_node(p: dict) -> dict:
     for f in ("password", "uuid", "obfs_password", "reality_sid", "sni", "cipher"):
         if f in node and not isinstance(node[f], str):
             node[f] = str(node[f])
+    # 数值字段统一规整为 int：YAML 里 alterId 可能是字符串/脏值，下游 config_gen 会 int()，
+    # 在此先归一，避免类型不一致与脏值（与 port 经 _int 归一保持一致）。
+    if "alter_id" in node:
+        node["alter_id"] = _int(node["alter_id"], 0)
     return node
 
 

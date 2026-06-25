@@ -425,6 +425,78 @@ except SystemExit:
     check("sub 缺子命令报错", True)
 
 
+print("== 回归：审查二轮修复（C1 / H1 / H2 / M1 / M2 / M3）==")
+# C1：零缩进块状序列（PyYAML 默认导出 / 多数订阅商格式）能解析，不再整体丢节点
+_zi = ("proxies:\n- name: HK\n  type: ss\n  server: 1.1.1.1\n  port: 8388\n"
+       "  cipher: aes-256-gcm\n  password: pass\n")
+_zin, _zie = parser.parse_many(_zi)
+check("C1 零缩进块状序列解析出节点", len(_zin) == 1 and _zin[0]["server"] == "1.1.1.1", str(_zie))
+# C1：零缩进 + 嵌套 ws-opts + 第二个列表项不被吞
+_zi2 = ("proxies:\n- name: A\n  type: vmess\n  server: a.com\n  port: 443\n  uuid: " + _uuid + "\n"
+        "  network: ws\n  ws-opts:\n    path: /a\n- name: B\n  type: ss\n  server: b.com\n"
+        "  port: 8388\n  cipher: aes-256-gcm\n  password: p\n")
+_zin2, _ = parser.parse_many(_zi2)
+check("C1 零缩进嵌套+第二项保留",
+      len(_zin2) == 2 and _zin2[0].get("ws_path") == "/a" and _zin2[1]["server"] == "b.com",
+      str([n.get("name") for n in _zin2]))
+# C1：零缩进序列后的同列兄弟键不被吞
+_zid = yaml_lite.load("proxies:\n- name: X\n  type: ss\n  server: s\n  port: 1\n"
+                      "  cipher: aes-256-gcm\n  password: p\nrules: []\n")
+check("C1 零缩进序列后兄弟键保留", list(_zid.keys()) == ["proxies", "rules"] and len(_zid["proxies"]) == 1, str(list(_zid.keys())))
+check("C1 顶层即块状序列文档", yaml_lite.load("- a\n- b\n") == ["a", "b"])
+
+# H1：脏 port（非数字/空/None/float串/越界/0）不再让整份配置生成崩溃，回落合法端口
+for _bp in ("abc", "", None, "443.0", 70000, 0):
+    _c = config_gen.build_config(
+        [{"name": "n", "type": "hysteria2", "server": "h", "port": _bp, "password": "p"}], [], {"secret": "s"})
+    _pp = _c["proxies"][0]["port"]
+    check(f"H1 脏 port {_bp!r} 回落合法", isinstance(_pp, int) and 1 <= _pp <= 65535, str(_pp))
+check("H1 合法 port 仍保留", config_gen.build_config(
+    [{"name": "n", "type": "hysteria2", "server": "h", "port": "8443", "password": "p"}], [], {"secret": "s"}
+)["proxies"][0]["port"] == 8443)
+
+# H2：非字符串规则 value/policy/type 不再让渲染崩溃
+_ok_node = {"name": "n", "type": "hysteria2", "server": "h", "port": 443, "password": "p"}
+for _rv in (123, None, ["a"], {"x": 1}):
+    try:
+        config_gen.render([_ok_node], [{"value": _rv, "policy": "PROXY", "type": "auto"}], {"secret": "s"})
+        check(f"H2 非字符串规则值 {type(_rv).__name__} 不崩", True)
+    except Exception as _e:
+        check(f"H2 非字符串规则值 {type(_rv).__name__} 不崩", False, repr(_e))
+try:
+    config_gen.render([_ok_node], [{"value": "x.com", "policy": 1, "type": 2}], {"secret": "s"})
+    check("H2 非字符串 policy/type 不崩", True)
+except Exception as _e:
+    check("H2 非字符串 policy/type 不崩", False, repr(_e))
+
+# M1：proxy_to_node 把 alterId 规整为 int，脏 alterId 不再拖垮配置
+_amn, _ = parser.parse_many(
+    "proxies:\n  - {name: v, type: vmess, server: m.com, port: 443, uuid: " + _uuid + ", alterId: abc}\n")
+check("M1 alterId 脏值规整为 int=0", bool(_amn) and isinstance(_amn[0]["alter_id"], int) and _amn[0]["alter_id"] == 0,
+      str(_amn[0].get("alter_id") if _amn else None))
+config_gen.build_config(_amn, [], {"secret": "s"}); check("M1 alterId 脏值不拖垮配置", True)
+
+# M2：清空 / 非法 fake-ip 网段回落默认，避免持久化空值后每次 apply 校验失败
+for _fr in ("", "   ", "not-a-cidr", None):
+    _fc = config_gen.build_config([_ok_node], [], dict(config_gen.DEFAULT_SETTINGS, secret="s", fake_ip_range=_fr))
+    check(f"M2 fake-ip {_fr!r} 回落默认",
+          _fc["dns"]["fake-ip-range"] == config_gen.DEFAULT_SETTINGS["fake_ip_range"], _fc["dns"]["fake-ip-range"])
+check("M2 合法 fake-ip 保留", config_gen.build_config(
+    [_ok_node], [], dict(config_gen.DEFAULT_SETTINGS, secret="s", fake_ip_range="198.18.0.1/16")
+)["dns"]["fake-ip-range"] == "198.18.0.1/16")
+
+# M3：webui 监听端口/地址校验（纯函数，无需起服务）
+from pihy2 import webui as _webui  # noqa: E402
+check("M3 端口校验合法", _webui._valid_listen_port("8088") == 8088 and _webui._valid_listen_port(443) == 443)
+check("M3 端口校验越界/脏=None",
+      _webui._valid_listen_port("0") is None and _webui._valid_listen_port("99999") is None
+      and _webui._valid_listen_port("abc") is None and _webui._valid_listen_port(None) is None)
+check("M3 bind 校验合法",
+      _webui._valid_bind("0.0.0.0") == "0.0.0.0" and _webui._valid_bind("127.0.0.1") == "127.0.0.1"
+      and _webui._valid_bind("::1") == "::1" and _webui._valid_bind("localhost") == "localhost")
+check("M3 bind 校验非法=None", _webui._valid_bind("evil.com") is None and _webui._valid_bind("not an ip") is None)
+
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):
