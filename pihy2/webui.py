@@ -396,10 +396,14 @@ class Handler(BaseHTTPRequestHandler):
                 # external_controller 必须是回环地址，否则带密钥外发会造成 SSRF/密钥外泄
                 ec = settings.get("external_controller")
                 if ec is not None:
-                    host = urllib.parse.urlparse(
-                        ec if ec.startswith("http") else "http://" + ec).hostname or ""
-                    if host not in ("127.0.0.1", "::1", "localhost"):
-                        return self._err("外部控制器必须是本机回环地址（127.0.0.1）")
+                    if not str(ec).strip():
+                        # 清空=保持原值，不用空串覆盖（否则前端清空该框会整份设置都存不进去）
+                        settings.pop("external_controller", None)
+                    else:
+                        host = urllib.parse.urlparse(
+                            ec if ec.startswith("http") else "http://" + ec).hostname or ""
+                        if host not in ("127.0.0.1", "::1", "localhost"):
+                            return self._err("外部控制器必须是本机回环地址（127.0.0.1）")
                 # 下载镜像必须 https
                 mir = settings.get("github_mirror", "")
                 if mir and not mir.lower().startswith("https://"):

@@ -442,8 +442,8 @@ function renderSettings() {
 async function saveSettings() {
   const lines = v => v.split('\n').map(x => x.trim()).filter(Boolean);
   const settings = {
-    default_up: el('set-up').value + ' Mbps',
-    default_down: el('set-down').value + ' Mbps',
+    default_up: (parseInt(el('set-up').value) || 20) + ' Mbps',
+    default_down: (parseInt(el('set-down').value) || 100) + ' Mbps',
     mixed_port: parseInt(el('set-port').value) || 7890,
     tun_stack: el('set-stack').value,
     log_level: el('set-log').value,

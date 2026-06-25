@@ -100,11 +100,17 @@ def fallback_url(arch: str | None = None) -> tuple[str, str]:
 
 
 def _apply_mirror(url: str, mirror: str) -> str:
-    """套用下载镜像前缀；只允许 https 镜像，避免明文下载被替换二进制（会以 root 运行）。"""
+    """套用下载镜像前缀；只允许 https 镜像、且镜像主机不得指向内网/本机（防 SSRF），
+    避免明文下载被替换二进制（会以 root 运行）、或被借道探测/打内网服务。"""
     if not mirror:
         return url
     if not mirror.lower().startswith("https://"):
         raise ValueError("下载镜像必须是 https:// 开头")
+    mhost = urllib.parse.urlparse(mirror).hostname or ""
+    try:
+        _resolve_public(mhost)                 # 解析并校验所有返回地址，命中内网即拒绝
+    except ValueError:
+        raise ValueError("下载镜像主机不能指向内网/本机地址")
     return mirror.rstrip("/") + "/" + url
 
 
@@ -248,17 +254,22 @@ def test_config(text: str | None = None) -> tuple[bool, str]:
     """用 mihomo -t 校验配置。text 给定时写到临时目录校验，否则校验已落盘的配置。"""
     if not os.path.exists(MIHOMO_BIN):
         return False, "mihomo 尚未安装"
-    if text is not None:
-        import tempfile
-        d = tempfile.mkdtemp(prefix="pihy2-")
-        with open(os.path.join(d, "config.yaml"), "w", encoding="utf-8") as f:
-            f.write(text)
-        folder = d
-    else:
-        folder = MIHOMO_DIR
-    r = run([MIHOMO_BIN, "-d", folder, "-t"])
-    out = (r.stdout + r.stderr).strip()
-    return (r.returncode == 0 and "test is successful" in out), out
+    tmp = None
+    try:
+        if text is not None:
+            # 临时目录用完即删：否则每次 apply/订阅更新都会在 /tmp 堆积含密码与 clash 密钥的配置副本
+            tmp = tempfile.mkdtemp(prefix="pihy2-")
+            with open(os.path.join(tmp, "config.yaml"), "w", encoding="utf-8") as f:
+                f.write(text)
+            folder = tmp
+        else:
+            folder = MIHOMO_DIR
+        r = run([MIHOMO_BIN, "-d", folder, "-t"])
+        out = (r.stdout + r.stderr).strip()
+        return (r.returncode == 0 and "test is successful" in out), out
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- systemd
@@ -335,8 +346,10 @@ def set_ip_forward(on: bool, log=print) -> None:
     rp_filter=2(loose) 是透明网关常见的关键项：TUN 代理下进出路径不对称，
     严格 rp_filter 会丢回程包。
 
-    以运行期实际值为准：每次都用 sysctl -w 确保生效，文件仅用于持久化（仅在内容变化时写），
-    不再以「sysctl 文件是否存在」推断当前状态——那并不等于内核运行值，判断不可靠。"""
+    重要：ip_forward / rp_filter 是**全局**内核参数，Docker、K8s、其它 VPN、软路由
+    都依赖它们。因此 pihy2 只在开启网关时主动置位；关闭网关时**只撤销自己的持久化文件、
+    绝不把运行期值强制改回 0**——否则每次 apply（含订阅定时器自动 apply）都会把别人开启的
+    转发踩掉，断开容器/下游设备网络。关闭即"不再由 pihy2 持有"，运行期值留给系统/其它软件。"""
     desired = ("net.ipv4.ip_forward=1\n"
                "net.ipv4.conf.all.rp_filter=2\n"
                "net.ipv4.conf.default.rp_filter=2\n")
@@ -350,12 +363,12 @@ def set_ip_forward(on: bool, log=print) -> None:
                 with open(SYSCTL_FILE, "w") as f:
                     f.write(desired)
         elif os.path.exists(SYSCTL_FILE):
-            os.remove(SYSCTL_FILE)
+            os.remove(SYSCTL_FILE)             # 关闭网关：仅移除 pihy2 的持久化，不动运行期全局值
     except OSError as e:
         log(f"持久化网关内核参数失败：{e}")
-    # 运行期值每次都应用，保证与目标状态一致
-    run(["sysctl", "-w", f"net.ipv4.ip_forward={1 if on else 0}"])
+    # 仅在开启网关时主动应用运行期值；关闭时不调用 sysctl -w，避免踩 Docker 等其它转发用户
     if on:
+        run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
         run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
         run(["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"])
 

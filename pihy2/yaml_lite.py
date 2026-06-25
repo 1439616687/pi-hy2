@@ -191,6 +191,9 @@ class _Reader:
     def parse(self):
         if not self.lines:
             return None
+        # 整份文档即一个流式标量（{...} / [...]）时，按流式解析；否则按块状结构
+        if self.lines[0][1][:1] in "[{":
+            return _scalar(self.lines[0][1])
         return self._block(self.lines[0][0])
 
     def _block(self, indent: int):

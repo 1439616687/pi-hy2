@@ -210,6 +210,13 @@ def rule_to_mihomo(rule: dict) -> str:
 
 
 # ---------------------------------------------------------------- 节点 -> proxy
+def _bandwidth(value, default: str) -> str:
+    """规整带宽字符串：必须含数字，否则回落默认。
+    避免 UI 清空带宽框时拼出 ' Mbps' 这类无数字的非法值被原样下发给 mihomo。"""
+    s = str(value or "").strip()
+    return s if re.search(r"\d", s) else default
+
+
 def _apply_transport(p: dict, node: dict):
     """把 ws/grpc 等传输层字段写进 mihomo proxy。"""
     net = node.get("network")
@@ -232,8 +239,8 @@ def _proxy_hysteria2(node: dict, settings: dict) -> dict:
         "sni": node.get("sni") or node["server"],
         "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
         "alpn": node.get("alpn") or ["h3"],
-        "up": node.get("up") or settings.get("default_up", "20 Mbps"),
-        "down": node.get("down") or settings.get("default_down", "100 Mbps"),
+        "up": _bandwidth(node.get("up") or settings.get("default_up"), "20 Mbps"),
+        "down": _bandwidth(node.get("down") or settings.get("default_down"), "100 Mbps"),
     }
     if node.get("ports"):
         p["ports"] = str(node["ports"])
@@ -392,9 +399,12 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
             cfg["secret"] = s["secret"]
 
     lan_open = bool(s.get("allow_lan") or s.get("gateway_mode"))
+    # 用户在面板清空 DNS 列表时回落默认，避免生成 nameserver: [] 让 mihomo 运行期无上游、解析全失败
+    nameservers = list(s["dns_nameservers"]) or list(DEFAULT_SETTINGS["dns_nameservers"])
+    china_dns = list(s["dns_china"]) or list(DEFAULT_SETTINGS["dns_china"])
     # default-nameserver 必须是纯 IP（不能是 DoH 域名），用作解析上游域名/引导 DNS，
     # 否则 fake-ip 下自定义的域名型 DoH nameserver 可能无法自举解析、mihomo 起不来。
-    bootstrap = [ip for ip in s["dns_china"] if _is_ip_or_cidr(ip) is not None] \
+    bootstrap = [ip for ip in china_dns if _is_ip_or_cidr(ip) is not None] \
         or ["223.5.5.5", "119.29.29.29"]
     cfg["dns"] = {
         "enable": True,
@@ -404,8 +414,8 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         "fake-ip-range": s["fake_ip_range"],
         "fake-ip-filter": ["*.lan", "*.local", "+.pool.ntp.org", "time.*.com"],
         "default-nameserver": bootstrap,
-        "nameserver": list(s["dns_nameservers"]),
-        "proxy-server-nameserver": list(s["dns_china"]),
+        "nameserver": nameservers,
+        "proxy-server-nameserver": china_dns,
     }
     cfg["tun"] = {
         "enable": True,
