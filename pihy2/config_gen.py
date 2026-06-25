@@ -22,6 +22,8 @@ DEFAULT_SETTINGS = {
     "log_level": "warning",          # silent/error/warning/info/debug
     "ipv6": False,
     "tun_stack": "system",           # system/gvisor/mixed
+    "tun_dns_hijack": ["any:53"],    # TUN 劫持的 DNS 目标；与本机 Pi-hole/dnsmasq 冲突时可改/清空
+    "tun_auto_redirect": True,       # nftables 重定向；与 Docker/firewalld 冲突或无 nft 时可关
     "fake_ip_range": "198.18.0.1/16",
     "dns_nameservers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
     "dns_china": ["223.5.5.5", "119.29.29.29"],
@@ -59,7 +61,10 @@ _PRESET_ORDER = ["ads", "streaming", "google", "telegram", "apple_cn", "cn_direc
 
 def expand_presets(enabled) -> list[str]:
     """把启用的预设 key 展开成 mihomo 规则行（按既定优先级排序，去重）。"""
-    enabled = set(enabled or [])
+    # 容错：presets 若被存成字符串/整数等非列表类型（脏 state / API 误传），按空处理而非崩溃
+    if not isinstance(enabled, (list, tuple, set)):
+        enabled = []
+    enabled = set(enabled)
     out, seen = [], set()
     for key in _PRESET_ORDER:
         if key in enabled and key in RULE_PRESETS:
@@ -150,6 +155,10 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
     mb = re.match(r"^\[([0-9A-Fa-f:]+)\](/\d+)?$", value)
     if mb:
         value = mb.group(1) + (mb.group(2) or "")
+    # 去掉 IPv6 zone-id（如 fe80::1%eth0）：mihomo/Go 的 ParseCIDR 不接受 %zone，
+    # 否则会生成 mihomo -t 直接拒绝的 IP-CIDR 规则。
+    if "%" in value:
+        value = re.sub(r"%[^/]+", "", value)
 
     explicit = {
         "domain": "DOMAIN",
@@ -290,6 +299,7 @@ def _proxy_vless(node: dict, settings: dict) -> dict:
     if node.get("reality_pbk"):
         p["reality-opts"] = {"public-key": node["reality_pbk"],
                              "short-id": node.get("reality_sid", "")}
+        p["tls"] = True   # REALITY 必须 tls:true；编辑面板若未勾 TLS，否则 mihomo 会拒绝该配置
     _apply_transport(p, node)
     return p
 
@@ -374,6 +384,21 @@ _RESERVED_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE",
                    "GLOBAL", "PROXY", "AUTO"}
 
 
+def display_names(nodes: list[dict]) -> dict:
+    """返回 节点id -> mihomo 实际使用的（去重 / 规避保留词后的）名字 的映射。
+
+    build_config 对节点名做了 _dedup_names 改写（同名追加 #2、保留词加 ·），
+    使 config.yaml 里的 proxy 名与 state.json 里的原始 name 不一致。面板调用 clash API
+    做切换/测速时必须用这里的名字（且传入与渲染相同顺序的 nodes，通常是 nodes_active_first），
+    否则会按不存在的名字去操作而失败。
+    """
+    out: dict = {}
+    for n in _dedup_names([x for x in (nodes or []) if x.get("server")]):
+        if n.get("id"):
+            out[n["id"]] = n["name"]
+    return out
+
+
 def _dedup_names(nodes: list[dict]) -> list[dict]:
     """节点名去重（同名追加 #2、#3…），并规避 mihomo 保留名，不改原对象。"""
     seen: dict[str, int] = {}
@@ -413,9 +438,12 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
             cfg["secret"] = s["secret"]
 
     lan_open = bool(s.get("allow_lan") or s.get("gateway_mode"))
-    # 用户在面板清空 DNS 列表时回落默认，避免生成 nameserver: [] 让 mihomo 运行期无上游、解析全失败
-    nameservers = list(s["dns_nameservers"]) or list(DEFAULT_SETTINGS["dns_nameservers"])
-    china_dns = list(s["dns_china"]) or list(DEFAULT_SETTINGS["dns_china"])
+    # 用户清空 DNS 列表、或脏 state 把列表存成了字符串等非列表类型时回落默认，
+    # 避免生成 nameserver: [] / 把字符串 list() 成单字符列表，让 mihomo 解析全失败
+    ns_raw = s.get("dns_nameservers")
+    nameservers = list(ns_raw) if isinstance(ns_raw, list) and ns_raw else list(DEFAULT_SETTINGS["dns_nameservers"])
+    cn_raw = s.get("dns_china")
+    china_dns = list(cn_raw) if isinstance(cn_raw, list) and cn_raw else list(DEFAULT_SETTINGS["dns_china"])
     # default-nameserver 必须是纯 IP（不能是 DoH 域名），用作解析上游域名/引导 DNS，
     # 否则 fake-ip 下自定义的域名型 DoH nameserver 可能无法自举解析、mihomo 起不来。
     bootstrap = [ip for ip in china_dns if _is_ip_or_cidr(ip) is not None] \
@@ -436,12 +464,17 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         "nameserver": nameservers,
         "proxy-server-nameserver": china_dns,
     }
+    # dns-hijack / auto-redirect 可配：与本机 Pi-hole/dnsmasq（占 :53）或
+    # Docker/firewalld（管 nftables）共存时，可改劫持目标或关掉 nft 重定向。默认保持原行为。
+    hijack = s.get("tun_dns_hijack")
+    if not isinstance(hijack, list) or not hijack:
+        hijack = ["any:53"]
     cfg["tun"] = {
         "enable": True,
         "stack": s["tun_stack"],
-        "dns-hijack": ["any:53"],
+        "dns-hijack": hijack,
         "auto-route": True,
-        "auto-redirect": True,
+        "auto-redirect": bool(s.get("tun_auto_redirect", True)),
         "auto-detect-interface": True,
     }
 

@@ -137,6 +137,10 @@ def _net_fields(node: dict, network: str, *,
     """填充传输层相关字段。仅支持会真正下发 opts 的 ws/httpupgrade/grpc，
     其余（tcp/h2/http）按 tcp 处理，避免出现“有 network 没 opts”的半截配置。"""
     network = (network or "tcp").lower()
+    # h2/http/quic/xhttp 需要专门的 *-opts，本项目不下发，按 tcp 连必然失败 ——
+    # 明确报错让用户知道（在订阅里会作为单条错误跳过），好过静默降级成连不通的 tcp
+    if network in ("h2", "http", "quic", "xhttp"):
+        raise ParseError(f"暂不支持 {network} 传输（仅支持 tcp/ws/grpc/httpupgrade）")
     if network in ("ws", "httpupgrade"):
         node["network"] = network
         node["ws_path"] = ws_path or "/"
@@ -596,7 +600,7 @@ def node_to_link(node: dict) -> str:
             params["fp"] = node["client_fingerprint"]
         if node.get("skip_cert_verify"):
             params["allowInsecure"] = "1"
-        if net == "ws":
+        if net in ("ws", "httpupgrade"):       # httpupgrade 复用 ws 的 path/host，导出别丢
             if node.get("ws_path"):
                 params["path"] = node["ws_path"]
             if node.get("ws_host"):

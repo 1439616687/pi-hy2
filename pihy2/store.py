@@ -139,6 +139,9 @@ class Store:
                            + [_id_num(n.get("id")) for n in base.get("nodes", [])])
         base["_subseq"] = max([base.get("_subseq") or 0]
                               + [_id_num(s.get("id")) for s in base.get("subscriptions", [])])
+        # active 指向已不存在的节点时（外部编辑/导入）回落到第一个，避免悬空 active
+        if base.get("active") and not any(n.get("id") == base["active"] for n in base.get("nodes", [])):
+            base["active"] = base["nodes"][0]["id"] if base.get("nodes") else ""
         return base
 
     # ---------------------------------------------------------------- 节点
@@ -249,8 +252,10 @@ class Store:
     # ---------------------------------------------------------------- 渲染
     def active_node(self) -> dict | None:
         nid = self.data.get("active")
-        return self.get_node(nid) if nid else (
-            self.data["nodes"][0] if self.data["nodes"] else None)
+        # active 可能是悬空 id（外部编辑/导入了引用不存在节点的 state）：回落到第一个节点，
+        # 否则 get_node 返回 None 会让 status 误显示“当前: 无”、渲染选不到默认出口
+        node = self.get_node(nid) if nid else None
+        return node or (self.data["nodes"][0] if self.data["nodes"] else None)
 
     def nodes_active_first(self) -> list[dict]:
         """把当前选中的节点排到最前，作为策略组的默认项。"""

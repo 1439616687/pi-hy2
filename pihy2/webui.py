@@ -14,6 +14,7 @@ import secrets
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import manager, parser, config_gen
@@ -94,8 +95,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": False, "error": msg}, code)
 
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        if not n:
+        try:                                # 畸形 Content-Length（如 'abc'）不应让整个请求线程崩
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return {}
+        if n <= 0:
             return {}
         if n > 4 * 1024 * 1024:          # 限制请求体大小，防止内存被撑爆
             self.rfile.read(min(n, 1 << 20))
@@ -171,6 +175,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_get(path)
         return self._static(path)
 
+    def do_HEAD(self):
+        # 走与 GET 相同的逻辑；_send 会因 self.command == "HEAD" 自动略过响应体
+        self.do_GET()
+
     def do_POST(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
@@ -240,10 +248,23 @@ class Handler(BaseHTTPRequestHandler):
                 "installed": os.path.exists(manager.MIHOMO_BIN),
             })
         if path == "/api/delays":
+            if not self._guard_write(store):     # 会触发 clash 探测（有副作用），按写操作做反 rebinding 防护
+                return
             s = store.data["settings"]
-            out = {n["id"]: manager.clash_delay(n["name"], s) for n in store.data["nodes"]}
+            # 用配置里去重后的名字调用 clash API；并发探测，避免几十个节点串行拖很久
+            names = config_gen.display_names(store.nodes_active_first())
+            nodes = list(store.data["nodes"])
+            out = {}
+            if nodes:
+                def _probe(n):
+                    return n["id"], manager.clash_delay(names.get(n["id"], n["name"]), s)
+                with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as ex:
+                    for nid, d in ex.map(_probe, nodes):
+                        out[nid] = d
             return self._json({"ok": True, "delays": out})
         if path == "/api/traffic":  # 实时流量/连接快照
+            if not self._guard_write(store):     # 查询 clash 控制器（外发探测），同样加反 rebinding 防护
+                return
             data = manager.clash_connections(store.data["settings"]) or {}
             conns = data.get("connections") or []
             top = sorted(conns, key=lambda x: (x.get("upload", 0) + x.get("download", 0)),
@@ -288,23 +309,27 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/login":
             ip = self._client_ip()
+            pw = store.data["webui"].get("password", "")
+            token = None
+            locked = False
+            # 检查锁定 + 比对密码 + 失败计数放进同一把锁的同一临界区，
+            # 否则并发请求会都读到 fails=0 后一起通过，绕过“连续失败上限”限速。
             with _lock:
                 _sweep_locked()                 # 顺手清理过期 token / 陈旧失败计数
                 fails = _login_fails.get(ip, [0, 0.0])
-                # 锁定窗口内拒绝继续尝试，遏制暴力破解
                 if fails[0] >= LOGIN_MAX_FAILS and time.time() - fails[1] < LOGIN_LOCK_SECS:
-                    return self._err("尝试过于频繁，请稍后再试", 429)
-            pw = store.data["webui"].get("password", "")
-            if pw and secrets.compare_digest(str(body.get("password", "")), pw):
-                token = secrets.token_urlsafe(24)
-                with _lock:
+                    locked = True
+                elif pw and secrets.compare_digest(str(body.get("password", "")), pw):
+                    token = secrets.token_urlsafe(24)
                     _tokens[token] = time.time() + TOKEN_TTL
                     _login_fails.pop(ip, None)
+                else:
+                    _login_fails[ip] = [fails[0] + 1, time.time()]
+            if locked:
+                return self._err("尝试过于频繁，请稍后再试", 429)
+            if token:
                 return self._json({"ok": True, "token": token})
-            with _lock:
-                f = _login_fails.get(ip, [0, 0.0])
-                _login_fails[ip] = [f[0] + 1, time.time()]
-            time.sleep(0.5)             # 失败固定延时，进一步抬高爆破成本
+            time.sleep(0.5)             # 失败固定延时放锁外：抬高爆破成本，又不拖慢其它 IP 登录
             return self._err("密码错误", 401)
 
         if path == "/api/logout":
@@ -321,9 +346,15 @@ class Handler(BaseHTTPRequestHandler):
             nodes, errs = parser.parse_many(body.get("text", ""))
             return self._json({"ok": True, "nodes": nodes, "errors": errs})
 
-        with _lock, state_lock():               # 进程内 + 跨进程，保护读改写不丢更新
-            store = self._store()
-            if path == "/api/nodes":
+        # 原则：进程锁/状态锁只罩住“内存读改写 + 存盘”这段；网络/子进程 IO（拉订阅、
+        # mihomo -t/重启、clash API）一律放锁外，避免一个慢/卡住的请求把所有面板写操作冻住。
+        if path in ("/api/nodes", "/api/nodes/order"):
+            with _lock, state_lock():
+                store = self._store()
+                if path == "/api/nodes/order":
+                    store.reorder_nodes(body.get("order", []))
+                    store.save()
+                    return self._json({"ok": True})
                 if body.get("text"):  # 从链接批量添加
                     nodes, errs = parser.parse_many(body["text"])
                     added = store.add_nodes(nodes)
@@ -335,59 +366,73 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": True, "added": [added]})
                 return self._err("缺少 text 或 node")
 
-            if path == "/api/nodes/order":
-                store.reorder_nodes(body.get("order", []))
-                store.save()
-                return self._json({"ok": True})
-
-            if path == "/api/active":
-                nid = body.get("id", "")
+        if path == "/api/active":
+            nid = body.get("id", "")
+            with _lock, state_lock():
+                store = self._store()
                 node = store.get_node(nid)
                 if not node:
                     return self._err("节点不存在")
                 store.set_active(nid)
                 store.save()
-                # 尝试免重启实时切换；失败则需用户点“应用配置”
-                ok, info = manager.clash_select("PROXY", node["name"], store.data["settings"])
-                return self._json({"ok": True, "live": ok, "info": info})
+                # clash API 用的是配置里去重/规避保留词后的名字，与 state 原始 name 可能不同
+                disp = config_gen.display_names(store.nodes_active_first()).get(nid, node["name"])
+                settings = dict(store.data["settings"])
+            ok, info = manager.clash_select("PROXY", disp, settings)   # 网络 IO，锁外
+            return self._json({"ok": True, "live": ok, "info": info})
 
-            if path == "/api/apply":
-                ok, msg = manager.apply_config(store, restart=True)
-                return self._json({"ok": ok, "message": msg})
+        if path == "/api/apply":
+            ok, msg = manager.apply_config(self._store(), restart=True)  # 子进程 IO，锁外
+            return self._json({"ok": ok, "message": msg})
 
-            if path == "/api/service":
-                action = body.get("action", "restart")
-                if action not in ("restart", "stop", "start"):
-                    return self._err("非法操作")
-                manager.service_action("mihomo", action)
-                return self._json({"ok": True})
+        if path == "/api/service":
+            action = body.get("action", "restart")
+            if action not in ("restart", "stop", "start"):
+                return self._err("非法操作")
+            manager.service_action("mihomo", action)
+            return self._json({"ok": True})
 
-            if path == "/api/connections/close":
-                return self._json({"ok": manager.clash_close_all(store.data["settings"])})
+        if path == "/api/connections/close":
+            return self._json({"ok": manager.clash_close_all(self._store().data["settings"])})
 
-            if path == "/api/subs":              # 添加订阅并立即拉取 + 应用
-                url = (body.get("url") or "").strip()
-                if not url.lower().startswith(("http://", "https://")):
-                    return self._err("订阅地址需以 http(s):// 开头")
+        if path == "/api/subs":              # 添加订阅并立即拉取 + 应用
+            url = (body.get("url") or "").strip()
+            if not url.lower().startswith(("http://", "https://")):
+                return self._err("订阅地址需以 http(s):// 开头")
+            with _lock, state_lock():            # 1) 锁内：登记订阅 + 存盘
+                store = self._store()
                 sub = store.add_subscription(body.get("name", ""), url)
-                cnt, errs = manager.refresh_subscription(store, sub["id"])
+                sid = sub["id"]
                 store.save()
-                if cnt:
-                    manager.apply_config(store)   # 拉到节点就应用，避免“更新了却不生效”
-                return self._json({"ok": True, "sub": sub, "count": cnt, "errors": errs})
+            nodes, errs = manager.fetch_sub_nodes(url)   # 2) 锁外：拉取（可能很慢）
+            cnt = 0
+            with _lock, state_lock():            # 3) 锁内：写回该订阅的节点
+                store = self._store()
+                if nodes and store.get_subscription(sid):
+                    cnt = store.set_subscription_nodes(sid, nodes)
+                    store.save()
+            if cnt:
+                manager.apply_config(self._store())   # 4) 锁外：应用
+            return self._json({"ok": True, "sub": sub, "count": cnt, "errors": errs})
 
-            if path == "/api/subs/update":       # 更新某个或全部订阅 + 应用
-                sid = body.get("id", "all")
-                if sid == "all":
-                    res = manager.refresh_all_subscriptions(store)
-                    cnt = sum(res.values())
-                else:
-                    cnt, errs = manager.refresh_subscription(store, sid)
-                store.save()
-                applied = ""
-                if cnt:
-                    applied = manager.apply_config(store)[1]
-                return self._json({"ok": True, "count": cnt, "applied": applied})
+        if path == "/api/subs/update":       # 更新某个或全部订阅 + 应用
+            sid = body.get("id", "all")
+            subs = self._store().data.get("subscriptions", [])
+            targets = subs if sid == "all" else [s for s in subs if s["id"] == sid]
+            total = 0
+            for s in targets:
+                nodes, _errs = manager.fetch_sub_nodes(s["url"])   # 锁外逐个拉取
+                if not nodes:
+                    continue
+                with _lock, state_lock():        # 锁内写回，不持锁做网络 IO
+                    store = self._store()
+                    if store.get_subscription(s["id"]):
+                        total += store.set_subscription_nodes(s["id"], nodes)
+                        store.save()
+            applied = ""
+            if total:
+                applied = manager.apply_config(self._store())[1]   # 锁外应用
+            return self._json({"ok": True, "count": total, "applied": applied})
 
         return self._err("not found", 404)
 
@@ -431,6 +476,27 @@ class Handler(BaseHTTPRequestHandler):
                 mir = settings.get("github_mirror", "")
                 if mir and not mir.lower().startswith("https://"):
                     return self._err("下载镜像必须以 https:// 开头")
+                # fake-ip 网段必须是合法 CIDR，否则 mihomo -t 失败且空/坏值被持久化、每次 apply 都卡住
+                if "fake_ip_range" in settings:
+                    fr = str(settings["fake_ip_range"]).strip()
+                    try:
+                        ipaddress.ip_network(fr, strict=False)
+                    except ValueError:
+                        return self._err("fake-ip 网段必须是合法 CIDR（如 198.18.0.1/16）")
+                    settings["fake_ip_range"] = fr
+                # 受限取值白名单
+                if settings.get("tun_stack") not in (None, "system", "gvisor", "mixed"):
+                    return self._err("TUN 协议栈必须是 system / gvisor / mixed")
+                if settings.get("log_level") not in (None, "silent", "error", "warning", "info", "debug"):
+                    return self._err("日志级别必须是 silent/error/warning/info/debug")
+                # 类型规整：脏值/误传不应破坏配置渲染（presets/dns_* 必须是列表，否则丢弃该键回退原值）
+                if "presets" in settings and not isinstance(settings["presets"], list):
+                    settings.pop("presets")
+                for _dk in ("dns_nameservers", "dns_china", "tun_dns_hijack"):
+                    if _dk in settings and not isinstance(settings[_dk], list):
+                        settings.pop(_dk)
+                if "tun_auto_redirect" in settings:
+                    settings["tun_auto_redirect"] = bool(settings["tun_auto_redirect"])
                 store.set_settings(settings)
                 if "sub_interval_hours" in body:     # 订阅自动更新间隔，顺带重写 timer
                     h = int(body["sub_interval_hours"]) if str(body["sub_interval_hours"]).isdigit() else 12
@@ -441,17 +507,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if path == "/api/webui":
                 w = store.data["webui"]
+                new_bind = w.get("bind", "0.0.0.0")
+                if "bind" in body:
+                    b = _valid_bind(body["bind"])
+                    if b is None:
+                        return self._err("监听地址必须是 IP 或 localhost")
+                    new_bind = b
+                new_pw = w.get("password", "")
+                if "password" in body:          # 空字符串=取消密码
+                    new_pw = body["password"]
+                # 安全不变量：未设密码时只能监听回环——否则=局域网内无鉴权的 root 控制台。
+                # serve() 仅在启动时兜底，这里在写入时就拦住危险组合（在线清密码却仍开放 LAN）。
+                if not new_pw and new_bind not in ("127.0.0.1", "::1", "localhost"):
+                    return self._err("未设访问密码时只能监听回环（127.0.0.1）。"
+                                     "请先设密码，或把监听地址改为 127.0.0.1 后再取消密码。")
                 if "port" in body:
                     p = _valid_listen_port(body["port"])
                     if p is None:
                         return self._err("监听端口必须是 1..65535 的整数")
                     w["port"] = p
-                if "bind" in body:
-                    b = _valid_bind(body["bind"])
-                    if b is None:
-                        return self._err("监听地址必须是 IP 或 localhost")
-                    w["bind"] = b
-                if "password" in body:  # 空字符串=取消密码
+                w["bind"] = new_bind
+                if "password" in body:
                     w["password"] = body["password"]
                     _tokens.clear()
                 store.save()

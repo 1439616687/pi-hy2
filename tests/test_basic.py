@@ -497,6 +497,66 @@ check("M3 bind 校验合法",
 check("M3 bind 校验非法=None", _webui._valid_bind("evil.com") is None and _webui._valid_bind("not an ip") is None)
 
 
+print("== 回归：审查全量修复（高/中/低批次）==")
+from pihy2 import manager as _m2  # noqa: E402
+_node = {"name": "n", "type": "hysteria2", "server": "h", "port": 443, "password": "p"}
+# #01 TUN dns-hijack / auto-redirect 可配
+_cfg = config_gen.build_config([_node], [], dict(config_gen.DEFAULT_SETTINGS, secret="s",
+                                                 tun_dns_hijack=["tun0:53"], tun_auto_redirect=False))
+check("#01 dns-hijack 可配", _cfg["tun"]["dns-hijack"] == ["tun0:53"])
+check("#01 auto-redirect 可关", _cfg["tun"]["auto-redirect"] is False)
+check("#01 默认仍 any:53 + auto-redirect", config_gen.build_config([_node], [], {"secret": "s"})["tun"]["dns-hijack"] == ["any:53"])
+# #06 httpupgrade 导出不丢 path/host
+_hu = parser.parse_link("vless://" + _uuid + "@h.com:443?security=tls&type=httpupgrade&path=%2Fhu&host=h.com#X")
+_hub = parser.parse_link(parser.node_to_link(_hu))
+check("#06 httpupgrade round-trip path", _hub.get("ws_path") == "/hu" and _hub.get("ws_host") == "h.com", str(_hub.get("ws_path")))
+# #15 IPv6 zone-id 去除
+check("#15 zone-id 去除", config_gen.classify_rule("fe80::1%eth0", "auto") == ("IP-CIDR", "fe80::1/128"))
+check("#15 zone-id+掩码", config_gen.classify_rule("fe80::1%eth0/64", "auto") == ("IP-CIDR", "fe80::1/64"))
+# #16 引号内 tab 不被改成空格
+check("#16 引号内 tab 保留", yaml_lite.load('a: "x\ty"') == {"a": "x\ty"}, repr(yaml_lite.load('a: "x\ty"')))
+# #17 active 悬空回落第一个节点
+_sd2 = tempfile.mkdtemp(prefix="pihy2-af-"); _sp2 = os.path.join(_sd2, "state.json")
+_st = _store.Store(_sp2); _st.add_node(dict(_node)); _st.data["active"] = "n999"
+check("#17 悬空 active 回落第一个", _st.active_node() is not None and _st.active_node()["id"] == "n1")
+# #28 presets/dns 非列表不崩、回落
+_c28 = config_gen.build_config([_node], [], dict(config_gen.DEFAULT_SETTINGS, secret="s",
+                                                 presets="ads", dns_nameservers="1.1.1.1", dns_china=5))
+check("#28 presets 字符串不崩 & 无规则泄漏", "GEOSITE" not in "\n".join(_c28["rules"]))
+check("#28 dns 非列表回落默认", len(_c28["dns"]["nameserver"]) >= 1 and _c28["dns"]["nameserver"][0].startswith("http"))
+# #29 解码：UTF-8 优先，GB18030 兜底，损坏可见
+check("#29 utf-8 解码", _m2._decode_body("测试".encode("utf-8")) == "测试")
+check("#29 gb18030 兜底", _m2._decode_body("测试".encode("gb18030")) == "测试")
+# #32 vless reality 强制 tls:true（即使未勾 TLS）
+_rp = config_gen.node_to_proxy({"name": "r", "type": "vless", "server": "h", "port": 443,
+                                "uuid": _uuid, "reality_pbk": "PBK", "tls": False}, {})
+check("#32 reality 强制 tls", _rp.get("tls") is True and "reality-opts" in _rp)
+# #33 h2/http/quic 传输被拒（而非静默降级 tcp）
+_h2n, _h2e = parser.parse_many("vless://" + _uuid + "@h.com:443?security=tls&type=h2#H")
+check("#33 h2 传输被拒", len(_h2n) == 0 and any("h2" in e for e in _h2e), str(_h2e))
+# #10 display_names：同名/保留词去重，供 clash API 用
+_dn = config_gen.display_names([
+    {"id": "n1", "name": "HK", "server": "a", "port": 1, "type": "ss"},
+    {"id": "n2", "name": "HK", "server": "b", "port": 2, "type": "ss"},
+    {"id": "n3", "name": "PROXY", "server": "c", "port": 3, "type": "ss"}])
+check("#10 display_names 去重/规避保留词",
+      _dn == {"n1": "HK", "n2": "HK #2", "n3": "PROXY·"}, str(_dn))
+# #07 镜像/直链下载也走 SSRF 钉死：拒绝内网、非 http(s)
+try:
+    _m2._download_to_file("http://127.0.0.1/x", os.path.join(_sd2, "x"), timeout=2)
+    check("#07 下载拒绝内网", False)
+except ValueError:
+    check("#07 下载拒绝内网", True)
+try:
+    _m2._download_to_file("ftp://x/y", os.path.join(_sd2, "y"))
+    check("#07 下载拒绝非 http(s)", False)
+except ValueError:
+    check("#07 下载拒绝非 http(s)", True)
+# #11 systemd 单元路径取运行中包目录，而非写死 /opt/pihy2
+check("#11 package_dir 为本仓库目录",
+      _m2.package_dir() == os.path.dirname(os.path.dirname(os.path.abspath(_m2.__file__))))
+
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):

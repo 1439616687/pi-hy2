@@ -114,11 +114,62 @@ def _apply_mirror(url: str, mirror: str) -> str:
     return mirror.rstrip("/") + "/" + url
 
 
+def _download_to_file(url: str, dest: str, timeout: int = 600, _max_redirects: int = 5) -> None:
+    """下载到文件，复用 fetch_text 的 SSRF 加固：每一跳都先解析+校验域名、再把连接钉死到该
+    公网 IP（消除二次解析的 TOCTOU/DNS rebinding），有限跟随跳转且逐跳复检，超大小即报错。
+
+    原先用 urllib.urlopen 下载会(a)二次解析镜像域名、(b)自动跟随跳转到任意主机且不复检，
+    使 _apply_mirror 的预校验形同虚设——镜像可借此打内网/读元数据或投递任意二进制（以 root 运行）。
+    """
+    max_bytes = 2 * _MAX_BIN_BYTES        # 调用时 _MAX_BIN_BYTES 已定义；超此即中止，防超大/压缩炸弹
+    for _ in range(_max_redirects + 1):
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError("下载地址必须以 http(s):// 开头")
+        host = parts.hostname or ""
+        if not host:
+            raise ValueError("下载地址缺少主机名")
+        port = parts.port or (443 if scheme == "https" else 80)
+        _fam, ip = _resolve_public(host)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        if scheme == "https":
+            conn = _PinnedHTTPSConnection(host, ip, port=port, timeout=timeout,
+                                          context=ssl.create_default_context())
+        else:
+            conn = _PinnedHTTPConnection(host, ip, port=port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "pihy2/1.0", "Host": host})
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                if not loc:
+                    raise ValueError("下载地址跳转缺少 Location")
+                url = urllib.parse.urljoin(url, loc)
+                continue                  # 下一跳重新解析+校验+钉死
+            if resp.status != 200:
+                raise ValueError(f"下载返回 HTTP {resp.status}")
+            total = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("下载体积超过上限，已中止")
+                    f.write(chunk)
+            return
+        finally:
+            conn.close()
+    raise ValueError("下载地址跳转次数过多")
+
+
 def _download(url: str, dest: str, mirror: str = "", timeout: int = 600) -> None:
     url = _apply_mirror(url, mirror)
-    req = urllib.request.Request(url, headers={"User-Agent": "pihy2"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
-        shutil.copyfileobj(resp, f)
+    _download_to_file(url, dest, timeout=timeout)
 
 
 def _sha256(path: str) -> str:
@@ -278,6 +329,13 @@ def _write(path: str, content: str) -> None:
         f.write(content)
 
 
+def package_dir() -> str:
+    """运行中的 pihy2 包所在父目录（含 pihy2/ 与 web/）。用于 systemd 单元的
+    WorkingDirectory/PYTHONPATH——从任意目录跑 `python3 -m pihy2 install` 时，
+    web / sub-update 服务也能正确导入 pihy2，而非写死 /opt/pihy2 导致 'No module named pihy2'。"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def install_services(log=print) -> None:
     """写入并启用 mihomo 与 pihy2-web 两个 systemd 服务。"""
     _write(MIHOMO_SERVICE, f"""[Unit]
@@ -297,21 +355,27 @@ WantedBy=multi-user.target
 """)
 
     py = sys.executable or "/usr/bin/python3"
+    pkg = package_dir()
     # 不写死端口：web 子命令会从 state.json 读取端口/监听地址，
     # 这样在面板里改端口后 `systemctl restart pihy2-web` 即可生效。
     # After=mihomo.service 让启动次序确定（面板在路由就绪后再起）。面板端口处于
     # 始终直连的私有网段，局域网访问不受 TUN 影响；即使 mihomo 没起来面板也能用于排错。
+    # 适度加固：面板以 root + 局域网暴露，但仍需 systemctl/sysctl/写 /etc，故只加不影响这些
+    # 操作的项（NoNewPrivileges 防提权扩张、PrivateTmp 隔离临时文件）。不加 ProtectHome/
+    # ProtectKernelTunables——前者会挡住从 /home 跑的开发部署、后者会让 sysctl -w 失败。
     _write(WEBUI_SERVICE, f"""[Unit]
 Description=pihy2 WebUI 管理面板
 After=network.target mihomo.service
 
 [Service]
 Type=simple
-WorkingDirectory={INSTALL_DIR}
-Environment=PYTHONPATH={INSTALL_DIR}
+WorkingDirectory={pkg}
+Environment=PYTHONPATH={pkg}
 ExecStart={py} -m pihy2 web
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -350,9 +414,11 @@ def set_ip_forward(on: bool, log=print) -> None:
     都依赖它们。因此 pihy2 只在开启网关时主动置位；关闭网关时**只撤销自己的持久化文件、
     绝不把运行期值强制改回 0**——否则每次 apply（含订阅定时器自动 apply）都会把别人开启的
     转发踩掉，断开容器/下游设备网络。关闭即"不再由 pihy2 持有"，运行期值留给系统/其它软件。"""
+    # 只设 conf.all.rp_filter=2：内核对每个接口取 max(all, iface)，all=2 已让所有接口
+    # （含将来 Docker veth / 其它 VPN）走 loose。原先额外写 conf.default 是冗余的，且更易让人
+    # 误以为只影响 pihy2；去掉它。注意 all=2 本身就是系统级放宽，这是透明网关非对称路由所必需。
     desired = ("net.ipv4.ip_forward=1\n"
-               "net.ipv4.conf.all.rp_filter=2\n"
-               "net.ipv4.conf.default.rp_filter=2\n")
+               "net.ipv4.conf.all.rp_filter=2\n")
     try:
         if on:
             cur = ""
@@ -370,12 +436,23 @@ def set_ip_forward(on: bool, log=print) -> None:
     if on:
         run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
         run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"])
-        run(["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"])
+
+
+def wait_active(name: str, timeout: float = 6.0) -> bool:
+    """轮询 systemctl is-active，等待服务进入 active（重启后绑定端口需要一点时间）。"""
+    import time
+    deadline = time.time() + timeout
+    while True:
+        if run(["systemctl", "is-active", name]).stdout.strip() == "active":
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.4)
 
 
 def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
-    """渲染 -> 校验 -> 落盘 -> 重启 mihomo。校验失败则不落盘。
-    与现有配置完全一致时跳过落盘与重启，避免（如订阅定时任务）无谓地断开连接。"""
+    """渲染 -> 校验 -> 落盘 -> （动系统转发）-> 重启并确认 mihomo 真起来了。
+    校验失败则不落盘、也不改系统转发。与现有配置完全一致时跳过落盘与重启。"""
     text = store.render_config()
     current = ""
     if os.path.exists(MIHOMO_CONFIG):
@@ -384,15 +461,25 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
                 current = f.read()
         except OSError:
             pass
-    set_ip_forward(bool(store.data["settings"].get("gateway_mode")), log)
+    gw = bool(store.data["settings"].get("gateway_mode"))
+    warn = dns_conflict_warning()
+    if warn:
+        log("⚠️  " + warn)
     if text == current:
+        set_ip_forward(gw, log)          # 无配置变化也把网关内核参数对齐到期望（幂等），但不重启
         return True, "配置无变化，未重启"
     ok, out = test_config(text)
     if not ok:
+        # 校验失败：不写配置、也不动系统转发，保持原状——避免开了转发却没应用网关配置导致流量裸奔
         return False, f"配置校验失败，已保留原配置：\n{out}"
     write_config(text)
+    set_ip_forward(gw, log)              # 仅在配置确实通过校验并落盘后，才提交系统级转发等副作用
     if restart and os.path.exists(MIHOMO_SERVICE):
-        service_action("mihomo", "restart", log)
+        r = service_action("mihomo", "restart", log)
+        if r.returncode != 0 or not wait_active("mihomo"):
+            # -t 不绑定端口，真启动才会暴露端口占用（9090/7890/1053）等问题；如实回报失败 + 日志
+            return False, ("配置已写入，但 mihomo 未能启动（常见原因：控制器/代理/DNS 端口被占用，"
+                           "如 9090/7890/1053）。最近日志：\n" + journal("mihomo", 12))
     return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
 
 
@@ -455,6 +542,18 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
+def _decode_body(data: bytes) -> str:
+    """解码订阅响应：优先 UTF-8，其次 GB18030（覆盖 GBK/GB2312，常见于国内机场），
+    最后用 replace 兜底——让损坏可见（出现 �），而非 'ignore' 静默丢字节、把可恢复的
+    编码问题变成悄悄出错/截断（如截断 base64、改坏节点名）。"""
+    for enc in ("utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
 def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024,
                _max_redirects: int = 5) -> str:
     """拉取订阅内容。订阅是 root 进程发起的服务端请求，须防 SSRF：
@@ -494,26 +593,35 @@ def fetch_text(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024,
             data = resp.read(max_bytes + 1)
             if len(data) > max_bytes:
                 raise ValueError("订阅内容超过大小限制")
-            return data.decode("utf-8", "ignore")
+            return _decode_body(data)
         finally:
             conn.close()
     raise ValueError("订阅地址跳转次数过多")
 
 
+def fetch_sub_nodes(url: str) -> tuple[list, list]:
+    """仅拉取 + 解析订阅内容为节点列表（不触碰 store）。返回 (节点列表, 错误列表)。
+
+    把“网络 IO”与“改 store”分开，便于 WebUI 在不持有进程锁/状态锁的情况下做拉取，
+    避免一个慢/卡住的订阅把整个面板的写操作冻住。
+    """
+    from . import parser
+    try:
+        text = fetch_text(url)
+    except Exception as e:
+        return [], [f"拉取失败：{e}"]
+    try:
+        return parser.parse_many(text)
+    except Exception as e:                    # 解析器兜底，任何脏数据都不该拖垮定时更新
+        return [], [f"解析失败：{e}"]
+
+
 def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
     """拉取并解析一个订阅，替换其名下节点。返回 (节点数, 错误列表)。"""
-    from . import parser
     sub = store.get_subscription(sid)
     if not sub:
         return 0, ["订阅不存在"]
-    try:
-        text = fetch_text(sub["url"])
-    except Exception as e:
-        return 0, [f"拉取失败：{e}"]
-    try:
-        nodes, errors = parser.parse_many(text)
-    except Exception as e:                    # 解析器兜底，任何脏数据都不该拖垮定时更新
-        return 0, [f"解析失败：{e}"]
+    nodes, errors = fetch_sub_nodes(sub["url"])
     if not nodes:
         return 0, (errors or ["订阅里没有可解析的节点（可能是返回了登录页/空内容，或全是暂不支持的协议）"])
     n = store.set_subscription_nodes(sid, nodes)
@@ -529,14 +637,15 @@ def refresh_all_subscriptions(store, log=print) -> dict:
 def install_sub_timer(hours: int = 12, log=print) -> None:
     """写入并启用订阅定时更新 timer。"""
     py = sys.executable or "/usr/bin/python3"
+    pkg = package_dir()
     _write(SUB_SERVICE, f"""[Unit]
 Description=pihy2 订阅更新
 After=network-online.target mihomo.service
 
 [Service]
 Type=oneshot
-WorkingDirectory={INSTALL_DIR}
-Environment=PYTHONPATH={INSTALL_DIR}
+WorkingDirectory={pkg}
+Environment=PYTHONPATH={pkg}
 ExecStart={py} -m pihy2 sub update all --apply
 """)
     _write(SUB_TIMER, f"""[Unit]
@@ -555,6 +664,19 @@ WantedBy=timers.target
 
 
 # ---------------------------------------------------------------- 状态/排错
+def dns_conflict_warning() -> str:
+    """检测本机是否已运行占用 :53 的 DNS 服务（systemd-resolved/dnsmasq/Pi-hole）。
+    有则返回一句中文告警（TUN 的 dns-hijack any:53 会劫持它们的查询），否则返回 ''。"""
+    for svc, label in (("systemd-resolved", "systemd-resolved"),
+                       ("dnsmasq", "dnsmasq"),
+                       ("pihole-FTL", "Pi-hole")):
+        if run(["systemctl", "is-active", svc]).stdout.strip() == "active":
+            return (f"检测到本机正在运行 {label}（占用 53 端口）：TUN 的 dns-hijack=any:53 "
+                    "会劫持本机/局域网的 DNS 查询，可能使其失效（如 Pi-hole 去广告停止）。"
+                    "若需共存，可在设置里把「TUN DNS 劫持」改为仅 TUN 接口或清空。")
+    return ""
+
+
 def service_status(name: str) -> dict:
     active = run(["systemctl", "is-active", name]).stdout.strip()
     enabled = run(["systemctl", "is-enabled", name]).stdout.strip()
@@ -659,9 +781,13 @@ def uninstall(purge: bool = False, log=print) -> None:
     run(["systemctl", "daemon-reload"])
     if purge:
         from .store import STATE_DIR
-        for path in (MIHOMO_BIN, "/etc/modules-load.d/tun.conf"):
+        # 也删 CLI 包装器，否则 purge 后 `pihy2` 命令还在、却指向被删空间，与“已彻底删除”不符
+        for path in (MIHOMO_BIN, "/etc/modules-load.d/tun.conf", "/usr/local/bin/pihy2"):
             if os.path.exists(path):
                 os.remove(path)
         shutil.rmtree(MIHOMO_DIR, ignore_errors=True)
         shutil.rmtree(STATE_DIR, ignore_errors=True)  # /etc/pihy2 状态
-    log("已卸载" + ("（含二进制、配置与状态）" if purge else "（保留 /etc/pihy2 状态，可重装恢复）"))
+        # 标准安装目录 /opt/pihy2 一并清理；放最后（模块已加载进内存，删源码不影响本次运行）。
+        # 只删约定的 INSTALL_DIR，不动从 git 检出目录直接运行的源码。
+        shutil.rmtree(INSTALL_DIR, ignore_errors=True)
+    log("已卸载" + ("（含二进制、配置、状态与安装目录）" if purge else "（保留 /etc/pihy2 状态，可重装恢复）"))
