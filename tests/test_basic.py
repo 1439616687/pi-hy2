@@ -557,6 +557,48 @@ check("#11 package_dir 为本仓库目录",
       _m2.package_dir() == os.path.dirname(os.path.dirname(os.path.abspath(_m2.__file__))))
 
 
+print("== 回归：第四轮（修复上轮引入的回归）==")
+# M-1 _resolve_public 返回 IP 列表（IPv4 优先，便于回退），内网仍整体拒绝
+check("M1 _resolve_public 返回列表", _m2._resolve_public("1.1.1.1") == ["1.1.1.1"], str(_m2._resolve_public("1.1.1.1")))
+try:
+    _m2._resolve_public("127.0.0.1"); check("M1 内网仍拒", False)
+except ValueError:
+    check("M1 内网仍拒", True)
+# M-2 Clash YAML 的 h2 传输被拒（与分享链接解析一致），不再静默降级 tcp
+_yh2, _yh2e = parser.parse_many("proxies:\n- {name: x, type: vmess, server: h, port: 443, uuid: " + _uuid + ", network: h2}\n")
+check("M2 YAML h2 被拒", len(_yh2) == 0 and any("h2" in e for e in _yh2e), str(_yh2e))
+# M-3 列表项首键的值是同列块状序列时正确解析（零缩进列表），不再整条丢失
+check("M3 列表项首键为同列序列", yaml_lite.load("x:\n- a:\n  - 1\n  - 2\n") == {"x": [{"a": [1, 2]}]},
+      str(yaml_lite.load("x:\n- a:\n  - 1\n  - 2\n")))
+# #01 _safe_int 对 inf/1e400/nan 回落默认（不再抛 OverflowError）
+check("#01 _safe_int inf/1e400/nan 回落",
+      config_gen._safe_int("inf", 7890) == 7890 and config_gen._safe_int("1e400", 443) == 443 and config_gen._safe_int("nan", 5) == 5)
+# #02 zone-id 去除仅对 IP 生效；含 '%' 的域名/关键词规则不被截断
+check("#02 含%域名不截断", config_gen.classify_rule("a%b.com", "auto") == ("DOMAIN-SUFFIX", "a%b.com"))
+check("#02 IPv6 zone 去除", config_gen.classify_rule("fe80::1%eth0", "auto") == ("IP-CIDR", "fe80::1/128"))
+# #03 mixed_port 脏值/越界回落 7890
+check("#03 mixed_port 字符串回落", config_gen.build_config([], [], dict(config_gen.DEFAULT_SETTINGS, secret="s", mixed_port="abc"))["mixed-port"] == 7890)
+check("#03 mixed_port 越界回落", config_gen.build_config([], [], dict(config_gen.DEFAULT_SETTINGS, secret="s", mixed_port=99999))["mixed-port"] == 7890)
+# #12 vless flow 仅在 tcp/REALITY 下下发
+check("#12 flow+ws 丢弃", "flow" not in config_gen.node_to_proxy(
+    {"name": "v", "type": "vless", "server": "h", "port": 443, "uuid": "u", "flow": "xtls-rprx-vision", "network": "ws"}, {}))
+check("#12 flow+tcp 保留", config_gen.node_to_proxy(
+    {"name": "v", "type": "vless", "server": "h", "port": 443, "uuid": "u", "flow": "xtls-rprx-vision"}, {}).get("flow") == "xtls-rprx-vision")
+# #13 非 hysteria2 的 fingerprint 字段不残留（config_gen 不消费，留着会误导）
+_fpn, _ = parser.parse_many("proxies:\n- {name: v, type: vless, server: h, port: 443, uuid: " + _uuid + ", fingerprint: chrome}\n")
+check("#13 vless fingerprint 去除", bool(_fpn) and "fingerprint" not in _fpn[0], str(_fpn[0] if _fpn else None))
+# #04 _migrate 容忍畸形 state（非 dict 节点过滤、缺 id 补发、悬空 active 回落）
+_sd3 = tempfile.mkdtemp(prefix="pihy2-mig-"); _sp3 = os.path.join(_sd3, "state.json")
+with open(_sp3, "w") as f:
+    _json2.dump({"version": 1, "nodes": ["bad", None, {"name": "ok", "server": "h", "port": 1, "type": "hysteria2"}], "active": "nope"}, f)
+_ms = _store.Store(_sp3)
+check("#04 畸形节点过滤+补id+active回落",
+      len(_ms.data["nodes"]) == 1 and bool(_ms.data["nodes"][0].get("id")) and _ms.active_node() is not None,
+      str(_ms.data["nodes"]))
+# #05 dns_conflict_warning 尊重 tun_dns_hijack：未宽泛劫持 :53 时不告警
+check("#05 非 any:53 不告警", _m2.dns_conflict_warning({"tun_dns_hijack": ["tun0:53"]}) == "")
+
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):

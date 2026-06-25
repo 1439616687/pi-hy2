@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import secrets
+import socket
 import threading
 import time
 import urllib.parse
@@ -84,8 +85,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        self.wfile.write(body)
 
     def _json(self, obj, code: int = 200):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
@@ -105,9 +105,11 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.read(min(n, 1 << 20))
             return {}
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            d = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
         except (json.JSONDecodeError, ValueError):
             return {}
+        # 合法但非对象的 JSON（如 [1,2] / 5 / "x" / null）会让各处 body.get(...) 崩，统一归一为 {}
+        return d if isinstance(d, dict) else {}
 
     def _store(self) -> Store:
         return Store()  # 每次请求从磁盘加载，避免与 CLI 写入冲突
@@ -151,8 +153,9 @@ class Handler(BaseHTTPRequestHandler):
         host = self._host_only()
         origin = self.headers.get("Origin") or self.headers.get("Referer")
         if origin:
+            # urlparse 把 Origin 主机名小写化，而 Host 原样；统一小写比较，避免误伤 MyPi.local 这类大小写
             oh = urllib.parse.urlparse(origin).hostname or ""
-            if oh and oh != host:
+            if oh and oh.lower() != host.lower():
                 self._err("拒绝：跨站请求", 403)
                 return False
         if not store.data["webui"].get("password"):
@@ -174,10 +177,6 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             return self._api_get(path)
         return self._static(path)
-
-    def do_HEAD(self):
-        # 走与 GET 相同的逻辑；_send 会因 self.command == "HEAD" 自动略过响应体
-        self.do_GET()
 
     def do_POST(self):
         if not self.path.startswith("/api/"):
@@ -216,6 +215,12 @@ class Handler(BaseHTTPRequestHandler):
     # ----------------------------------------------------------- GET API
     def _api_get(self, path: str):
         store = self._store()
+        if path == "/api/authinfo":  # 公开：登录页据此判断是否需要登录（必须先于守卫）
+            return self._json({"ok": True, "need_auth": self._need_auth(store)})
+        # 所有数据型 GET 也走反 DNS-rebinding 守卫：未设密码时这些接口（/api/export 等）
+        # 会泄露节点凭据/配置，必须和写操作一样要求 Host 为 IP/localhost、同源。
+        if not self._guard_write(store):
+            return
         if path == "/api/state":
             if not self._authed(store):
                 return self._err("未登录", 401)
@@ -235,8 +240,6 @@ class Handler(BaseHTTPRequestHandler):
                           "has_password": bool(store.data["webui"].get("password"))},
                 "active": store.data["active"],
             })
-        if path == "/api/authinfo":  # 未鉴权也可访问：告诉前端是否需要登录
-            return self._json({"ok": True, "need_auth": self._need_auth(store)})
         if not self._authed(store):
             return self._err("未登录", 401)
         if path == "/api/status":
@@ -248,8 +251,6 @@ class Handler(BaseHTTPRequestHandler):
                 "installed": os.path.exists(manager.MIHOMO_BIN),
             })
         if path == "/api/delays":
-            if not self._guard_write(store):     # 会触发 clash 探测（有副作用），按写操作做反 rebinding 防护
-                return
             s = store.data["settings"]
             # 用配置里去重后的名字调用 clash API；并发探测，避免几十个节点串行拖很久
             names = config_gen.display_names(store.nodes_active_first())
@@ -263,8 +264,6 @@ class Handler(BaseHTTPRequestHandler):
                         out[nid] = d
             return self._json({"ok": True, "delays": out})
         if path == "/api/traffic":  # 实时流量/连接快照
-            if not self._guard_write(store):     # 查询 clash 控制器（外发探测），同样加反 rebinding 防护
-                return
             data = manager.clash_connections(store.data["settings"]) or {}
             conns = data.get("connections") or []
             top = sorted(conns, key=lambda x: (x.get("upload", 0) + x.get("download", 0)),
@@ -442,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed(store):
             return self._err("未登录", 401)
         body = self._body()
+        timer_hours = None
+        settings_saved = False
         with _lock, state_lock():
             store = self._store()
             if path.startswith("/api/nodes/"):
@@ -497,15 +498,22 @@ class Handler(BaseHTTPRequestHandler):
                         settings.pop(_dk)
                 if "tun_auto_redirect" in settings:
                     settings["tun_auto_redirect"] = bool(settings["tun_auto_redirect"])
+                # gateway_mode/allow_lan/ipv6 等布尔设置规整：Python 里非空字符串恒真，
+                # 不转的话 "false"/"0"/"no" 会误开网关与系统 IP 转发。
+                for _bk in ("gateway_mode", "allow_lan", "ipv6"):
+                    if _bk in settings:
+                        _v = settings[_bk]
+                        settings[_bk] = (str(_v).strip().lower() not in ("", "0", "false", "no", "off")
+                                         if isinstance(_v, str) else bool(_v))
                 store.set_settings(settings)
-                if "sub_interval_hours" in body:     # 订阅自动更新间隔，顺带重写 timer
+                if "sub_interval_hours" in body:     # 订阅自动更新间隔
                     h = int(body["sub_interval_hours"]) if str(body["sub_interval_hours"]).isdigit() else 12
                     store.data["sub_interval_hours"] = max(1, h)
                     if os.path.exists(manager.SUB_TIMER):
-                        manager.install_sub_timer(store.data["sub_interval_hours"])
+                        timer_hours = store.data["sub_interval_hours"]   # 锁外再重写 timer
                 store.save()
-                return self._json({"ok": True})
-            if path == "/api/webui":
+                settings_saved = True            # 落锁外执行 install_sub_timer 并返回
+            elif path == "/api/webui":
                 w = store.data["webui"]
                 new_bind = w.get("bind", "0.0.0.0")
                 if "bind" in body:
@@ -532,6 +540,12 @@ class Handler(BaseHTTPRequestHandler):
                     _tokens.clear()
                 store.save()
                 return self._json({"ok": True})
+        # /api/settings 走到这里：systemd timer 重写（daemon-reload/enable/start 子进程）放锁外执行，
+        # 避免持有 _lock/state_lock 期间做慢 IO 冻结其它面板写操作。
+        if settings_saved:
+            if timer_hours is not None:
+                manager.install_sub_timer(timer_hours)
+            return self._json({"ok": True})
         return self._err("not found", 404)
 
     # ----------------------------------------------------------- DELETE API
@@ -563,7 +577,14 @@ def serve(port: int | None = None, bind: str | None = None):
         print("⚠️  未设置访问密码，为安全起见仅监听 127.0.0.1。"
               "请在面板/向导里设置密码后再开放到局域网。")
         bind = "127.0.0.1"
-    httpd = ThreadingHTTPServer((bind, port), Handler)
+    # ThreadingHTTPServer 默认 AF_INET（仅 IPv4）；bind 是 IPv6 字面量时必须切到 AF_INET6，
+    # 否则 ('::1', port) 会抛 gaierror 让面板起不来（_valid_bind 允许 ::1/:: 这类 IPv6）。
+    try:
+        family = socket.AF_INET6 if ipaddress.ip_address(bind).version == 6 else socket.AF_INET
+    except ValueError:
+        family = socket.AF_INET                  # 'localhost' 等主机名 -> 走 IPv4
+    server_cls = type("_PiHy2Server", (ThreadingHTTPServer,), {"address_family": family})
+    httpd = server_cls((bind, port), Handler)
     print(f"pihy2 WebUI 运行于 http://{bind}:{port}（静态目录 {WEB_DIR}）")
     try:
         httpd.serve_forever()

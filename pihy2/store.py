@@ -129,6 +129,10 @@ class Store:
     def _migrate(self, data: dict) -> dict:
         base = _new_state()
         base.update({k: v for k, v in data.items() if k in base})
+        # 外部/手工编辑的 state 里 nodes/subscriptions 可能含非 dict 元素：先过滤，避免
+        # 后续 n.get(...) 在字符串/None 上抛 AttributeError，使整个工具在加载期就起不来。
+        base["nodes"] = [n for n in base.get("nodes", []) if isinstance(n, dict)]
+        base["subscriptions"] = [s for s in base.get("subscriptions", []) if isinstance(s, dict)]
         # settings/webui 做字段补全，兼容旧版本新增字段
         base["settings"] = {**config_gen.DEFAULT_SETTINGS, **data.get("settings", {})}
         if not base["settings"].get("secret"):
@@ -136,13 +140,23 @@ class Store:
         base["webui"] = {**_new_state()["webui"], **data.get("webui", {})}
         # 回填自增计数，避免（外部编辑/导入缺 _seq 的旧状态后）新 id 与既有 id 撞号
         base["_seq"] = max([base.get("_seq") or 0]
-                           + [_id_num(n.get("id")) for n in base.get("nodes", [])])
+                           + [_id_num(n.get("id")) for n in base["nodes"]])
         base["_subseq"] = max([base.get("_subseq") or 0]
-                              + [_id_num(s.get("id")) for s in base.get("subscriptions", [])])
-        # active 指向已不存在的节点时（外部编辑/导入）回落到第一个，避免悬空 active
-        if base.get("active") and not any(n.get("id") == base["active"] for n in base.get("nodes", [])):
-            base["active"] = base["nodes"][0]["id"] if base.get("nodes") else ""
+                              + [_id_num(s.get("id")) for s in base["subscriptions"]])
+        # 给缺/非法 id 的节点补发稳定 id（推进 _seq），避免 get/update/delete 按 id 失配
+        for n in base["nodes"]:
+            if not n.get("id"):
+                n["id"] = self._next_id_on(base)
+        # active 指向已不存在的节点时（外部编辑/导入）回落到第一个有效 id，避免悬空 active
+        ids = {n["id"] for n in base["nodes"]}
+        if base.get("active") not in ids:
+            base["active"] = next((n["id"] for n in base["nodes"]), "")
         return base
+
+    @staticmethod
+    def _next_id_on(state: dict) -> str:
+        state["_seq"] = state.get("_seq", 0) + 1
+        return f"n{state['_seq']}"
 
     # ---------------------------------------------------------------- 节点
     def _next_id(self) -> str:

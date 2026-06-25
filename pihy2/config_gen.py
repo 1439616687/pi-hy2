@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
 
 # 默认设置（store 会以此为模板）
@@ -155,10 +156,12 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
     mb = re.match(r"^\[([0-9A-Fa-f:]+)\](/\d+)?$", value)
     if mb:
         value = mb.group(1) + (mb.group(2) or "")
-    # 去掉 IPv6 zone-id（如 fe80::1%eth0）：mihomo/Go 的 ParseCIDR 不接受 %zone，
-    # 否则会生成 mihomo -t 直接拒绝的 IP-CIDR 规则。
+    # 去掉 IPv6 zone-id（如 fe80::1%eth0）：mihomo/Go 的 ParseCIDR 不接受 %zone。
+    # 仅当“去 zone 后确为合法 IP/CIDR”时才采用，避免误伤恰好含 '%' 的域名/关键词规则。
     if "%" in value:
-        value = re.sub(r"%[^/]+", "", value)
+        stripped = re.sub(r"%[^/]+", "", value)
+        if _is_ip_or_cidr(stripped) is not None:
+            value = stripped
 
     explicit = {
         "domain": "DOMAIN",
@@ -220,11 +223,13 @@ def rule_to_mihomo(rule: dict) -> str:
 
 # ---------------------------------------------------------------- 节点 -> proxy
 def _safe_int(v, default: int) -> int:
-    """宽松转 int，容忍 "443"/"1.0"/None/非法值，避免脏字段让整份配置生成崩掉。"""
+    """宽松转 int，容忍 "443"/"1.0"/None/非法值，避免脏字段让整份配置生成崩掉。
+    'inf'/'1e400' 这类 float() 成功但 int() 抛 OverflowError、以及 nan，一并回落默认。"""
     try:
-        return int(float(v))
+        f = float(v)
     except (TypeError, ValueError):
         return default
+    return int(f) if math.isfinite(f) else default
 
 
 def _port(node: dict) -> int:
@@ -286,7 +291,8 @@ def _proxy_vless(node: dict, settings: dict) -> dict:
         "uuid": str(node.get("uuid", "")), "udp": True,
         "tls": bool(node.get("tls", False)),
     }
-    if node.get("flow"):
+    # flow（xtls-rprx-vision 等）只在裸 TCP/REALITY 下有效；与 ws/grpc/httpupgrade 同时下发会被 mihomo 拒绝
+    if node.get("flow") and node.get("network") in (None, "", "tcp"):
         p["flow"] = node["flow"]
     if node.get("sni"):
         p["servername"] = node["sni"]
@@ -424,8 +430,11 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
     s = {**DEFAULT_SETTINGS, **(settings or {})}
     nodes = _dedup_names([n for n in (nodes or []) if n.get("server")])
 
+    mixed_port = _safe_int(s.get("mixed_port"), 7890)   # 脏值（字符串/越界）回落，避免 YAML 里出现非法端口
+    if not 1 <= mixed_port <= 65535:
+        mixed_port = 7890
     cfg: dict = {
-        "mixed-port": s["mixed_port"],
+        "mixed-port": mixed_port,
         # 网关模式或显式 allow_lan 时，混合代理端口/DNS 对局域网开放
         "allow-lan": bool(s.get("allow_lan") or s.get("gateway_mode")),
         "mode": "rule",

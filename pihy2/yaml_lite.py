@@ -321,12 +321,12 @@ class _Reader:
                     key_col = ind + (len(text) - len(rest))
                     kk0 = _unquote(k)
                     if v == "":
-                        # 首键无行内值：可能后接缩进子块。_inline_nested 在消费子块时
-                        # 会自行推进 self.i，故仅在它未推进时才补一次自增（修复吞行 bug）。
-                        before = self.i
-                        self._assign(item, kk0, self._inline_nested(key_col))
-                        if self.i == before:
-                            self.i += 1
+                        # 首键无行内值：可能后接更深缩进子块，或与 key 同列的块状序列（零缩进列表）。
+                        # 复用 _child_block_indent，与 _consume_value 保持一致——避免漏判同列序列（否则
+                        # 整条订阅可能解析失败），也避免吞行。
+                        self.i += 1
+                        cind = self._child_block_indent(key_col)
+                        self._assign(item, kk0, self._block(cind) if cind is not None else None)
                     elif _BLOCK_SCALAR_RE.match(v):
                         self.i += 1
                         self._assign(item, kk0, self._block_scalar(key_col))
@@ -341,13 +341,6 @@ class _Reader:
                         self._consume_value(item, kk, vv, key_col)
                     items.append(item)
         return items
-
-    def _inline_nested(self, key_col: int):
-        # `- key:` 后面跟缩进子块（少见），返回该子块并把 self.i 停在子块之后
-        if self.i + 1 < len(self.lines) and self.lines[self.i + 1][0] > key_col:
-            self.i += 1
-            return self._block(self.lines[self.i][0])
-        return None
 
 
 def load(text: str):
