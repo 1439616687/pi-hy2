@@ -47,7 +47,7 @@ def cmd_status(args):
     print(f"节点数   : {len(store.data['nodes'])}  当前: "
           f"{(store.active_node() or {}).get('name', '无')}")
     if args.ip:
-        print(f"出口 IP  : {manager.current_ip()}")
+        print(f"出口 IP  : {manager.current_ip(timeout=6, retries=2)}")  # 限定重试/超时，避免出口失败时阻塞太久
     print("\n最近日志：")
     print(manager.journal("mihomo", 15))
 

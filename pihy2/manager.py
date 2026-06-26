@@ -373,7 +373,7 @@ def install_services(log=print) -> None:
     # 卸载时只删 pihy2 自己写的那份并恢复此备份。pihy2 的单元含 "Description=mihomo (pihy2)" 标记。
     if os.path.exists(MIHOMO_SERVICE):
         try:
-            existing = open(MIHOMO_SERVICE).read()
+            existing = open(MIHOMO_SERVICE, encoding="utf-8", errors="ignore").read()
             bak = MIHOMO_SERVICE + ".pihy2-bak"
             if "pihy2" not in existing and not os.path.exists(bak):
                 shutil.copy2(MIHOMO_SERVICE, bak)
@@ -895,20 +895,28 @@ def uninstall(purge: bool = False, log=print) -> None:
         # mihomo.service 只删 pihy2 自己写的那份；非 pihy2（用户/发行版自带）保留不动（CONFLICT-2）
         if path == MIHOMO_SERVICE:
             try:
-                is_ours = "pihy2" in open(path).read()
+                is_ours = "pihy2" in open(path, encoding="utf-8", errors="ignore").read()
             except OSError:
                 is_ours = True
             if not is_ours:
                 log("检测到 mihomo.service 非 pihy2 所写，保留不动。")
                 continue
         os.remove(path)
-        bak = path + ".pihy2-bak"            # 若曾备份用户原版单元则恢复
+        bak = path + ".pihy2-bak"
         if os.path.exists(bak):
-            try:
-                os.replace(bak, path)
-                log(f"已恢复原有服务：{path}")
-            except OSError:
-                pass
+            if purge:
+                # purge=彻底删除：不恢复用户原版单元——其 ExecStart 指向的二进制/配置随后会被删，
+                # 恢复只会留下一个断链的 failed 单元；直接删掉备份。
+                try:
+                    os.remove(bak)
+                except OSError:
+                    pass
+            else:
+                try:                         # 非 purge：恢复用户原版单元
+                    os.replace(bak, path)
+                    log(f"已恢复原有服务：{path}")
+                except OSError:
+                    pass
     # 非 purge：恢复被 pihy2 接管前备份的 config.yaml（否则用户手管配置卸载后仍是 pihy2 生成的）
     cfg_bak = MIHOMO_CONFIG + ".pihy2-bak"
     if not purge and os.path.exists(cfg_bak):

@@ -383,14 +383,19 @@ function isIPv6(v) {
     if (s.includes('.')) { if (i !== segs.length - 1 || !isIPv4(s)) return false; }
     else if (!/^[0-9a-fA-F]{1,4}$/.test(s)) return false;
   }
-  const groups = h.split(':').filter(x => x !== '');
-  return h.includes('::') ? groups.length <= 7 : (h.split(':').length === 8 && groups.length === 8);
+  // 嵌入式 IPv4 段计 2 个 hextet：完整形式 0:0:0:0:0:ffff:1.2.3.4 共 8 个 hextet（与服务端 ipaddress 一致，
+  // 不再因无 '::' 的内嵌 IPv4 形式被前端误判为非法）
+  const hextets = segs.reduce((n, s) => n + (s === '' ? 0 : (s.includes('.') ? 2 : 1)), 0);
+  return h.includes('::') ? hextets <= 7 : hextets === 8;
 }
 function classifyRule(value, rtype) {
   value = (value || '').trim(); rtype = (rtype || 'auto').toLowerCase();
   const mb = value.match(/^\[([0-9a-fA-F:]+)\](\/\d+)?$/);   // 先剥 [..] IPv6 字面量（与服务端一致）
   if (mb) value = mb[1] + (mb[2] || '');
-  value = value.replace(/%[^/]+/, '');                       // 去 IPv6 zone-id（%eth0），与服务端一致
+  if (value.includes('%')) {                                 // 去 IPv6 zone-id（%eth0）——仅当剥后确为 IP 才剥，
+    const z = value.replace(/%[^/]+/, '');                   // 与服务端 classify_rule 一致，避免误伤含 '%' 的域名/关键词
+    if (isIPv4(z) || isIPv6(z)) value = z;
+  }
   const map = { domain: 'DOMAIN', 'domain-suffix': 'DOMAIN-SUFFIX', suffix: 'DOMAIN-SUFFIX', 'domain-keyword': 'DOMAIN-KEYWORD', keyword: 'DOMAIN-KEYWORD', 'domain-wildcard': 'DOMAIN-WILDCARD', wildcard: 'DOMAIN-WILDCARD', 'ip-cidr': 'IP-CIDR', ip: 'IP-CIDR', geoip: 'GEOIP', geosite: 'GEOSITE', 'process-name': 'PROCESS-NAME' };
   if (rtype !== 'auto' && map[rtype]) {       // 已知显式类型
     let kind = map[rtype];

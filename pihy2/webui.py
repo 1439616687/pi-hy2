@@ -68,6 +68,9 @@ def _valid_dns(entry) -> bool:
     low = e.lower()
     if low in ("system", "dhcp") or low.startswith(_DNS_URL_SCHEMES):
         return True
+    e = e.split("#", 1)[0].strip()                    # mihomo 允许 IP 带 #接口/#策略 后缀（如 223.5.5.5#en0），剥掉再校验
+    if not e:
+        return False
     try:
         if e.startswith("[") and "]" in e:           # [IPv6] 或 [IPv6]:port
             ipaddress.ip_address(e[1:e.index("]")])
@@ -513,6 +516,18 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed(store):
             return self._err("未登录", 401)
         body = self._body()
+        # SEC-7 镜像主机公网校验涉及 DNS 解析（getaddrinfo 可能阻塞），放在拿 _lock/state_lock 之前做，
+        # 避免持锁做慢 IO 冻结其它面板写操作（与本文件“慢 IO 一律放锁外”的约定一致）。
+        if path == "/api/settings":
+            _bs = body.get("settings")
+            _mir = str((_bs.get("github_mirror") if isinstance(_bs, dict) else "") or "").strip()
+            if _mir:
+                if not _mir.lower().startswith("https://"):
+                    return self._err("下载镜像必须以 https:// 开头")
+                try:
+                    manager._resolve_public(urllib.parse.urlparse(_mir).hostname or "")
+                except Exception:
+                    return self._err("下载镜像主机不能指向内网/本机地址")
         timer_hours = None
         settings_saved = False
         with _lock, state_lock():
@@ -545,16 +560,7 @@ class Handler(BaseHTTPRequestHandler):
                             ec if ec.startswith("http") else "http://" + ec).hostname or ""
                         if host not in ("127.0.0.1", "::1", "localhost"):
                             return self._err("外部控制器必须是本机回环地址（127.0.0.1）")
-                # 下载镜像必须 https，且主机不得指向内网/本机（SEC-7：保存即校验，与安装时 _apply_mirror 同口径，
-                # 避免坏镜像被持久化、到安装才在远处报错）
-                mir = settings.get("github_mirror", "")
-                if mir:
-                    if not mir.lower().startswith("https://"):
-                        return self._err("下载镜像必须以 https:// 开头")
-                    try:
-                        manager._resolve_public(urllib.parse.urlparse(mir).hostname or "")
-                    except Exception:
-                        return self._err("下载镜像主机不能指向内网/本机地址")
+                # 下载镜像的 https + 公网主机校验已在锁外预校验（见本方法开头，避免持锁做 DNS 慢 IO）
                 # DNS 服务器内容校验：仅过滤了 list 类型还不够——坏条目（如随手打的中文/非地址）会被原样
                 # 渲染进 config.yaml 让 mihomo -t 失败、且被持久化后每次 apply（含定时器）都卡住（ROBUST-4）
                 for _dk in ("dns_nameservers", "dns_china"):

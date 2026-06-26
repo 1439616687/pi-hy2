@@ -842,6 +842,39 @@ check("ROBUST-4 _valid_dns",
       _w5._valid_dns("1.1.1.1") and _w5._valid_dns("https://1.1.1.1/dns-query")
       and not _w5._valid_dns("乱填") and not _w5._valid_dns(""))
 
+# 复核回归修正（对第五轮修复自身引入的回归再修）：
+# _valid_dns 接受 mihomo 的 IP#接口/#策略 形式
+check("复核 _valid_dns 接受 IP#flag",
+      _w5._valid_dns("223.5.5.5#en0") and _w5._valid_dns("1.1.1.1#dns0") and not _w5._valid_dns("乱填#x"))
+# uninstall --purge 不恢复用户原版 mihomo.service（恢复只会留下指向已删二进制的断链单元）
+_ud = tempfile.mkdtemp()
+_usvc = os.path.join(_ud, "mihomo.service"); _ubak = _usvc + ".pihy2-bak"
+open(_usvc, "w").write("[Service]\nDescription=mihomo (pihy2)\n")
+open(_ubak, "w").write("ORIGINAL\n")
+_usaved = {k: getattr(_m5, k) for k in ("MIHOMO_SERVICE", "WEBUI_SERVICE", "SUB_SERVICE", "SUB_TIMER",
+                                        "MIHOMO_CONFIG", "TUN_MODULE_CONF", "MIHOMO_BIN", "INSTALL_DIR",
+                                        "run", "service_action", "set_ip_forward")}
+_ssaved = _s5.STATE_DIR
+try:
+    _m5.MIHOMO_SERVICE = _usvc
+    _m5.WEBUI_SERVICE = os.path.join(_ud, "w"); _m5.SUB_SERVICE = os.path.join(_ud, "s")
+    _m5.SUB_TIMER = os.path.join(_ud, "t"); _m5.MIHOMO_CONFIG = os.path.join(_ud, "config.yaml")
+    _m5.TUN_MODULE_CONF = os.path.join(_ud, "tun.conf"); _m5.MIHOMO_BIN = os.path.join(_ud, "mihomo")
+    _m5.INSTALL_DIR = os.path.join(_ud, "opt"); _s5.STATE_DIR = os.path.join(_ud, "state")
+    _m5.run = lambda *a, **k: _types2.SimpleNamespace(returncode=0, stdout="", stderr="")
+    _m5.service_action = lambda *a, **k: None
+    _m5.set_ip_forward = lambda *a, **k: None
+    _m5.uninstall(purge=True, log=lambda m: None)
+    check("复核 purge 不恢复用户单元", not os.path.exists(_usvc) and not os.path.exists(_ubak))
+    open(_usvc, "w").write("[Service]\nDescription=mihomo (pihy2)\n"); open(_ubak, "w").write("ORIGINAL\n")
+    _m5.uninstall(purge=False, log=lambda m: None)
+    check("复核 非 purge 恢复用户单元",
+          os.path.exists(_usvc) and open(_usvc).read().strip() == "ORIGINAL")
+finally:
+    for _k, _v in _usaved.items():
+        setattr(_m5, _k, _v)
+    _s5.STATE_DIR = _ssaved
+
 # TEST-6：渲染出的配置必须能被自带 yaml_lite 解析（无 mihomo 二进制时也校验结构，不再只做子串断言）
 _t6n = [{"id": "n1", "name": "JP", "server": "a.com", "port": 443, "type": "hysteria2", "password": "p"},
         {"id": "n2", "name": "JP", "server": "b.com", "port": 443, "type": "vless",
