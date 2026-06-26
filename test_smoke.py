@@ -147,6 +147,39 @@ check("repaired state renders", "rules:" in rt)
 if PYYAML:
     check("repaired render valid YAML", isinstance(PYYAML.safe_load(rt), dict))
 
+# 6. 向导镜像选填：归一 / 校验 / 架构门控（桩掉真实 DNS 与 input，不打网络）
+section("wizard mirror prompt")
+from pihy2 import wizard, manager as _mgr  # noqa: E402
+
+_orig_resolve, _orig_ask = _mgr._resolve_public, wizard.ask
+
+
+def _fake_resolve(host):
+    if host in ("ghproxy.com", "gh.test"):
+        return ["1.2.3.4"]
+    raise ValueError("blocked/internal/unresolvable")
+
+
+def _mirror(seq):
+    _it = iter(seq)
+    wizard.ask = lambda prompt, default="": next(_it)
+    return wizard._ask_mirror("")
+
+
+_mgr._resolve_public = _fake_resolve
+try:
+    check("mirror empty -> direct", _mirror([""]) == "")
+    check("mirror '-' -> direct", _mirror(["-"]) == "")
+    check("mirror bare host -> https", _mirror(["ghproxy.com"]) == "https://ghproxy.com")
+    check("mirror http rejected then accepts https",
+          _mirror(["http://gh.test", "https://gh.test/"]) == "https://gh.test/")
+    check("mirror LAN rejected then direct",
+          _mirror(["https://192.168.5.2:2088/", "-"]) == "")
+    check("arch gate: arm64 supported, armv7 not",
+          "arm64" in _mgr.PINNED_SHA256 and "armv7" not in _mgr.PINNED_SHA256)
+finally:
+    _mgr._resolve_public, wizard.ask = _orig_resolve, _orig_ask
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
