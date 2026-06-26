@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import secrets
 import sys
+import urllib.parse
 
 from . import manager, parser
 from .store import Store, state_lock
@@ -41,6 +42,28 @@ def ask_yn(prompt: str, default: bool = True) -> bool:
     if not val:
         return default
     return val in ("y", "yes", "是", "1")
+
+
+def _ask_mirror(default: str = "") -> str:
+    """选填 mihomo 下载镜像：留空（或回车保持已有默认）=直连，``-`` =强制直连。
+
+    就地把取值规整为 ``https://`` 前缀，并拒绝 http 与内网/本机地址（与 manager 的 SSRF 校验
+    同口径——manager 在真正下载时还会再校验一次）。非法即重填，绝不因一次手误中断整个向导。
+    """
+    while True:
+        val = ask("下载镜像（留空=直连 GitHub）", default).strip()
+        if val in ("", "-"):
+            return ""
+        url = val if "://" in val else "https://" + val
+        if not url.lower().startswith("https://"):
+            _p(f"{C_WARN}  镜像必须以 https:// 开头，请重填或留空直连。{C_END}")
+            continue
+        try:
+            manager._resolve_public(urllib.parse.urlparse(url).hostname or "")
+        except Exception:
+            _p(f"{C_WARN}  镜像主机无法解析或指向内网/本机，请换公网镜像或留空直连。{C_END}")
+            continue
+        return url
 
 
 def read_links() -> str:
@@ -194,14 +217,38 @@ def _run_wizard():
         if not ask_yn("仍要继续吗？", False):
             _p("已中止。请确认内核 tun 模块可用后重试。")
             sys.exit(1)
-    _p("· 安装 mihomo（首次直连 GitHub，可能较慢，请耐心等待）")
-    try:
-        manager.install_mihomo(mirror=store.data["settings"].get("github_mirror", ""),
-                               log=lambda m: _p("  " + m))
-    except Exception as e:
-        _p(f"{C_ERR}  mihomo 安装失败：{e}{C_END}")
-        _p("  可手动下载二进制放到 /usr/local/bin/mihomo 后重跑：python3 -m pihy2 install")
-        sys.exit(1)
+    _p("· 安装 mihomo")
+    arch = manager.detect_arch()
+    # 镜像仅对内置 SHA-256 的架构（arm64/amd64）安全可用；其它架构 install_mihomo 会直接拒绝镜像，
+    # 故只在受支持的架构上提供镜像选项，避免在 32 位树莓派上填了镜像却必然安装失败（兼容性关键点）。
+    mirror_ok = arch in manager.PINNED_SHA256
+    mirror = store.data["settings"].get("github_mirror", "")
+    if mirror_ok:
+        _p(f"{C_DIM}  直连 GitHub 慢/被墙时可填下载镜像（公网 https 前缀，如 https://ghproxy.com/）；{C_END}")
+        _p(f"{C_DIM}  留空=直连。镜像会强制固定版本并校验 SHA-256，且不支持局域网地址。{C_END}")
+        mirror = _ask_mirror(mirror)
+    else:
+        if mirror:
+            _p(f"{C_WARN}  当前架构 {arch} 未内置校验和，下载镜像不可用，改为直连 GitHub。{C_END}")
+        mirror = ""
+        _p(f"{C_DIM}  架构 {arch}：镜像需 arm64/amd64；本架构直连 GitHub"
+           f"（慢/失败可手动放二进制到 /usr/local/bin/mihomo 后重跑）。{C_END}")
+    store.data["settings"]["github_mirror"] = mirror
+
+    while True:                                  # 失败可换镜像/改直连后重试，不丢前面几步的输入
+        try:
+            manager.install_mihomo(mirror=mirror, log=lambda m: _p("  " + m))
+            break
+        except Exception as e:
+            _p(f"{C_ERR}  mihomo 安装失败：{e}{C_END}")
+            if mirror_ok and ask_yn("换个镜像或留空直连后重试吗？（否=放弃）", True):
+                mirror = _ask_mirror(mirror)
+                store.data["settings"]["github_mirror"] = mirror
+                continue
+            _p("  也可手动下载二进制放到 /usr/local/bin/mihomo 后重跑：python3 -m pihy2 install")
+            sys.exit(1)
+    with state_lock():                           # 持久化最终镜像选择（WebUI 设置页也读它做后续下载）
+        store.save()
 
     _p("· 生成并校验配置")
     ok, msg = manager.apply_config(store, restart=False, log=lambda m: _p("  " + m))
