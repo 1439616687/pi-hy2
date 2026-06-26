@@ -102,6 +102,9 @@ _MIME = {
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "pihy2"
+    # 单连接读写超时：ThreadingHTTPServer 每个连接占一个线程且不设上限，无超时则一个只连不发的
+    # 客户端（slowloris/半开连接）会把线程永久占住、最终耗尽内存/线程。设 30s 让空闲连接被丢弃。
+    timeout = 30
 
     def log_message(self, *a):  # 静默默认访问日志
         pass
@@ -112,6 +115,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # 安全响应头（纵深防御）：禁止被 iframe 嵌套（防点击劫持）、禁止 MIME 嗅探、不外泄 Referer；
+        # CSP 收敛到同源——脚本/样式因面板用内联 onclick 与 style 属性需 'unsafe-inline'（esc() 已防注入）。
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                         "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                         "frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -353,12 +366,9 @@ class Handler(BaseHTTPRequestHandler):
                                "count": len(conns), "conns": brief})
         if path == "/api/logs":
             return self._json({"ok": True, "logs": manager.journal("mihomo", 60)})
-        if path == "/api/config":  # 预览当前会生成的配置（隐去 clash 密钥）
-            cfg = store.render_config()
-            sec = store.data["settings"].get("secret")
-            if sec:
-                cfg = cfg.replace(sec, "******")
-            return self._json({"ok": True, "config": cfg})
+        if path == "/api/config":  # 预览当前会生成的配置（隐去节点密码/UUID/混淆密码与 clash 密钥）
+            return self._json({"ok": True,
+                               "config": config_gen.redact_secrets(store.render_config())})
         if path == "/api/export":  # 导出所有节点链接（逐个兜底，单条坏数据不拖垮整次导出）
             links = []
             for n in store.data["nodes"]:

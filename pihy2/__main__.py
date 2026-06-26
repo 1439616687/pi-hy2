@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, manager
+from . import __version__, manager, config_gen
 from .store import Store, state_lock
 
 
@@ -60,10 +60,10 @@ def cmd_service(args):
 def cmd_config(args):
     store = Store()
     cfg = store.render_config()
-    sec = store.data["settings"].get("secret")
-    # 默认脱敏 clash 密钥（与 WebUI 的 /api/config 一致），避免 `pihy2 config | tee` 等泄露到日志/滚屏（SEC-8）
-    if sec and not getattr(args, "with_secrets", False):
-        cfg = cfg.replace(sec, "******")
+    # 默认脱敏节点密码/UUID/混淆密码与 clash 密钥（与 WebUI 的 /api/config 一致），
+    # 避免 `pihy2 config | tee` 等把凭据泄露到日志/滚屏。--with-secrets 显示全部明文。
+    if not getattr(args, "with_secrets", False):
+        cfg = config_gen.redact_secrets(cfg)
     print(cfg)
 
 
@@ -190,7 +190,7 @@ def build_parser():
         sp.set_defaults(func=cmd_service, action=act)
 
     cfgp = sub.add_parser("config", help="打印将生成的配置")
-    cfgp.add_argument("--with-secrets", action="store_true", help="不脱敏（显示 clash 密钥明文）")
+    cfgp.add_argument("--with-secrets", action="store_true", help="不脱敏（显示节点密码与 clash 密钥明文）")
     cfgp.set_defaults(func=cmd_config)
 
     ad = sub.add_parser("add", help="从链接添加节点")
