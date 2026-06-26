@@ -115,21 +115,11 @@ pihy2/
   webui.py            WebUI 服务 + REST API
   __main__.py         命令行入口（python3 -m pihy2）
 web/                  WebUI 前端（原生 HTML/CSS/JS，无框架）
-tests/test_basic.py   解析/规则/配置生成 + mihomo -t 校验测试
 docs/手动配置指南.md   原始逐步手动配置指南（原理参考）
 ```
 
 运行期文件：mihomo 在 `/usr/local/bin/mihomo`，配置在 `/etc/mihomo/config.yaml`，
 pihy2 状态在 `/etc/pihy2/state.json`（所有节点/规则/设置的唯一来源，配置由它生成）。
-
----
-
-## 🧪 测试
-
-```bash
-python3 tests/test_basic.py                 # 解析与配置生成逻辑
-MIHOMO=/path/to/mihomo python3 tests/test_basic.py   # 额外用真实二进制做 mihomo -t 校验
-```
 
 ---
 
