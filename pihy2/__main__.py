@@ -58,7 +58,13 @@ def cmd_service(args):
 
 
 def cmd_config(args):
-    print(Store().render_config())
+    store = Store()
+    cfg = store.render_config()
+    sec = store.data["settings"].get("secret")
+    # 默认脱敏 clash 密钥（与 WebUI 的 /api/config 一致），避免 `pihy2 config | tee` 等泄露到日志/滚屏（SEC-8）
+    if sec and not getattr(args, "with_secrets", False):
+        cfg = cfg.replace(sec, "******")
+    print(cfg)
 
 
 def cmd_add(args):
@@ -79,6 +85,8 @@ def cmd_add(args):
         if args.apply:
             ok, msg = manager.apply_config(store)
             print(msg)
+            if not ok:                       # 应用失败要反映到退出码，便于脚本/CI 感知（CLI-3）
+                sys.exit(1)
 
 
 def cmd_uninstall(args):
@@ -100,8 +108,10 @@ def cmd_sub(args):
     _cmd_sub_mutate(args, action)
 
 
-def _apply_outside_lock():
-    print(manager.apply_config(Store())[1])
+def _apply_outside_lock() -> bool:
+    ok, msg = manager.apply_config(Store())
+    print(msg)
+    return ok
 
 
 def _cmd_sub_mutate(args, action):
@@ -115,8 +125,8 @@ def _cmd_sub_mutate(args, action):
         for e in errs[:3]:
             print("  " + e)
         print(f"已添加订阅 {sub['id']}（{cnt} 个节点）")
-        if args.apply:
-            _apply_outside_lock()
+        if args.apply and not _apply_outside_lock():
+            sys.exit(1)                      # 应用失败反映到退出码（CLI-3）
         return
     if action == "update":
         target = args.id or "all"
@@ -138,8 +148,8 @@ def _cmd_sub_mutate(args, action):
             print(f"已更新 {len(targets)} 个订阅，共 {total} 个节点")
         else:
             print(f"已更新 {total} 个节点" if targets else "订阅不存在")
-        if args.apply:
-            _apply_outside_lock()
+        if args.apply and not _apply_outside_lock():
+            sys.exit(1)                      # 应用失败反映到退出码（CLI-3）
         return
     if action == "del":
         with state_lock():
@@ -147,8 +157,8 @@ def _cmd_sub_mutate(args, action):
             ok = store.delete_subscription(args.id, remove_nodes=not args.keep_nodes)
             store.save()
         print("已删除" if ok else "订阅不存在")
-        if ok and args.apply:
-            _apply_outside_lock()
+        if ok and args.apply and not _apply_outside_lock():
+            sys.exit(1)                      # 应用失败反映到退出码（CLI-3）
 
 
 def cmd_version(args):
@@ -179,7 +189,9 @@ def build_parser():
         sp = sub.add_parser(act, help=f"{act} mihomo 服务")
         sp.set_defaults(func=cmd_service, action=act)
 
-    sub.add_parser("config", help="打印将生成的配置").set_defaults(func=cmd_config)
+    cfgp = sub.add_parser("config", help="打印将生成的配置")
+    cfgp.add_argument("--with-secrets", action="store_true", help="不脱敏（显示 clash 密钥明文）")
+    cfgp.set_defaults(func=cmd_config)
 
     ad = sub.add_parser("add", help="从链接添加节点")
     ad.add_argument("link", nargs="?", help="hy2 链接（省略则从标准输入读取）")

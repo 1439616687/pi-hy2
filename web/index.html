@@ -32,6 +32,9 @@
     </div>
   </header>
 
+  <!-- 主机冲突告警（DNS 抢占 / 既有 VPN），由 /api/status 下发 -->
+  <div id="warn-banner" class="warn-banner hidden"></div>
+
   <!-- 标签页 -->
   <nav class="tabs">
     <button class="tab active" data-tab="nodes" onclick="switchTab('nodes')">节点</button>
@@ -161,6 +164,9 @@
             <textarea id="set-dns" rows="3"></textarea></label>
           <label>国内 DNS（解析节点域名用，每行一个）
             <textarea id="set-dnscn" rows="2"></textarea></label>
+          <label>TUN DNS 劫持目标（每行一个，如 <code>any:53</code>；<b>清空=不劫持</b>，与本机 Pi-hole/dnsmasq 共存）
+            <textarea id="set-hijack" rows="2" placeholder="any:53"></textarea></label>
+          <label class="row"><input id="set-autoredirect" type="checkbox"> 启用 nftables auto-redirect（与 Docker/firewalld 冲突或无 nft 时关掉）</label>
         </fieldset>
         <fieldset>
           <legend>高级</legend>

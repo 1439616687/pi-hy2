@@ -55,9 +55,34 @@ def _valid_bind(v):
         return None
 
 
+_DNS_URL_SCHEMES = ("https://", "tls://", "quic://", "h3://", "udp://", "tcp://",
+                    "dhcp://", "system://", "rcode://")
+
+
+def _valid_dns(entry) -> bool:
+    """校验单个 DNS nameserver：IP / IP:port / [IPv6] / DoH·DoT·DoQ 等 URL / system / dhcp。
+    用于把随手打错的 DNS 条目挡在写入前，避免坏值渲染进 config.yaml 后卡住每次 apply。"""
+    e = str(entry).strip()
+    if not e:
+        return False
+    low = e.lower()
+    if low in ("system", "dhcp") or low.startswith(_DNS_URL_SCHEMES):
+        return True
+    try:
+        if e.startswith("[") and "]" in e:           # [IPv6] 或 [IPv6]:port
+            ipaddress.ip_address(e[1:e.index("]")])
+            return True
+        if e.count(":") == 1:                          # IPv4:port
+            e = e.rsplit(":", 1)[0]
+        ipaddress.ip_address(e)                        # 纯 IPv4 / 纯 IPv6
+        return True
+    except ValueError:
+        return False
+
+
 def _sweep_locked():
     """清理过期 token 与陈旧的登录失败计数，防字典无界增长（调用方须持有 _lock）。"""
-    now = time.time()
+    now = time.monotonic()
     for t in [k for k, exp in _tokens.items() if exp < now]:
         _tokens.pop(t, None)
     for ip in [k for k, v in _login_fails.items() if now - v[1] > LOGIN_LOCK_SECS]:
@@ -126,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
             exp = _tokens.get(token)
             if exp is None:
                 return False
-            if exp < time.time():       # 过期则清除
+            if exp < time.monotonic():       # 过期则清除
                 _tokens.pop(token, None)
                 return False
         return True
@@ -141,6 +166,18 @@ class Handler(BaseHTTPRequestHandler):
             return h[1:h.index("]")] if "]" in h else h
         return h.rsplit(":", 1)[0] if ":" in h else h
 
+    def _host_port(self):
+        """从 Host 头取端口（无端口返回 None）。"""
+        h = (self.headers.get("Host", "") or "").strip()
+        if h.startswith("["):                       # [ipv6]:port
+            rest = h[h.index("]") + 1:] if "]" in h else ""
+            p = rest[1:] if rest.startswith(":") else ""
+        elif ":" in h:
+            p = h.rsplit(":", 1)[1]
+        else:
+            p = ""
+        return int(p) if p.isdigit() else None
+
     def _guard_write(self, store: Store) -> bool:
         """状态变更请求的防护：
 
@@ -154,9 +191,21 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin") or self.headers.get("Referer")
         if origin:
             # urlparse 把 Origin 主机名小写化，而 Host 原样；统一小写比较，避免误伤 MyPi.local 这类大小写
-            oh = urllib.parse.urlparse(origin).hostname or ""
+            pu = urllib.parse.urlparse(origin)
+            oh = pu.hostname or ""
             if oh and oh.lower() != host.lower():
                 self._err("拒绝：跨站请求", 403)
+                return False
+            # SEC-3：同主机不同端口也是不同源；两边都显式给出端口时比较端口（默认端口歧义不强求）
+            hp = self._host_port()
+            if oh and pu.port is not None and hp is not None and pu.port != hp:
+                self._err("拒绝：跨站请求（端口不同源）", 403)
+                return False
+        else:
+            # SEC-4：无 Origin/Referer 的请求要求自定义头 X-Requested-With——浏览器跨站无法在不触发预检的
+            # 情况下携带它，作为 token/host 校验之外的纵深防御（面板自身 fetch 都会带上，不误伤 *.local）。
+            if self.headers.get("X-Requested-With", "") != "pihy2":
+                self._err("拒绝：缺少 X-Requested-With（疑似跨站请求）", 403)
                 return False
         if not store.data["webui"].get("password"):
             host_ok = host == "localhost"
@@ -172,32 +221,40 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     # ----------------------------------------------------------- 路由
+    def _safe(self, fn, *a):
+        """统一兜底：处理器里的任何意外异常都回成 {ok:false,error} 的 500 JSON，
+        而不是裸 500（前端拿不到 error 字段）。锁用 with 管理，异常时已正常释放，无死锁风险（ROBUST-2）。"""
+        try:
+            return fn(*a)
+        except Exception as e:
+            return self._err(f"服务器内部错误：{e}", 500)
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/"):
-            return self._api_get(path)
-        return self._static(path)
+            return self._safe(self._api_get, path)
+        return self._safe(self._static, path)
 
     def do_POST(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
         if not self._guard_write(self._store()):
             return
-        return self._api_post(self.path.split("?", 1)[0])
+        return self._safe(self._api_post, self.path.split("?", 1)[0])
 
     def do_PUT(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
         if not self._guard_write(self._store()):
             return
-        return self._api_put(self.path.split("?", 1)[0])
+        return self._safe(self._api_put, self.path.split("?", 1)[0])
 
     def do_DELETE(self):
         if not self.path.startswith("/api/"):
             return self._err("not found", 404)
         if not self._guard_write(self._store()):
             return
-        return self._api_delete(self.path.split("?", 1)[0])
+        return self._safe(self._api_delete, self.path.split("?", 1)[0])
 
     # ----------------------------------------------------------- 静态文件
     def _static(self, path: str):
@@ -243,12 +300,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed(store):
             return self._err("未登录", 401)
         if path == "/api/status":
+            mihomo_st = manager.service_status("mihomo")
+            installed = os.path.exists(manager.MIHOMO_BIN)
+            # 仅在 mihomo 确实在运行时才探测出口 IP：否则这条 urllib 请求会白白阻塞到超时，
+            # 而排错时面板恰恰最该秒开（ROBUST-11）。运行时也限定重试/超时，避免冷启动拖太久。
+            ip = (manager.current_ip(timeout=5, retries=2)
+                  if installed and mihomo_st.get("active") == "active" else "")
             return self._json({
                 "ok": True,
-                "mihomo": manager.service_status("mihomo"),
+                "mihomo": mihomo_st,
                 "webui": manager.service_status("pihy2-web"),
-                "ip": manager.current_ip(),
-                "installed": os.path.exists(manager.MIHOMO_BIN),
+                "ip": ip,
+                "installed": installed,
+                # 把 DNS/VPN 冲突告警带回面板：定时器静默 apply 时检测到的冲突也能被看到（CONFLICT-5）
+                "warnings": manager.host_conflict_warnings(store.data["settings"]),
             })
         if path == "/api/delays":
             s = store.data["settings"]
@@ -316,14 +381,15 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 _sweep_locked()                 # 顺手清理过期 token / 陈旧失败计数
                 fails = _login_fails.get(ip, [0, 0.0])
-                if fails[0] >= LOGIN_MAX_FAILS and time.time() - fails[1] < LOGIN_LOCK_SECS:
+                if fails[0] >= LOGIN_MAX_FAILS and time.monotonic() - fails[1] < LOGIN_LOCK_SECS:
                     locked = True
-                elif pw and secrets.compare_digest(str(body.get("password", "")), pw):
+                elif pw and secrets.compare_digest(
+                        str(body.get("password", "")).encode("utf-8"), str(pw).encode("utf-8")):
                     token = secrets.token_urlsafe(24)
-                    _tokens[token] = time.time() + TOKEN_TTL
+                    _tokens[token] = time.monotonic() + TOKEN_TTL
                     _login_fails.pop(ip, None)
                 else:
-                    _login_fails[ip] = [fails[0] + 1, time.time()]
+                    _login_fails[ip] = [fails[0] + 1, time.monotonic()]
             if locked:
                 return self._err("尝试过于频繁，请稍后再试", 429)
             if token:
@@ -400,9 +466,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err("订阅地址需以 http(s):// 开头")
             with _lock, state_lock():            # 1) 锁内：登记订阅 + 存盘
                 store = self._store()
+                if any((s.get("url") or "").strip() == url        # ROBUST-10：同 URL 不重复登记
+                       for s in store.data.get("subscriptions", [])):
+                    return self._err("该订阅地址已存在，请勿重复添加")
                 sub = store.add_subscription(body.get("name", ""), url)
                 sid = sub["id"]
+                interval = store.data.get("sub_interval_hours", 12)
                 store.save()
+            # CLI-2：首个订阅登记后确保定时更新 timer 已装（幂等）——非向导安装路径也能自动更新
+            manager.install_sub_timer(interval)
             nodes, errs = manager.fetch_sub_nodes(url)   # 2) 锁外：拉取（可能很慢）
             cnt = 0
             with _lock, state_lock():            # 3) 锁内：写回该订阅的节点
@@ -458,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if path == "/api/settings":
                 # 仅接受面向用户的已知设置键，显式拒绝 secret 等内部字段被覆盖/注入
-                allowed = set(config_gen.DEFAULT_SETTINGS) | {"github_mirror"}
+                allowed = set(config_gen.DEFAULT_SETTINGS)   # github_mirror 现已并入 DEFAULT_SETTINGS（DC-6）
                 allowed.discard("secret")
                 settings = {k: v for k, v in dict(body.get("settings", {})).items()
                             if k in allowed}
@@ -473,10 +545,24 @@ class Handler(BaseHTTPRequestHandler):
                             ec if ec.startswith("http") else "http://" + ec).hostname or ""
                         if host not in ("127.0.0.1", "::1", "localhost"):
                             return self._err("外部控制器必须是本机回环地址（127.0.0.1）")
-                # 下载镜像必须 https
+                # 下载镜像必须 https，且主机不得指向内网/本机（SEC-7：保存即校验，与安装时 _apply_mirror 同口径，
+                # 避免坏镜像被持久化、到安装才在远处报错）
                 mir = settings.get("github_mirror", "")
-                if mir and not mir.lower().startswith("https://"):
-                    return self._err("下载镜像必须以 https:// 开头")
+                if mir:
+                    if not mir.lower().startswith("https://"):
+                        return self._err("下载镜像必须以 https:// 开头")
+                    try:
+                        manager._resolve_public(urllib.parse.urlparse(mir).hostname or "")
+                    except Exception:
+                        return self._err("下载镜像主机不能指向内网/本机地址")
+                # DNS 服务器内容校验：仅过滤了 list 类型还不够——坏条目（如随手打的中文/非地址）会被原样
+                # 渲染进 config.yaml 让 mihomo -t 失败、且被持久化后每次 apply（含定时器）都卡住（ROBUST-4）
+                for _dk in ("dns_nameservers", "dns_china"):
+                    if _dk in settings and isinstance(settings[_dk], list):
+                        bad = [x for x in settings[_dk] if not _valid_dns(x)]
+                        if bad:
+                            return self._err(f"DNS 服务器格式不正确：{bad[0]}"
+                                             "（需为 IP、IP:端口，或 https/tls/udp 等 DNS URL）")
                 # fake-ip 网段必须是合法 CIDR，否则 mihomo -t 失败且空/坏值被持久化、每次 apply 都卡住
                 if "fake_ip_range" in settings:
                     fr = str(settings["fake_ip_range"]).strip()

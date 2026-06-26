@@ -599,6 +599,270 @@ check("#04 畸形节点过滤+补id+active回落",
 check("#05 非 any:53 不告警", _m2.dns_conflict_warning({"tun_dns_hijack": ["tun0:53"]}) == "")
 
 
+print("== 回归：第五轮（全量修复）==")
+import io as _io  # noqa: E402
+import types as _types2  # noqa: E402
+from pihy2 import store as _s5, manager as _m5, webui as _w5, yaml_lite as _y5  # noqa: E402
+
+# ---- 解析器 ----
+# BUG-5 TUIC skip_cert_verify 往返
+_t5 = parser.parse_link("tuic://uu:pw@u.com:443?insecure=1#U")
+check("BUG-5 TUIC skip 往返不丢", parser.parse_link(parser.node_to_link(_t5)).get("skip_cert_verify") is True)
+# BUG-6 vmess skip_cert_verify 往返
+_vm5 = "vmess://" + _b64.b64encode(_json.dumps({
+    "v": "2", "ps": "V", "add": "v.com", "port": "443",
+    "id": "11111111-1111-1111-1111-111111111111", "net": "ws", "tls": "tls",
+    "skip-cert-verify": "1", "path": "/x"}).encode()).decode()
+check("BUG-6 vmess skip 往返不丢", parser.parse_link(parser.node_to_link(parser.parse_link(_vm5))).get("skip_cert_verify") is True)
+# BUG-7 kcp 等未知传输被拒
+try:
+    parser.parse_link("vmess://" + _b64.b64encode(_json.dumps({
+        "v": "2", "ps": "K", "add": "k.com", "port": "443",
+        "id": "11111111-1111-1111-1111-111111111111", "net": "kcp"}).encode()).decode())
+    check("BUG-7 kcp 被拒", False)
+except parser.ParseError:
+    check("BUG-7 kcp 被拒", True)
+# BUG-11 SS 2022 明文 method + base64 密码（含 ':' 非严格 base64，须回退明文且不被乱码解码）
+_ss5 = parser.parse_link("ss://2022-blake3-aes-256-gcm:cGFzc3dvcmQ=@h.com:8388#X")
+check("BUG-11 SS 2022 明文不被乱码解码",
+      _ss5["cipher"] == "2022-blake3-aes-256-gcm" and _ss5["password"] == "cGFzc3dvcmQ=", str(_ss5))
+# BUG-12 IPv6 server 不二次套括号
+_yn5, _ = parser.parse_clash_yaml("proxies:\n  - {name: x, type: trojan, server: '[2001:db8::1]', port: 443, password: p}")
+check("BUG-12 IPv6 导出不双括号", parser.node_to_link(_yn5[0]).startswith("trojan://p@[2001:db8::1]:443"), parser.node_to_link(_yn5[0]))
+# ROBUST-5 _int 不抛 OverflowError
+check("ROBUST-5 _int(1e999) 回落", parser._int("1e999", 7) == 7 and parser._int("inf", 7) == 7)
+# ROBUST-6 vmess 合法 JSON 非对象 -> ParseError
+try:
+    parser.parse_link("vmess://" + _b64.b64encode(b"[1,2,3]").decode())
+    check("ROBUST-6 vmess 数组 -> ParseError", False)
+except parser.ParseError:
+    check("ROBUST-6 vmess 数组 -> ParseError", True)
+# normalize_node：name=int / alpn=str 被规整
+_nn5 = parser.normalize_node({"name": 2024, "alpn": "h3,h2", "port": "443", "alter_id": "0"})
+check("normalize_node 规整类型", _nn5["name"] == "2024" and _nn5["alpn"] == ["h3", "h2"] and _nn5["port"] == 443)
+
+# ---- config_gen ----
+# BUG-1 退化规则不产出空载行；*.cn 仍是 DOMAIN-SUFFIX（文档化行为）
+check("BUG-1 '*.' 不空载", config_gen.classify_rule("*.")[0] == "DOMAIN-WILDCARD")
+try:
+    config_gen.classify_rule(".")
+    check("BUG-1 '.' 抛错被跳过", False)
+except ValueError:
+    check("BUG-1 '.' 抛错被跳过", True)
+check("BUG-1 '*.cn' 仍 DOMAIN-SUFFIX,cn", config_gen.classify_rule("*.cn") == ("DOMAIN-SUFFIX", "cn"))
+_cfg5 = config_gen.build_config(
+    [{"id": "n1", "name": "A", "server": "s", "port": 443, "type": "hysteria2", "password": "p"}],
+    [{"value": "*.", "policy": "PROXY"}, {"value": "github.com", "policy": "PROXY"}], {})
+check("BUG-1 坏规则不毒化整份配置",
+      not any(",," in r for r in _cfg5["rules"]) and any("github.com" in r for r in _cfg5["rules"]))
+# DC-1 去重编号与传入顺序无关
+_a5 = {"id": "n1", "name": "JP", "server": "a", "port": 443, "type": "hysteria2", "password": "x"}
+_b5 = {"id": "n2", "name": "JP", "server": "b", "port": 443, "type": "hysteria2", "password": "y"}
+check("DC-1 去重编号顺序无关",
+      config_gen.display_names([_a5, _b5]) == config_gen.display_names([_b5, _a5]))
+# BUG-4 清空 hijack -> dns-hijack: []
+check("BUG-4 清空 hijack 即不劫持", config_gen.build_config([], [], {"tun_dns_hijack": []})["tun"]["dns-hijack"] == [])
+# ROBUST-8 枚举夹紧
+_c8 = config_gen.build_config([], [], {"log_level": "verbose", "tun_stack": "wireguard"})
+check("ROBUST-8 枚举夹紧", _c8["log-level"] == "warning" and _c8["tun"]["stack"] == "system")
+# ROBUST-9 外部控制器非回环回落
+_c9 = config_gen.build_config([], [], {"external_controller": "0.0.0.0:9090", "secret": "x"})
+check("ROBUST-9 控制器回落回环", _c9.get("external-controller") == "127.0.0.1:9090")
+# STYLE-2 IPv6 私网固定直连
+check("STYLE-2 ipv6 安全直连",
+      any("fc00::/7" in r for r in config_gen.build_config([], [], {"ipv6": True})["rules"]))
+# DC-3 非 dict 规则不崩
+_dc3 = config_gen.build_config(
+    [{"id": "n1", "name": "A", "server": "s", "port": 443, "type": "hysteria2", "password": "p"}],
+    ["foo", {"value": "github.com", "policy": "PROXY"}], {})
+check("DC-3 非 dict 规则不崩",
+      any(r.startswith("MATCH,") for r in _dc3["rules"]) and any("github.com" in r for r in _dc3["rules"]))
+
+# ---- store ----
+_sp5 = os.path.join(tempfile.mkdtemp(), "state.json")
+# STORE-2/3 非 dict settings/webui 不崩、secret 归一为 str
+open(_sp5, "w").write('{"version":1,"settings":"pwned","webui":["x"],"nodes":[{"id":"n1","name":1,"server":"s"},{"id":"n1","name":"d","server":"s2"}]}')
+_st5 = _s5.Store(_sp5)
+check("STORE-2/3 坏 settings/webui 不崩 + secret 为 str", isinstance(_st5.data["settings"]["secret"], str))
+# DC-7 重复 id 重发
+check("DC-7 重复节点 id 重发", len({n["id"] for n in _st5.data["nodes"]}) == 2)
+# DC-2 name=int 经 add_node 规整
+_st5b = _s5.Store(os.path.join(tempfile.mkdtemp(), "s.json"))
+_st5b.add_node({"name": 2024, "server": "s", "port": 443, "type": "hysteria2"})
+check("DC-2 add_node 规整 name", _st5b.data["nodes"][0]["name"] == "2024")
+# DC-4 update_node 拒绝改 sub
+_st5b.update_node(_st5b.data["nodes"][0]["id"], {"sub": "sX", "name": "renamed"})
+check("DC-4 update_node 不改 sub", _st5b.data["nodes"][0].get("sub") is None and _st5b.data["nodes"][0]["name"] == "renamed")
+# STORE-4 set_settings 丢弃 secret 与未知键
+_st5b.set_settings({"secret": "HIJACK", "bogus": 1, "log_level": "info"})
+check("STORE-4 set_settings 丢 secret/未知键",
+      _st5b.data["settings"]["secret"] != "HIJACK" and "bogus" not in _st5b.data["settings"]
+      and _st5b.data["settings"]["log_level"] == "info")
+# CLI-1 订阅缺字段补全
+open(_sp5, "w").write('{"version":1,"subscriptions":[{"id":"s1","url":"u"}]}')
+_st5c = _s5.Store(_sp5)
+check("CLI-1 订阅字段补全", all(k in _st5c.data["subscriptions"][0] for k in ("name", "url", "count", "updated")))
+# STORE-1 非破坏性备份
+_sp1 = os.path.join(tempfile.mkdtemp(), "state.json")
+open(_sp1, "w").write("not json"); _s5.Store(_sp1)
+open(_sp1, "w").write("also bad"); _s5.Store(_sp1)
+check("STORE-1 .bad 非破坏性备份",
+      os.path.exists(_sp1 + ".bad") and os.path.exists(_sp1 + ".bad.1"))
+
+# ---- yaml_lite ----
+check("BUG-2 合并键流式别名列表",
+      _y5.load("c: &c {type: vmess}\nt: &t {tls: true}\nproxies:\n  - name: A\n    server: a\n    port: 1\n    <<: [*c, *t]\n")["proxies"][0].get("tls") is True)
+check("BUG-3 序列项锚点不崩",
+      _y5.load("proxies:\n  - &n1\n    name: B\n    server: b\n    port: 1\n    type: trojan\n")["proxies"][0].get("server") == "b")
+_r1 = _y5.load("proxies:\n  - {name: C, server: c, port: 1, type: ss, cipher: aes-128-gcm, password: \"[weird\"}\n  - {name: D, server: d, port: 1, type: ss, cipher: aes-128-gcm, password: ok}\n")
+check("ROBUST-1 '[' 开头字段不毁整篇", len(_r1["proxies"]) == 2 and _r1["proxies"][0]["password"] == "[weird")
+
+# ---- manager ----
+check("COMPAT-1/2 架构映射", (_m5.detect_arch() or True) is not None)
+_arch_map = {}
+_origm = _m5.platform.machine
+for _mm in ("armv6l", "armv7l", "armv8l", "aarch64", "x86_64", "i686"):
+    _m5.platform.machine = (lambda v=_mm: v)
+    _arch_map[_mm] = _m5.detect_arch()
+_m5.platform.machine = _origm
+check("COMPAT-1 armv6 独立 / COMPAT-2 i686->386",
+      _arch_map["armv6l"] == "armv6" and _arch_map["armv8l"] == "armv7" and _arch_map["i686"] == "386",
+      str(_arch_map))
+# TEST-3 apply_config 回滚不变量（monkeypatch）
+_tmpcfg = os.path.join(tempfile.mkdtemp(), "config.yaml")
+_savedm = {k: getattr(_m5, k) for k in ("test_config", "write_config", "set_ip_forward",
+                                        "service_action", "wait_active", "run", "journal",
+                                        "host_conflict_warnings", "MIHOMO_CONFIG", "MIHOMO_SERVICE")}
+try:
+    _calls = {"write": [], "fwd": []}
+    _m5.MIHOMO_CONFIG = _tmpcfg
+    _m5.MIHOMO_SERVICE = "/nonexistent-service"   # restart 分支跳过
+    _m5.write_config = lambda t: (_calls["write"].append(t), open(_tmpcfg, "w").write(t))
+    _m5.set_ip_forward = lambda on, log=print: _calls["fwd"].append(on)
+    _m5.host_conflict_warnings = lambda s=None: []
+    _m5.run = lambda *a, **k: _types2.SimpleNamespace(returncode=0, stdout="active", stderr="")
+    _m5.journal = lambda *a, **k: ""
+
+    class _FS:
+        def __init__(self, text): self._t = text; self.data = {"settings": {"gateway_mode": True}}
+        def render_config(self): return self._t
+    # (a) 校验失败：不写配置、不动转发
+    _m5.test_config = lambda text=None: (False, "boom")
+    ok_a, _ = _m5.apply_config(_FS("cfgA"), restart=False)
+    check("TEST-3a 校验失败不写不转发", ok_a is False and not _calls["write"] and not _calls["fwd"])
+    # (c) restart 但 mihomo 没起来：不开转发（这里用 restart=False + is-active 返回 active 来验证开转发那条正路）
+    _m5.test_config = lambda text=None: (True, "ok")
+    _m5.run = lambda *a, **k: _types2.SimpleNamespace(returncode=0, stdout="active", stderr="")
+    ok_c, _ = _m5.apply_config(_FS("cfgC"), restart=False)
+    check("TEST-3c 校验通过则写盘+确认运行后开转发",
+          ok_c is True and _calls["write"] and _calls["fwd"] == [True])
+    # mihomo 未运行：不开转发
+    _calls["fwd"].clear()
+    _m5.run = lambda *a, **k: _types2.SimpleNamespace(returncode=0, stdout="inactive", stderr="")
+    _m5.apply_config(_FS("cfgD"), restart=False)
+    check("TEST-3 BUG-9 未运行不开转发", _calls["fwd"] == [])
+finally:
+    for k, v in _savedm.items():
+        setattr(_m5, k, v)
+
+# ---- webui Handler 鉴权/守卫（TEST-1/2，构造假 Handler，不起真服务）----
+
+
+def _mk_handler(headers, body=b"", client=("9.9.9.9", 1)):
+    h = _w5.Handler.__new__(_w5.Handler)
+    h.headers = dict(headers)
+    h.rfile = _io.BytesIO(body)
+    h.wfile = _io.BytesIO()
+    h.client_address = client
+    h.request_version = "HTTP/1.1"
+    h.command = headers.get("_method", "POST")
+    h.requestline = "-"          # send_response -> log_request 会用到
+    return h
+
+
+def _resp(h):
+    raw = h.wfile.getvalue()
+    line = raw.split(b"\r\n", 1)[0].split(b" ")
+    status = int(line[1]) if len(line) > 1 else 0
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    try:
+        return status, _json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        return status, {}
+
+
+def _call(method, path, store_pw="", headers=None, body=None):
+    hdr = {"Host": "127.0.0.1:8088", "X-Requested-With": "pihy2"}
+    if body is not None:
+        bj = _json.dumps(body).encode()
+        hdr["Content-Length"] = str(len(bj))
+    else:
+        bj = b""
+    if headers:
+        hdr.update(headers)
+    h = _mk_handler(hdr, bj)
+    h.path = path
+    _fake = _types2.SimpleNamespace(data={"webui": {"password": store_pw, "port": 8088, "bind": "127.0.0.1"},
+                                          "settings": {}, "nodes": [], "rules": []})
+    h._store = lambda: _fake
+    getattr(h, "do_" + method)()
+    return _resp(h)
+
+with _w5._lock:
+    _w5._tokens.clear(); _w5._login_fails.clear()
+
+# SEC-1 非 ASCII 密码可登录（旧代码 compare_digest 抛 TypeError 永久锁死）
+_st, _js = _call("POST", "/api/login", store_pw="密码123", body={"password": "密码123"})
+check("SEC-1 非 ASCII 密码可登录", _st == 200 and _js.get("ok") and _js.get("token"), f"{_st} {_js}")
+_st_bad, _ = _call("POST", "/api/login", store_pw="密码123", body={"password": "wrong"})
+check("SEC-1 错误密码 401", _st_bad == 401)
+# SEC-4 密码模式、无 Origin、缺 X-Requested-With -> 403
+_st4, _ = _call("POST", "/api/parse", store_pw="pw",
+                headers={"X-Requested-With": ""}, body={"text": ""})
+check("SEC-4 缺自定义头被拒", _st4 == 403)
+# SEC-3 Origin 端口不同源 -> 403
+_st3, _ = _call("POST", "/api/parse", store_pw="pw",
+                headers={"Origin": "http://127.0.0.1:9999"}, body={"text": ""})
+check("SEC-3 端口不同源被拒", _st3 == 403)
+# 无密码模式：域名 Host 写操作被拒（反 rebinding）
+_st_dom, _ = _call("POST", "/api/parse", store_pw="",
+                   headers={"Host": "evil.example.com"}, body={"text": ""})
+check("反 rebinding：无密码时域名 Host 被拒", _st_dom == 403)
+# 登录限速：连续失败到上限后 429
+with _w5._lock:
+    _w5._tokens.clear(); _w5._login_fails.clear()
+_last = 200
+for _i in range(_w5.LOGIN_MAX_FAILS + 1):
+    _last, _ = _call("POST", "/api/login", store_pw="pw", body={"password": "x"})
+check("TEST-2 登录失败到上限后 429", _last == 429, str(_last))
+with _w5._lock:
+    _w5._tokens.clear(); _w5._login_fails.clear()
+# _valid_dns
+check("ROBUST-4 _valid_dns",
+      _w5._valid_dns("1.1.1.1") and _w5._valid_dns("https://1.1.1.1/dns-query")
+      and not _w5._valid_dns("乱填") and not _w5._valid_dns(""))
+
+# TEST-6：渲染出的配置必须能被自带 yaml_lite 解析（无 mihomo 二进制时也校验结构，不再只做子串断言）
+_t6n = [{"id": "n1", "name": "JP", "server": "a.com", "port": 443, "type": "hysteria2", "password": "p"},
+        {"id": "n2", "name": "JP", "server": "b.com", "port": 443, "type": "vless",
+         "uuid": "11111111-1111-1111-1111-111111111111", "tls": True, "network": "ws",
+         "ws_path": "/x", "reality_pbk": "k"}]
+_t6r = [{"value": "*.cn", "policy": "DIRECT"}, {"value": "1.2.3.0/24", "policy": "DIRECT"}]
+for _label, _ns, _rs, _ss in (
+        ("多节点+预设", _t6n, _t6r, {"presets": ["ads", "cn_direct"]}),
+        ("单节点", [_t6n[0]], _t6r, {}),
+        ("零节点", [], [], {}),
+        ("网关", _t6n, _t6r, {"gateway_mode": True}),
+        ("ipv6", _t6n, _t6r, {"ipv6": True}),
+        ("清空hijack", _t6n, _t6r, {"tun_dns_hijack": []})):
+    try:
+        _doc = _y5.load(config_gen.render(_ns, _rs, _ss))
+        _ok = isinstance(_doc, dict) and all(k in _doc for k in ("rules", "tun", "dns"))
+    except Exception as _e:  # noqa: BLE001
+        _ok = False
+    check(f"TEST-6 配置可解析({_label})", _ok)
+
+
 # mihomo -t 真实语法校验（若提供二进制）
 mihomo = os.environ.get("MIHOMO")
 if mihomo and os.path.exists(mihomo):

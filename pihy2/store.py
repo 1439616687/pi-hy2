@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 
 try:
@@ -18,7 +19,7 @@ try:
 except ImportError:                    # pragma: no cover
     fcntl = None
 
-from . import config_gen
+from . import config_gen, parser
 
 STATE_DIR = os.environ.get("PIHY2_DIR", "/etc/pihy2")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -97,17 +98,31 @@ class Store:
     # ---------------------------------------------------------------- 读写
     def load(self) -> dict:
         if not os.path.exists(self.path):
-            return _new_state()
+            return _new_state()        # 全新安装：文件不存在是正常的，不算损坏
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 return self._migrate(json.load(f))
-        except (json.JSONDecodeError, OSError):
-            # 损坏/不可读：先把原文件改名备份，避免随后一次 save 用空状态把可抢救的数据覆盖清零
-            try:
-                os.replace(self.path, self.path + ".bad")
-            except OSError:
-                pass
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError, OSError) as e:
+            # 损坏/结构异常（非 dict 顶层、settings/webui 非 dict 等）/不可读：把原文件**非破坏性**
+            # 改名备份（绝不覆盖已有 .bad），避免随后一次 save 用空状态把可抢救的数据覆盖清零；
+            # 同时把原因打到 stderr，让“配置莫名清空”可见、可排查（systemd journal 也能收到）。
+            self._backup_corrupt(e)
             return _new_state()
+
+    def _backup_corrupt(self, err: Exception) -> None:
+        bak = self.path + ".bad"
+        i = 0
+        while os.path.exists(bak):     # 非破坏性：第二次损坏不再覆盖第一次的可抢救备份
+            i += 1
+            bak = f"{self.path}.bad.{i}"
+        try:
+            os.replace(self.path, bak)
+            sys.stderr.write(
+                f"⚠️  pihy2: 无法读取状态文件 {self.path}（{type(err).__name__}: {err}）；"
+                f"已备份为 {bak} 并以空白状态启动——请检查该备份能否抢救后再做改动。\n")
+        except OSError:
+            sys.stderr.write(
+                f"⚠️  pihy2: 状态文件 {self.path} 损坏且无法备份（{type(err).__name__}: {err}）。\n")
 
     def save(self) -> None:
         # state.json 含明文密码/密钥，目录与文件都收紧权限到仅 root 可读
@@ -127,26 +142,46 @@ class Store:
         os.replace(tmp, self.path)        # 原子替换，避免写一半损坏
 
     def _migrate(self, data: dict) -> dict:
+        if not isinstance(data, dict):     # 顶层不是对象（list/str/number）：交给 load 的兜底备份+重置
+            raise ValueError("state.json 顶层不是对象")
         base = _new_state()
         base.update({k: v for k, v in data.items() if k in base})
         # 外部/手工编辑的 state 里 nodes/subscriptions 可能含非 dict 元素：先过滤，避免
         # 后续 n.get(...) 在字符串/None 上抛 AttributeError，使整个工具在加载期就起不来。
         base["nodes"] = [n for n in base.get("nodes", []) if isinstance(n, dict)]
         base["subscriptions"] = [s for s in base.get("subscriptions", []) if isinstance(s, dict)]
-        # settings/webui 做字段补全，兼容旧版本新增字段
-        base["settings"] = {**config_gen.DEFAULT_SETTINGS, **data.get("settings", {})}
-        if not base["settings"].get("secret"):
-            base["settings"]["secret"] = secrets.token_hex(16)
-        base["webui"] = {**_new_state()["webui"], **data.get("webui", {})}
+        # settings/webui 做字段补全；**先把非 dict 的 settings/webui 归一为 {}** 再展开，
+        # 否则 {**"pwned"} 抛 TypeError，使每个入口（CLI/面板/定时器）一加载就崩、且不走 .bad 备份。
+        _s = data.get("settings")
+        base["settings"] = {**config_gen.DEFAULT_SETTINGS, **(_s if isinstance(_s, dict) else {})}
+        sec = base["settings"].get("secret")    # 非字符串 secret 会让 /api/config 脱敏与 clash 客户端崩
+        base["settings"]["secret"] = sec if isinstance(sec, str) and sec else secrets.token_hex(16)
+        _w = data.get("webui")
+        base["webui"] = {**_new_state()["webui"], **(_w if isinstance(_w, dict) else {})}
         # 回填自增计数，避免（外部编辑/导入缺 _seq 的旧状态后）新 id 与既有 id 撞号
         base["_seq"] = max([base.get("_seq") or 0]
                            + [_id_num(n.get("id")) for n in base["nodes"]])
         base["_subseq"] = max([base.get("_subseq") or 0]
                               + [_id_num(s.get("id")) for s in base["subscriptions"]])
-        # 给缺/非法 id 的节点补发稳定 id（推进 _seq），避免 get/update/delete 按 id 失配
+        # 给缺/非法/**重复** id 的节点（重）发稳定 id：重复 id 会让 update 命中错节点、delete 误删多个
+        seen_ids: set = set()
         for n in base["nodes"]:
-            if not n.get("id"):
+            nid = n.get("id")
+            if not nid or nid in seen_ids:
                 n["id"] = self._next_id_on(base)
+            seen_ids.add(n["id"])
+        # 订阅：补全缺失字段（旧版/手工编辑的 state 缺 name/url/count/updated 会让 `pihy2 sub list` KeyError）、
+        # 并对缺/重复 id 重发，确保 get/delete 按 id 唯一匹配
+        seen_sids: set = set()
+        for s in base["subscriptions"]:
+            s.setdefault("name", "订阅")
+            s.setdefault("url", "")
+            s.setdefault("count", 0)
+            s.setdefault("updated", "")
+            sid = s.get("id")
+            if not sid or sid in seen_sids:
+                s["id"] = self._next_sub_id_on(base)
+            seen_sids.add(s["id"])
         # active 指向已不存在的节点时（外部编辑/导入）回落到第一个有效 id，避免悬空 active
         ids = {n["id"] for n in base["nodes"]}
         if base.get("active") not in ids:
@@ -158,13 +193,18 @@ class Store:
         state["_seq"] = state.get("_seq", 0) + 1
         return f"n{state['_seq']}"
 
+    @staticmethod
+    def _next_sub_id_on(state: dict) -> str:
+        state["_subseq"] = state.get("_subseq", 0) + 1
+        return f"s{state['_subseq']}"
+
     # ---------------------------------------------------------------- 节点
     def _next_id(self) -> str:
         self.data["_seq"] += 1
         return f"n{self.data['_seq']}"
 
     def add_node(self, node: dict) -> dict:
-        node = dict(node)
+        node = parser.normalize_node(node)   # 统一字段类型，杜绝 name=int/alpn=str 等坏形状进库（DC-2/DC-5）
         node["id"] = self._next_id()
         self.data["nodes"].append(node)
         if not self.data.get("active"):
@@ -177,7 +217,13 @@ class Store:
     def update_node(self, node_id: str, fields: dict) -> dict | None:
         for n in self.data["nodes"]:
             if n["id"] == node_id:
-                n.update({k: v for k, v in fields.items() if k != "id"})
+                # 不接受经 PUT 改写 id / sub：sub 决定订阅归属，被改写会让节点在下次订阅刷新时凭空消失或残留
+                for k, v in fields.items():
+                    if k not in ("id", "sub"):
+                        n[k] = v
+                norm = parser.normalize_node(n)   # 规整类型，避免坏形状落库后让渲染/导出崩
+                n.clear()
+                n.update(norm)
                 return n
         return None
 
@@ -255,10 +301,17 @@ class Store:
 
     # ---------------------------------------------------------------- 规则/设置
     def set_rules(self, rules: list[dict]) -> None:
-        self.data["rules"] = rules
+        # 只收 dict 规则项：非 dict（如外部传入 ["foo"]）会让 build_config 渲染时 r.get(...) 崩，
+        # 且被持久化后变成毒丸——此后每次 config 预览/apply（含定时器）都 500，直到手改 state.json。
+        self.data["rules"] = [r for r in (rules or []) if isinstance(r, dict)]
+
+    # 已知可写设置键（DEFAULT_SETTINGS 全集，github_mirror 现已并入），永不让外部覆盖 secret。
+    # 把这道硬保证放在 store 层，使 CLI/向导/未来任何写入方都继承；webui 仍各自保留用户友好的校验消息。
+    _ALLOWED_SETTING_KEYS = set(config_gen.DEFAULT_SETTINGS) - {"secret"}
 
     def set_settings(self, settings: dict) -> None:
-        self.data["settings"].update(settings)
+        clean = {k: v for k, v in dict(settings).items() if k in self._ALLOWED_SETTING_KEYS}
+        self.data["settings"].update(clean)
 
     def set_active(self, node_id: str) -> None:
         self.data["active"] = node_id

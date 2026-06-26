@@ -215,6 +215,10 @@ def _run_wizard():
         hours=store.data.get("sub_interval_hours", 12), log=lambda m: _p("  " + m))
     manager.enable_start("mihomo", log=lambda m: _p("  " + m))
     manager.enable_start("pihy2-web", log=lambda m: _p("  " + m))
+    # mihomo 此时已启动：网关模式下再 apply 一次，让 IP 转发等系统副作用真正生效——首次 apply 在
+    # mihomo 启动之前，按安全策略（BUG-9）当时不会开启转发，需在确认运行后补提交。
+    if store.data["settings"].get("gateway_mode"):
+        manager.apply_config(store, restart=False, log=lambda m: _p("  " + m))
 
     # ---- 6. 验证 ----
     title("第 6 步 / 验证")

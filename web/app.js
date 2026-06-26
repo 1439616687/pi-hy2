@@ -8,13 +8,16 @@ let rulesDirty = false;          // 路由有未保存修改时为 true
 let toastTimer = null;
 
 async function api(method, path, body) {
-  const opt = { method, headers: {} };
+  // X-Requested-With：服务端对无 Origin 的请求要求该自定义头（CSRF 纵深防御，见 webui._guard_write）
+  const opt = { method, headers: { 'X-Requested-With': 'pihy2' } };
   if (TOKEN) opt.headers['Authorization'] = 'Bearer ' + TOKEN;
   if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  const r = await fetch(path, opt);
-  if (r.status === 401) {           // token 失效/服务端重启：清掉并回到登录
+  let r;
+  try { r = await fetch(path, opt); }
+  catch (e) { return { ok: false, error: '网络错误' }; }   // 不抛：避免各 await 处未捕获的 promise 拒绝
+  if (r.status === 401) {           // token 失效/服务端重启：清掉并回到登录（返回而非抛，调用方按 !ok 处理）
     TOKEN = ''; localStorage.removeItem('pihy2_token'); showLogin();
-    throw new Error('未登录');
+    return { ok: false, _unauth: true, error: '未登录' };
   }
   return await r.json().catch(() => ({}));
 }
@@ -49,7 +52,7 @@ function showApp() { el('login').classList.add('hidden'); el('app').classList.re
 async function doLogin(e) {
   e.preventDefault();
   const pw = el('login-pw').value;
-  const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) }).then(r => r.json()).catch(() => ({}));
+  const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'pihy2' }, body: JSON.stringify({ password: pw }) }).then(r => r.json()).catch(() => ({}));
   if (r.ok) { TOKEN = r.token; localStorage.setItem('pihy2_token', TOKEN); el('login-pw').value = ''; el('login-err').textContent = ''; await loadState(); showApp(); refreshStatus(); }
   else { el('login-err').textContent = r.error || '密码错误'; }
 }
@@ -88,19 +91,27 @@ async function addSub() {
   if (!url) { toast('请填订阅链接', 'err'); return; }
   toast('正在拉取订阅…');
   const r = await api('POST', '/api/subs', { url, name: el('sub-name').value.trim() });
-  if (r.ok) { el('sub-url').value = ''; el('sub-name').value = ''; await loadState(); toast(`订阅已添加，${r.count || 0} 个节点已生效`, 'ok'); }
+  // /api/subs 即便拉取/解析失败也返回 ok:true（仅 count=0）——成功提示须以 count 为准（BUG-8）
+  if (r.ok && r.count) { el('sub-url').value = ''; el('sub-name').value = ''; await loadState(); toast(`订阅已添加，${r.count} 个节点已生效`, 'ok'); }
+  else if (r.ok) { await loadState(); toast('订阅已添加，但未解析到节点：' + ((r.errors || []).slice(0, 2).join('；') || '请检查链接或格式'), 'err'); }
   else toast('添加失败：' + (r.error || ''), 'err');
+}
+// /api/subs/update 恒返回 ok:true，逐订阅失败被服务端吞掉——“已生效”只在确有节点更新时才说（FRONT-2）
+function reportSubUpdate(r, prefix) {
+  if (r.ok && r.count) toast(`${prefix} ${r.count} 个节点并生效`, 'ok');
+  else if (r.ok) toast('未更新到新节点，请检查订阅链接是否可访问', 'err');
+  else toast('更新失败：' + (r.error || ''), 'err');
 }
 async function updateSub(id) {
   toast('更新中…');
   const r = await api('POST', '/api/subs/update', { id });
-  await loadState(); done(r, `已更新 ${r.count || 0} 个节点并生效`);
+  await loadState(); reportSubUpdate(r, '已更新');
 }
 async function updateAllSubs() {
   if (!(STATE.subscriptions || []).length) { toast('没有订阅', 'err'); return; }
   toast('更新中…');
   const r = await api('POST', '/api/subs/update', { id: 'all' });
-  await loadState(); done(r, `已更新共 ${r.count || 0} 个节点并生效`);
+  await loadState(); reportSubUpdate(r, '已更新共');
 }
 async function delSub(id) {
   // 名字从 STATE 查，不拼进内联事件，避免订阅名里的引号造成存储型 XSS
@@ -138,6 +149,12 @@ async function refreshStatus() {
   m.textContent = 'mihomo: ' + (running ? '运行中' : active);
   m.className = 'pill ' + (running ? 'ok' : 'bad');
   el('st-ip').textContent = '出口IP: ' + (s.ip || '—');
+  const wb = el('warn-banner');                    // CONFLICT-5：把 DNS/VPN 冲突告警显示出来（含定时器 apply 检测到的）
+  if (wb) {
+    const ws = s.warnings || [];
+    wb.innerHTML = ws.map(w => `<div>⚠️ ${esc(w)}</div>`).join('');
+    wb.classList.toggle('hidden', !ws.length);
+  }
 }
 
 let applying = false;
@@ -197,7 +214,7 @@ async function moveNode(id, dir) {
   STATE.nodes.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
   renderNodes();
   const r = await api('POST', '/api/nodes/order', { order: ids });
-  if (!r.ok) toast('排序保存失败', 'err');
+  if (!r.ok) { toast('排序保存失败', 'err'); await loadState(); }   // 失败回滚到服务端真实顺序（FRONT-1）
 }
 
 async function setActive(id) {
@@ -329,14 +346,16 @@ function enableDragOrder() {
       ids.splice(to, 0, ids.splice(from, 1)[0]);
       STATE.nodes.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
       renderNodes();
-      await api('POST', '/api/nodes/order', { order: ids });
+      const r = await api('POST', '/api/nodes/order', { order: ids });
+      if (!r.ok) { toast('排序保存失败', 'err'); await loadState(); }   // 失败回滚（FRONT-1）
     });
   });
 }
 
 // ----------------------------------------------------------------- 路由规则
 const RULE_TYPES = [['auto', '自动判别'], ['domain-suffix', '域名后缀'], ['domain', '精确域名'],
-  ['domain-keyword', '关键词'], ['domain-wildcard', '通配符'], ['ip-cidr', 'IP段'], ['geoip', 'GEOIP'], ['geosite', 'GEOSITE']];
+  ['domain-keyword', '关键词'], ['domain-wildcard', '通配符'], ['ip-cidr', 'IP段'], ['geoip', 'GEOIP'],
+  ['geosite', 'GEOSITE'], ['process-name', '进程名']];
 
 // 与服务端 config_gen.classify_rule 保持一致，确保“生成规则”预览即最终结果
 // 前导零（如 010.0.0.1）被 Python ipaddress 视为非法，前端也一并拒绝以对齐判别
@@ -355,6 +374,15 @@ function isIPv6(v) {
   // 允许 '.'：覆盖 IPv4-mapped/嵌入式 IPv6（如 ::ffff:1.2.3.4），与服务端 ipaddress 一致
   if (!h.includes(':') || !/^[0-9a-fA-F:.]+$/.test(h)) return false;
   if (h.split('::').length > 2) return false;
+  // DC-8：每个 hextet 必须是 1-4 位十六进制；嵌入式 IPv4 只允许出现在最后一段。
+  // 否则 12345::1 / 1.2.3.4.5::1 这类会被前端判为合法、预览成 IP-CIDR，但服务端 ipaddress 拒绝、整条规则被悄悄丢弃。
+  const segs = h.split(':');
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s === '') continue;                       // '::' 产生的空段
+    if (s.includes('.')) { if (i !== segs.length - 1 || !isIPv4(s)) return false; }
+    else if (!/^[0-9a-fA-F]{1,4}$/.test(s)) return false;
+  }
   const groups = h.split(':').filter(x => x !== '');
   return h.includes('::') ? groups.length <= 7 : (h.split(':').length === 8 && groups.length === 8);
 }
@@ -375,15 +403,22 @@ function classifyRule(value, rtype) {
   }
   // auto（未知显式类型也回退到此，和服务端一致）
   if (isIPv4(value) || isIPv6(value)) { if (!value.includes('/')) value += isIPv6(value) ? '/128' : '/32'; return ['IP-CIDR', value]; }
-  if (value.startsWith('*.')) return ['DOMAIN-SUFFIX', value.slice(2)];
+  // 与服务端 classify_rule 对齐（STYLE-1）：*.cn -> DOMAIN-SUFFIX,cn；剥前缀后为空(*.)或仍含通配(*.*) -> 通配字面量
+  if (value.startsWith('*.')) {
+    const sub = value.slice(2);
+    if (sub && !sub.includes('*') && !sub.includes('?')) return ['DOMAIN-SUFFIX', sub];
+    return ['DOMAIN-WILDCARD', value];
+  }
   if (value.includes('*') || value.includes('?')) return ['DOMAIN-WILDCARD', value];
-  if (value.startsWith('.')) return ['DOMAIN-SUFFIX', value.slice(1)];
+  if (value.startsWith('.')) { const sub = value.slice(1); return sub ? ['DOMAIN-SUFFIX', sub] : ['(空值·会被忽略)', value]; }
+  if (!value) return ['(空值·会被忽略)', value];
   if (value.includes('.')) return ['DOMAIN-SUFFIX', value];
   return ['DOMAIN-KEYWORD', value];
 }
 function genRule(r) {
   if (!(r.value || '').trim()) return '';
   const [kind, val] = classifyRule(r.value, r.type);
+  if (kind.startsWith('(')) return kind;        // 标记类（非法 IP / 空值·会被忽略）直接显示，不拼成假规则
   const policy = (r.policy || 'PROXY').toUpperCase();
   return `${kind},${val},${policy}${kind === 'IP-CIDR' ? ',no-resolve' : ''}`;
 }
@@ -460,11 +495,14 @@ function renderSettings() {
   el('set-fakeip').value = s.fake_ip_range || '198.18.0.1/16';
   el('set-dns').value = (s.dns_nameservers || []).join('\n');
   el('set-dnscn').value = (s.dns_china || []).join('\n');
+  if (el('set-hijack')) el('set-hijack').value = (s.tun_dns_hijack || []).join('\n');     // FEAT-1
+  if (el('set-autoredirect')) el('set-autoredirect').checked = s.tun_auto_redirect !== false;
   el('set-mirror').value = s.github_mirror || '';
   el('set-ctrl').value = s.external_controller || '';
   el('web-port').value = (STATE.webui || {}).port || 8088;
   el('web-bind').value = (STATE.webui || {}).bind || '0.0.0.0';
   el('web-pw').value = '';
+  if (el('web-pw-clear')) el('web-pw-clear').checked = false;   // FRONT-3：渲染时复位“取消密码”勾选，避免粘连误清密码
   const hint = el('web-pw-hint');
   if (hint) hint.textContent = (STATE.webui || {}).has_password ? '当前已设密码' : '当前未设密码（仅本机可访问）';
 }
@@ -481,6 +519,9 @@ async function saveSettings() {
     fake_ip_range: el('set-fakeip').value.trim(),
     dns_nameservers: lines(el('set-dns').value),
     dns_china: lines(el('set-dnscn').value),
+    // FEAT-1：TUN DNS 劫持目标与 nftables auto-redirect 现可在面板改（清空 hijack=不劫持，与 Pi-hole 共存）
+    tun_dns_hijack: el('set-hijack') ? lines(el('set-hijack').value) : (STATE.settings.tun_dns_hijack || ['any:53']),
+    tun_auto_redirect: el('set-autoredirect') ? el('set-autoredirect').checked : true,
     github_mirror: el('set-mirror').value.trim(),
     external_controller: el('set-ctrl').value.trim(),
   };

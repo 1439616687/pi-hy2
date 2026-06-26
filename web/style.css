@@ -249,8 +249,17 @@ legend .muted { font-weight: 500; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 
 /* ------------------------------------------------------------------ 弹窗 / 登录 */
+.warn-banner {
+  margin: 0; padding: 10px 16px; font-size: 13px; line-height: 1.5;
+  color: var(--warn-text, #8a5a00); background: var(--warn-soft, #fff4d6);
+  border-bottom: 1px solid rgba(255, 184, 0, .4);
+}
+.warn-banner.hidden { display: none; }
+
 .overlay {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, .28);
+  /* 先写 top/right/bottom/left 长写法兜底，再写 inset 简写：iOS Safari < 14.1 不认 inset，
+     缺兜底时遮罩会退化成贴合内容、盖不满全屏（COMPAT-3） */
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; inset: 0; background: rgba(0, 0, 0, .28);
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
   display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px;
   animation: overlay-in .2s ease both;

@@ -33,6 +33,9 @@ MIHOMO_CONFIG = os.path.join(MIHOMO_DIR, "config.yaml")
 MIHOMO_SERVICE = "/etc/systemd/system/mihomo.service"
 WEBUI_SERVICE = "/etc/systemd/system/pihy2-web.service"
 INSTALL_DIR = "/opt/pihy2"
+# pihy2 专属的开机加载 tun 文件名：绝不与主机自带的 /etc/modules-load.d/tun.conf 重名，
+# 这样卸载时只删 pihy2 自己的、不会误删别的 VPN 依赖的 tun 加载指令（CONFLICT-6）。
+TUN_MODULE_CONF = "/etc/modules-load.d/pihy2-tun.conf"
 
 # 串行化 apply：渲染->写盘->重启 是对共享 OS 资源（config.yaml / mihomo 服务 / 转发）的非原子操作，
 # 多线程（面板多请求）并发 apply 会互相打架。进程内一把锁覆盖 WebUI 的并发；CLI 各为独立短进程，竞争极小。
@@ -66,15 +69,21 @@ def run(cmd: list[str], check: bool = False, timeout: int = 60) -> subprocess.Co
 
 
 def detect_arch() -> str:
-    """返回 mihomo 资源命名用的架构：arm64 / amd64 / armv7。"""
+    """返回 mihomo 资源命名用的架构：arm64 / amd64 / armv7 / armv6 / 386。"""
     m = platform.machine().lower()
     if m in ("aarch64", "arm64"):
         return "arm64"
     if m in ("x86_64", "amd64"):
         return "amd64"
-    if m.startswith("armv7") or m.startswith("armv6") or m == "armhf":
+    if m.startswith("armv6"):
+        # Pi Zero / Zero W / Pi 1 是 ARMv6：armv7 二进制含 ARMv7 指令会 SIGILL（非法指令），须用 armv6 资源
+        return "armv6"
+    if m.startswith("armv7") or m in ("armv8l", "armhf", "arm"):
+        # armv8l = 64 位内核上的 32 位用户态（Pi4/CM4 跑 32 位系统）；armhf = Debian armv7 基线
         return "armv7"
-    return "arm64"  # 目标是树莓派，默认 arm64
+    if m in ("i386", "i486", "i586", "i686", "x86"):
+        return "386"
+    return "arm64"  # 目标是树莓派，未知架构默认 arm64（_binary_ok 的 -v 校验会拦下不匹配的二进制）
 
 
 # ---------------------------------------------------------------- 下载 mihomo
@@ -285,7 +294,7 @@ def install_mihomo(mirror: str = "", log=print) -> str:
 def ensure_tun(log=print) -> bool:
     run(["modprobe", "tun"])
     try:
-        with open("/etc/modules-load.d/tun.conf", "w") as f:
+        with open(TUN_MODULE_CONF, "w") as f:
             f.write("tun\n")
     except OSError as e:
         log(f"写入开机加载 tun 失败：{e}")
@@ -297,13 +306,30 @@ def ensure_tun(log=print) -> bool:
 # ---------------------------------------------------------------- 配置
 def write_config(text: str) -> None:
     os.makedirs(MIHOMO_DIR, exist_ok=True)
-    tmp = MIHOMO_CONFIG + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, 0o600)              # 含节点密码与 clash 密钥，仅 root 可读
-    os.replace(tmp, MIHOMO_CONFIG)
+    # 首次接管：已存在且非 pihy2 生成的 config.yaml（用户/发行版手管）先备份一次，避免静默覆盖丢失（CONFLICT-1）
+    if os.path.exists(MIHOMO_CONFIG):
+        bak = MIHOMO_CONFIG + ".pihy2-bak"
+        try:
+            with open(MIHOMO_CONFIG, "r", encoding="utf-8") as f:
+                head = f.read(256)
+            if "pihy2" not in head and not os.path.exists(bak):
+                shutil.copy2(MIHOMO_CONFIG, bak)
+        except OSError:
+            pass
+    # 落到 MIHOMO_DIR 内的唯一临时文件再原子替换：避免多写入方（面板 vs 订阅定时器，不同进程）
+    # 抢同一个固定 .tmp 名互相踩（ROBUST-3）；同目录保证 os.replace 原子（不跨文件系统）。
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=MIHOMO_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)          # 含节点密码与 clash 密钥，仅 root 可读
+        os.replace(tmp, MIHOMO_CONFIG)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def test_config(text: str | None = None) -> tuple[bool, str]:
@@ -343,6 +369,17 @@ def package_dir() -> str:
 
 def install_services(log=print) -> None:
     """写入并启用 mihomo 与 pihy2-web 两个 systemd 服务。"""
+    # 若已存在非 pihy2 的 mihomo.service（用户/发行版自带），先备份再覆盖（CONFLICT-2）；
+    # 卸载时只删 pihy2 自己写的那份并恢复此备份。pihy2 的单元含 "Description=mihomo (pihy2)" 标记。
+    if os.path.exists(MIHOMO_SERVICE):
+        try:
+            existing = open(MIHOMO_SERVICE).read()
+            bak = MIHOMO_SERVICE + ".pihy2-bak"
+            if "pihy2" not in existing and not os.path.exists(bak):
+                shutil.copy2(MIHOMO_SERVICE, bak)
+                log(f"已备份原有 mihomo.service -> {bak}")
+        except OSError:
+            pass
     _write(MIHOMO_SERVICE, f"""[Unit]
 Description=mihomo (pihy2)
 After=network-online.target
@@ -469,27 +506,36 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
             except OSError:
                 pass
         gw = bool(store.data["settings"].get("gateway_mode"))
-        warn = dns_conflict_warning(store.data["settings"])
-        if warn:
-            log("⚠️  " + warn)
+        for w in host_conflict_warnings(store.data["settings"]):
+            log("⚠️  " + w)
+
+        def _commit_forward():
+            # 提交网关 IP 转发前必须确认 mihomo 真在运行：否则网关模式下 LAN 流量会被转发进一个
+            # 未运行的死代理而裸奔/黑洞（BUG-9：restart=False / 向导首次 apply 时尤甚）。
+            # 关闭网关（gw=False）只撤销 pihy2 自己的持久化、不动全局运行期值，任何时候都安全。
+            if not gw:
+                set_ip_forward(False, log)
+            elif run(["systemctl", "is-active", "mihomo"]).stdout.strip() == "active":
+                set_ip_forward(True, log)
+            else:
+                log("注意：mihomo 未在运行，暂不开启网关 IP 转发（待其启动后再 apply 即生效）。")
+
         if text == current:
-            set_ip_forward(gw, log)          # 无配置变化也把网关内核参数对齐到期望（幂等），但不重启
+            _commit_forward()                # 无配置变化也把网关内核参数对齐到期望（幂等），但不重启
             return True, "配置无变化，未重启"
         ok, out = test_config(text)
         if not ok:
             # 校验失败：不写配置、也不动系统转发，保持原状——避免开了转发却没应用网关配置导致流量裸奔
             return False, f"配置校验失败，已保留原配置：\n{out}"
         write_config(text)
-        started = True
         if restart and os.path.exists(MIHOMO_SERVICE):
             r = service_action("mihomo", "restart", log)
             # -t 不绑定端口，真启动才会暴露端口占用（9090/7890/1053）等问题
-            started = r.returncode == 0 and wait_active("mihomo")
-        if not started:
-            # mihomo 没真正起来：不要开 IP 转发，否则网关模式下流量会经一个死代理裸奔/黑洞
-            return False, ("配置已写入，但 mihomo 未能启动（常见原因：控制器/代理/DNS 端口被占用，"
-                           "如 9090/7890/1053）。最近日志：\n" + journal("mihomo", 12))
-        set_ip_forward(gw, log)              # 仅在 mihomo 确认运行后，才提交系统级转发等副作用
+            if not (r.returncode == 0 and wait_active("mihomo")):
+                # mihomo 没真正起来：不要开 IP 转发，否则网关模式下流量会经一个死代理裸奔/黑洞
+                return False, ("配置已写入，但 mihomo 未能启动（常见原因：控制器/代理/DNS 端口被占用，"
+                               "如 9090/7890/1053）。最近日志：\n" + journal("mihomo", 12))
+        _commit_forward()                    # 内含 mihomo 运行自检，restart=False 时也不会盲目开转发
         return True, "配置已应用" + ("（mihomo 已重启）" if restart else "")
 
 
@@ -515,20 +561,27 @@ def _validate_ip(ipstr: str) -> str:
 
 
 def _resolve_public(host: str) -> list[str]:
-    """解析域名并校验所有返回地址；返回钉死用的 IP 列表（IPv4 优先，去重保序）。
-    任一内网地址即整体拒绝（保留反 DNS-rebinding 防御）。返回多地址是为了在首选地址不可达
-    （如本机有 IPv6 地址但无 IPv6 路由）时能回退，避免下载/订阅抓取卡死在唯一被钉死的死 IP 上。"""
+    """解析域名并校验所有返回地址；返回钉死用的公网 IP 列表（IPv4 优先，去重保序）。
+    **过滤**掉内网/保留地址、只钉死到通过校验的公网地址（反 DNS-rebinding 防御不变——绝不连内网）；
+    仅当一个公网地址都不剩时才整体拒绝。这样双栈主机（公网 A + 占位/ULA 的 AAAA，常见于分屏 CDN）
+    不会因单个内网地址被整体误拒，又能在首选地址不可达时回退到其它公网地址。"""
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
         raise ValueError("无法解析订阅域名")
     v4, v6 = [], []
+    rejected = 0
     for fam, _, _, _, sa in infos:
-        ok = _validate_ip(sa[0])              # 任一地址内网即在此抛错、整体拒绝
+        try:
+            ok = _validate_ip(sa[0])          # 内网/保留地址在此抛错 -> 跳过该地址（不连），但不否决整个主机
+        except ValueError:
+            rejected += 1
+            continue
         (v4 if fam == socket.AF_INET else v6).append(ok)
     ips = list(dict.fromkeys(v4 + v6))
     if not ips:
-        raise ValueError("订阅域名无解析结果")
+        # 一个公网地址都没有：要么全是内网（真正的 rebinding/打内网，拒绝），要么根本没解析到
+        raise ValueError("订阅地址不能指向内网/本机/保留地址" if rejected else "订阅域名无解析结果")
     return ips
 
 
@@ -652,11 +705,6 @@ def refresh_subscription(store, sid: str, log=print) -> tuple[int, list]:
     return n, errors
 
 
-def refresh_all_subscriptions(store, log=print) -> dict:
-    return {s["id"]: refresh_subscription(store, s["id"], log)[0]
-            for s in list(store.data.get("subscriptions", []))}
-
-
 def install_sub_timer(hours: int = 12, log=print) -> None:
     """写入并启用订阅定时更新 timer。"""
     py = sys.executable or "/usr/bin/python3"
@@ -707,6 +755,34 @@ def dns_conflict_warning(settings: dict | None = None) -> str:
     return ""
 
 
+def vpn_conflict_warning() -> str:
+    """检测本机是否已存在 WireGuard / tailscale 等隧道接口（明确不属于 pihy2 的 mihomo TUN）。
+    与 pihy2 的 auto-route TUN 同时存在时可能争抢默认路由/产生黑洞，返回一句中文告警；否则 ''。
+    只匹配 wg*/tailscale*（绝不会是 mihomo 自己的 TUN），避免误报 pihy2 自身的隧道接口。"""
+    r = run(["ip", "-o", "link"], timeout=5)
+    if r.returncode != 0:
+        return ""
+    hits = set()
+    for ln in r.stdout.splitlines():
+        parts = ln.split(":", 2)              # 形如 "3: wg0: <...>"
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip().split("@")[0]
+        if name.startswith(("wg", "tailscale")):
+            hits.add(name)
+    if hits:
+        return ("检测到本机已有隧道接口 " + "、".join(sorted(hits)) +
+                "：pihy2 的 TUN 开启 auto-route 会抢占默认路由，可能与既有 VPN 互相影响/产生黑洞。"
+                "如遇异常，可在设置里关闭 auto-redirect，或先停掉另一条隧道。")
+    return ""
+
+
+def host_conflict_warnings(settings: dict | None = None) -> list:
+    """汇总与本机既有配置可能冲突的告警（DNS 抢占 / 既有 VPN-TUN），供 apply 与 /api/status 共享展示，
+    使定时器静默 apply 时检测到的冲突也能在面板里被看到（CONFLICT-5）。"""
+    return [w for w in (dns_conflict_warning(settings), vpn_conflict_warning()) if w]
+
+
 def service_status(name: str) -> dict:
     active = run(["systemctl", "is-active", name]).stdout.strip()
     enabled = run(["systemctl", "is-enabled", name]).stdout.strip()
@@ -717,8 +793,8 @@ def journal(name: str, lines: int = 30) -> str:
     return run(["journalctl", "-u", name, "-n", str(lines), "--no-pager"]).stdout
 
 
-def current_ip(timeout: int = 8, retries: int = 1) -> str:
-    """探测当前出口 IP。刚启动 mihomo 时连接未热，可多重试几次。"""
+def current_ip(timeout: int = 8, retries: int = 3) -> str:
+    """探测当前出口 IP。刚启动 mihomo 时连接未热，默认多重试几次（带退避）。"""
     import time
     last = ""
     for i in range(max(1, retries)):
@@ -750,6 +826,15 @@ def _controller_base(settings: dict) -> str:
     return base
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """clash 控制器是本机回环、绝不应发生跳转；禁止跟随跳转，避免把 Bearer 密钥重发到跳转目标（SEC-5）。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_CLASH_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _clash_request(method: str, path: str, settings: dict, body=None, timeout: int = 10):
     url = _controller_base(settings).rstrip("/") + path
     data = json.dumps(body).encode() if body is not None else None
@@ -757,7 +842,7 @@ def _clash_request(method: str, path: str, settings: dict, body=None, timeout: i
     req.add_header("Content-Type", "application/json")
     if settings.get("secret"):
         req.add_header("Authorization", "Bearer " + settings["secret"])
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _CLASH_OPENER.open(req, timeout=timeout) as resp:   # 不跟随跳转（见 _NoRedirect）
         raw = resp.read().decode()
         return json.loads(raw) if raw else {}
 
@@ -775,7 +860,7 @@ def clash_select(group: str, name: str, settings: dict) -> tuple[bool, str]:
 def clash_delay(name: str, settings: dict, timeout: int = 5000) -> int | None:
     """测某个节点的延迟（毫秒）。失败返回 None。"""
     try:
-        path = (f"/proxies/{urllib.parse.quote(name)}/delay"
+        path = (f"/proxies/{urllib.parse.quote(name, safe='')}/delay"
                 f"?timeout={timeout}&url=http://www.gstatic.com/generate_204")
         r = _clash_request("GET", path, settings, timeout=timeout / 1000 + 3)
         return r.get("delay")
@@ -805,14 +890,46 @@ def uninstall(purge: bool = False, log=print) -> None:
         service_action(svc, "disable", log)
         service_action(svc, "stop", log)
     for path in (MIHOMO_SERVICE, WEBUI_SERVICE, SUB_SERVICE, SUB_TIMER):
-        if os.path.exists(path):
-            os.remove(path)
-    set_ip_forward(False, log)            # 关掉网关模式开的 IP 转发
+        if not os.path.exists(path):
+            continue
+        # mihomo.service 只删 pihy2 自己写的那份；非 pihy2（用户/发行版自带）保留不动（CONFLICT-2）
+        if path == MIHOMO_SERVICE:
+            try:
+                is_ours = "pihy2" in open(path).read()
+            except OSError:
+                is_ours = True
+            if not is_ours:
+                log("检测到 mihomo.service 非 pihy2 所写，保留不动。")
+                continue
+        os.remove(path)
+        bak = path + ".pihy2-bak"            # 若曾备份用户原版单元则恢复
+        if os.path.exists(bak):
+            try:
+                os.replace(bak, path)
+                log(f"已恢复原有服务：{path}")
+            except OSError:
+                pass
+    # 非 purge：恢复被 pihy2 接管前备份的 config.yaml（否则用户手管配置卸载后仍是 pihy2 生成的）
+    cfg_bak = MIHOMO_CONFIG + ".pihy2-bak"
+    if not purge and os.path.exists(cfg_bak):
+        try:
+            os.replace(cfg_bak, MIHOMO_CONFIG)
+            log(f"已恢复原有 mihomo 配置：{MIHOMO_CONFIG}")
+        except OSError:
+            pass
+    # pihy2 自己的开机加载 tun 文件：base 卸载即移除，不再每次开机残留加载（CONFLICT-6）
+    if os.path.exists(TUN_MODULE_CONF):
+        try:
+            os.remove(TUN_MODULE_CONF)
+        except OSError:
+            pass
+    set_ip_forward(False, log)            # 关掉网关模式开的 IP 转发（仅撤销持久化，不动运行期全局值）
     run(["systemctl", "daemon-reload"])
     if purge:
         from .store import STATE_DIR
-        # 也删 CLI 包装器，否则 purge 后 `pihy2` 命令还在、却指向被删空间，与“已彻底删除”不符
-        for path in (MIHOMO_BIN, "/etc/modules-load.d/tun.conf", "/usr/local/bin/pihy2"):
+        # 也删 CLI 包装器，否则 purge 后 `pihy2` 命令还在、却指向被删空间，与“已彻底删除”不符。
+        # 注意：不删 /etc/modules-load.d/tun.conf（可能是主机自带、别的 VPN 依赖）——pihy2 用专属文件名。
+        for path in (MIHOMO_BIN, "/usr/local/bin/pihy2"):
             if os.path.exists(path):
                 os.remove(path)
         shutil.rmtree(MIHOMO_DIR, ignore_errors=True)
@@ -820,4 +937,6 @@ def uninstall(purge: bool = False, log=print) -> None:
         # 标准安装目录 /opt/pihy2 一并清理；放最后（模块已加载进内存，删源码不影响本次运行）。
         # 只删约定的 INSTALL_DIR，不动从 git 检出目录直接运行的源码。
         shutil.rmtree(INSTALL_DIR, ignore_errors=True)
-    log("已卸载" + ("（含二进制、配置、状态与安装目录）" if purge else "（保留 /etc/pihy2 状态，可重装恢复）"))
+    log("已卸载" + ("（含二进制、配置、状态与安装目录）" if purge else "（保留 /etc/pihy2 状态，可重装恢复）") +
+        "。注意：为避免影响 Docker 等，本机运行期的 net.ipv4.ip_forward / rp_filter 不会被改回；"
+        "如需还原请重启或手动 sysctl -w。")

@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import re
 from urllib.parse import urlsplit, unquote, parse_qs
 
@@ -36,11 +37,14 @@ def _truthy(v: str) -> bool:
 
 
 def _int(v, default: int = 0) -> int:
-    """宽松转 int，兼容 "443"/"1.0"/None/非法值，避免脏数据让整次订阅解析崩掉。"""
+    """宽松转 int，兼容 "443"/"1.0"/None/非法值，避免脏数据让整次订阅解析崩掉。
+    'inf'/'1e999' 这类 float() 成功但 int() 抛 OverflowError、以及 nan，一并回落默认
+    （与 config_gen._safe_int 对称，兑现 docstring 承诺的“永不崩”）。"""
     try:
-        return int(float(v))
+        f = float(v)
     except (TypeError, ValueError):
         return default
+    return int(f) if math.isfinite(f) else default
 
 
 def _normalize_fingerprint(v: str) -> str:
@@ -137,10 +141,6 @@ def _net_fields(node: dict, network: str, *,
     """填充传输层相关字段。仅支持会真正下发 opts 的 ws/httpupgrade/grpc，
     其余（tcp/h2/http）按 tcp 处理，避免出现“有 network 没 opts”的半截配置。"""
     network = (network or "tcp").lower()
-    # h2/http/quic/xhttp 需要专门的 *-opts，本项目不下发，按 tcp 连必然失败 ——
-    # 明确报错让用户知道（在订阅里会作为单条错误跳过），好过静默降级成连不通的 tcp
-    if network in ("h2", "http", "quic", "xhttp"):
-        raise ParseError(f"暂不支持 {network} 传输（仅支持 tcp/ws/grpc/httpupgrade）")
     if network in ("ws", "httpupgrade"):
         node["network"] = network
         node["ws_path"] = ws_path or "/"
@@ -148,6 +148,10 @@ def _net_fields(node: dict, network: str, *,
     elif network == "grpc":
         node["network"] = "grpc"
         node["grpc_service_name"] = grpc_sn
+    elif network not in ("", "tcp"):
+        # h2/http/quic/xhttp/kcp/mkcp… 需专门 *-opts，本项目不下发，静默按 tcp 连必然失败 ——
+        # 明确报错让用户知道（订阅里作为单条错误跳过），好过生成连不通的半截/坏节点
+        raise ParseError(f"暂不支持 {network} 传输（仅支持 tcp/ws/grpc/httpupgrade）")
 
 
 # ---------------------------------------------------------------- hysteria2
@@ -224,6 +228,8 @@ def _parse_vmess(link: str) -> dict:
         j = json.loads(_b64decode(raw))
     except (json.JSONDecodeError, ValueError):
         raise ParseError("VMess 链接不是合法的 base64(JSON)")
+    if not isinstance(j, dict):   # 合法 JSON 但非对象（数组/数字/字符串）：兑现 ParseError 契约而非 AttributeError
+        raise ParseError("VMess 链接不是合法的 base64(JSON)")
     host = j.get("add", "")
     port = _int(j.get("port"), 443)
     if not host:
@@ -275,6 +281,27 @@ def _parse_trojan(link: str) -> dict:
 
 
 # ---------------------------------------------------------------- shadowsocks
+def _ss_userinfo(userinfo: str) -> tuple[str, str]:
+    """拆 SIP002 的 method:password。userinfo 可能是 base64，也可能是明文
+    （2022-blake3 系列常用「明文 method + base64 密码」，整体含 ':'/'-' 非严格 base64）。
+
+    用**严格** base64（validate=True）解码：含 ':' 的明文必然解码失败，从而正确回退到明文，
+    避免宽松解码（errors='ignore'）把明文 method:pass 解成恰好含 ':' 的乱码、悄悄取到错误凭据。"""
+    s = userinfo.strip()
+    for variant in (s, s.replace("-", "+").replace("_", "/")):
+        try:
+            dec = base64.b64decode(variant + "=" * (-len(variant) % 4), validate=True).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            continue
+        if ":" in dec:
+            m, p = dec.split(":", 1)
+            return m, p
+    if ":" in userinfo:                   # 明文 method:password
+        m, p = unquote(userinfo).split(":", 1)
+        return m, p
+    raise ParseError("SS 用户信息无法解析")
+
+
 def _parse_ss(link: str) -> dict:
     body = link[len("ss://"):]
     name = ""
@@ -287,13 +314,7 @@ def _parse_ss(link: str) -> dict:
 
     if "@" in body:                       # SIP002：base64(method:pass)@host:port
         userinfo, hostport = body.rsplit("@", 1)
-        try:
-            method, password = _b64decode(userinfo).split(":", 1)
-        except (ParseError, ValueError):
-            if ":" in userinfo:           # 少数已是明文
-                method, password = unquote(userinfo).split(":", 1)
-            else:
-                raise ParseError("SS 用户信息无法解析")
+        method, password = _ss_userinfo(userinfo)
         host, port = _split_hostport(hostport)
     else:                                 # 旧式：base64(method:pass@host:port)
         dec = _b64decode(body)
@@ -353,9 +374,11 @@ def _parse_tuic(link: str) -> dict:
         "password": password,
         "sni": _first(qs, "sni", "peer") or host,
         "alpn": _alpn(_first(qs, "alpn")) or ["h3"],
-        "congestion": _first(qs, "congestion_control", "congestion", default="bbr"),
-        "udp_relay_mode": _first(qs, "udp_relay_mode", default="native"),
-        "skip_cert_verify": _truthy(_first(qs, "allow_insecure", "insecure", default="0")),
+        # 只在链接里写明时才存，让 config_gen 兜底默认（bbr/native），导出不再凭空注入默认值
+        "congestion": _first(qs, "congestion_control", "congestion"),
+        "udp_relay_mode": _first(qs, "udp_relay_mode"),
+        # 导出端用 allowInsecure，故解析端也认它（_first 大小写不敏感），保证 skip-cert-verify 往返不丢
+        "skip_cert_verify": _truthy(_first(qs, "allow_insecure", "allowInsecure", "insecure", default="0")),
     })
     return node
 
@@ -455,6 +478,8 @@ def proxy_to_node(p: dict) -> dict:
     if t not in _SUPPORTED_TYPES:
         raise ParseError(f"暂不支持的协议类型：{t or '空'}")
     server = str(p.get("server", "")).strip()
+    if server.startswith("[") and server.endswith("]"):
+        server = server[1:-1]            # 规整 [2001:db8::1] -> 2001:db8::1，避免 node_to_link 二次套括号
     if not server:
         raise ParseError("缺少服务器地址")
     node = _base_node(str(p.get("name") or server), t, server, _int(p.get("port"), 443))
@@ -483,9 +508,9 @@ def proxy_to_node(p: dict) -> dict:
         node["reality_sid"] = ro.get("short-id", "")
         node["tls"] = True
     net = str(p.get("network", "")).lower()
-    # 与分享链接解析（_net_fields）对称：h2/http/quic 需专门 opts，本项目不下发，
-    # 静默按 tcp 连必然失败，故在 YAML 导入时也明确报错、跳过该节点而非生成坏配置。
-    if net in ("h2", "http", "quic", "xhttp"):
+    # 与分享链接解析（_net_fields）对称：ws/grpc/httpupgrade 之外的传输需专门 opts，本项目不下发，
+    # 静默按 tcp 连必然失败，故在 YAML 导入时也明确报错（含 h2/http/quic/xhttp/kcp/mkcp…）、跳过该节点。
+    if net not in ("", "tcp", "ws", "grpc", "httpupgrade"):
         raise ParseError(f"暂不支持 {net} 传输（仅支持 tcp/ws/grpc/httpupgrade）")
     if net in ("ws", "grpc", "httpupgrade"):
         node["network"] = net
@@ -516,6 +541,33 @@ def proxy_to_node(p: dict) -> dict:
     # 在此先归一，避免类型不一致与脏值（与 port 经 _int 归一保持一致）。
     if "alter_id" in node:
         node["alter_id"] = _int(node["alter_id"], 0)
+    return node
+
+
+# 节点字典的通用类型规整：供 store 的「表单新增 / 编辑 PUT」复用，使四个生产路径
+# （分享链接 / Clash YAML 导入 / 表单新增 / 编辑）的字段类型一致，杜绝下游 .strip()/quote()/
+# 拼接/序列化时的 TypeError（如把 name=2024、alpn="h3,h2"、uuid=纯数字 直接存进 state.json）。
+_STR_FIELDS = ("name", "server", "password", "uuid", "obfs_password", "reality_sid",
+               "reality_pbk", "sni", "cipher", "flow", "client_fingerprint", "obfs",
+               "ws_path", "ws_host", "grpc_service_name", "fingerprint", "pin_sha256",
+               "up", "down", "ports", "type", "congestion", "udp_relay_mode", "plugin")
+
+
+def normalize_node(node: dict) -> dict:
+    """把任意来源的节点字典规整为下游契约要求的类型（不改原对象）。"""
+    node = dict(node)
+    for f in _STR_FIELDS:
+        if f in node and node[f] is not None and not isinstance(node[f], str):
+            node[f] = str(node[f])
+    if "port" in node:
+        node["port"] = _int(node.get("port"), 443)
+    if "alter_id" in node:
+        node["alter_id"] = _int(node["alter_id"], 0)
+    a = node.get("alpn")
+    if isinstance(a, str):
+        node["alpn"] = _alpn(a)
+    elif a is not None and not isinstance(a, list):
+        node["alpn"] = []
     return node
 
 
@@ -572,6 +624,8 @@ def node_to_link(node: dict) -> str:
         }
         if node.get("alpn"):                       # round-trip 不丢 alpn
             j["alpn"] = ",".join(str(a) for a in node["alpn"])
+        if node.get("skip_cert_verify"):           # round-trip 不丢“跳过证书校验”
+            j["skip-cert-verify"] = True
         return "vmess://" + base64.b64encode(
             json.dumps(j, ensure_ascii=False).encode()).decode()
 

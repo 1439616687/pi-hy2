@@ -61,10 +61,15 @@ def _scalar(v: str):
     if v == "" or v == "~" or v.lower() == "null":
         return None
     if v[0] in "[{":
-        val, rest = _parse_flow(v)
-        if rest.strip():
-            raise YamlError(f"流式标量解析残留: {rest!r}")
-        return val
+        try:
+            val, rest = _parse_flow(v)
+            if not rest.strip():
+                return val
+        except YamlError:
+            pass
+        # 不是合法流式标量（如恰好以 [ / { 开头的密码、节点名、证书片段）：按普通字符串处理，
+        # 避免一个字段的流式解析失败把整篇订阅（document 级 except）的所有节点一起丢掉（ROBUST-1）。
+        return v
     if v[0] in ("'", '"'):
         return _unquote(v)
     low = v.lower()
@@ -211,6 +216,10 @@ class _Reader:
         if key == "<<":
             merges = value if isinstance(value, list) else [value]
             for m in merges:
+                # `<<: [*a, *b]`（流式别名列表，聚合配置常见）里别名是字面字符串 '*a'，
+                # 流式解析不认锚点；在合并时按当前锚点表解析，否则所有被合并的键被静默丢弃（BUG-2）。
+                if isinstance(m, str) and m.startswith("*"):
+                    m = self.anchors.get(m[1:].strip())
                 if isinstance(m, dict):
                     for k, v in m.items():
                         d.setdefault(k, v)
@@ -229,13 +238,18 @@ class _Reader:
             return self.anchors.get(val[1:].strip())
         return _scalar(val)
 
-    def _block_scalar(self, indent: int) -> str:
-        """收集所有缩进大于 indent 的后续行作为块标量字符串（尽力而为）。"""
+    def _block_scalar(self, indent: int, indicator: str = "|") -> str:
+        """收集所有缩进大于 indent 的后续行作为块标量字符串（尽力而为）。
+        indicator 形如 |、>、|-、>+ 等：> 折叠换行为空格，| 保留换行；'-' 去尾随换行。"""
         parts = []
         while self.i < len(self.lines) and self.lines[self.i][0] > indent:
             parts.append(self.lines[self.i][1])
             self.i += 1
-        return "\n".join(parts)
+        sep = " " if indicator.startswith(">") else "\n"
+        text = sep.join(parts)
+        if indicator.endswith("-"):     # chomping '-'(strip)：去尾随换行；默认/'+' 保持
+            text = text.rstrip("\n")
+        return text
 
     def _map(self, indent: int):
         d = {}
@@ -279,7 +293,7 @@ class _Reader:
                 self._assign(container, key, None)
         elif _BLOCK_SCALAR_RE.match(val):
             self.i += 1
-            self._assign(container, key, self._block_scalar(col))
+            self._assign(container, key, self._block_scalar(col, val))
         elif val.startswith("&") and len(val.split()) == 1:
             # 块级锚点：&name 后接缩进子块
             name = val[1:]
@@ -310,6 +324,17 @@ class _Reader:
             elif rest[0] in "[{":                   # 流式
                 items.append(_scalar(rest))
                 self.i += 1
+            elif rest.startswith("&") and len(rest.split()) == 1:
+                # `- &anchor` 后接缩进子映射/子序列（聚合/手写配置常给整条 proxy 起锚点）。
+                # 旧逻辑把 '&anchor' 当纯标量、anchors[x]=None，后续缩进行触发“缩进异常”毁掉整篇（BUG-3）。
+                name = rest[1:]
+                self.i += 1
+                if self.i < len(self.lines) and self.lines[self.i][0] > indent:
+                    block = self._block(self.lines[self.i][0])
+                else:
+                    block = None
+                self.anchors[name] = block
+                items.append(block)
             else:
                 k, v = _split_kv(rest)
                 if v is None:                       # 纯标量项
@@ -329,7 +354,7 @@ class _Reader:
                         self._assign(item, kk0, self._block(cind) if cind is not None else None)
                     elif _BLOCK_SCALAR_RE.match(v):
                         self.i += 1
-                        self._assign(item, kk0, self._block_scalar(key_col))
+                        self._assign(item, kk0, self._block_scalar(key_col, v))
                     else:
                         self._assign(item, kk0, self._resolve_scalar(v))
                         self.i += 1

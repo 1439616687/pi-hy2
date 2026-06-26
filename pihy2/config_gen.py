@@ -14,6 +14,7 @@ import ipaddress
 import json
 import math
 import re
+import urllib.parse
 
 # 默认设置（store 会以此为模板）
 DEFAULT_SETTINGS = {
@@ -32,6 +33,7 @@ DEFAULT_SETTINGS = {
     "default_down": "100 Mbps",
     "presets": [],                   # 启用的一键分流预设 key 列表
     "final": "PROXY",                # 兜底策略：PROXY 或 DIRECT
+    "github_mirror": "",             # mihomo 下载镜像前缀（须 https://，留空=直连 GitHub）
     "external_controller": "127.0.0.1:9090",  # clash API，供面板做实时切换/测速
     "secret": "",                    # clash API 密钥（首次安装随机生成）
 }
@@ -187,6 +189,10 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
                 raise ValueError(f"非法 IP/CIDR：{value}")
             if "/" not in value:
                 value = f"{value}/32" if "." in value else f"{value}/128"
+        elif kind in ("DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD") and not value:
+            # 显式域名类却为空：抛错由 build_config 跳过，避免下发 DOMAIN-SUFFIX,, 这类被 mihomo -t 拒绝、
+            # 进而卡住此后每一次 apply 的坏规则（含订阅定时器）。
+            raise ValueError("规则值为空")
         return kind, value
 
     # auto 智能判别
@@ -197,12 +203,22 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
         return "IP-CIDR", (f"{value}/32" if "." in value else f"{value}/128")
 
     if value.startswith("*."):
-        # *.example.com —— 用户多半想连 example.com 及其子域，DOMAIN-SUFFIX 最贴切且高效
-        return "DOMAIN-SUFFIX", value[2:]
+        sub = value[2:]
+        # *.cn / *.example.com -> DOMAIN-SUFFIX,<sub>（README 文档化：连该域及其子域，ccTLD 亦然）。
+        # 但剥前缀后为空（"*."）或仍含通配（"*.*"）无法构成合法 suffix，回落 DOMAIN-WILDCARD 字面量，
+        # 避免下发 DOMAIN-SUFFIX,, 这类被 mihomo -t 拒绝、卡死后续每次 apply 的空载规则（BUG-1）。
+        if sub and "*" not in sub and "?" not in sub:
+            return "DOMAIN-SUFFIX", sub
+        return "DOMAIN-WILDCARD", value
     if "*" in value or "?" in value:
         return "DOMAIN-WILDCARD", value
     if value.startswith("."):
-        return "DOMAIN-SUFFIX", value[1:]
+        sub = value[1:]
+        if not sub:
+            raise ValueError("规则值为空")
+        return "DOMAIN-SUFFIX", sub
+    if not value:
+        raise ValueError("规则值为空")
     if "." in value:
         return "DOMAIN-SUFFIX", value
     # 单个词，无点：按关键词
@@ -406,12 +422,19 @@ def display_names(nodes: list[dict]) -> dict:
 
 
 def _dedup_names(nodes: list[dict]) -> list[dict]:
-    """节点名去重（同名追加 #2、#3…），并规避 mihomo 保留名，不改原对象。"""
+    """节点名去重（同名追加 #2、#3…），并规避 mihomo 保留名，不改原对象。
+
+    去重编号按**稳定键（节点 id，缺失退回原始下标）**确定，与传入顺序无关：否则
+    build_config（apply 时顺序）与 display_names（点选时 active-first 顺序）会对同一批节点
+    算出不同的 name->node 映射，导致面板「切换/测速」命中错误节点（DC-1）。
+    输出仍保持传入顺序（供 PROXY 选择器把当前节点放最前作默认项）。"""
+    out = [dict(n) for n in nodes]
+    order = sorted(range(len(out)), key=lambda i: (str(out[i].get("id") or ""), i))
     seen: dict[str, int] = {}
-    out = []
-    for n in nodes:
-        n = dict(n)
-        base = (n.get("name") or n.get("server") or "节点").strip() or "节点"
+    for i in order:
+        n = out[i]
+        # str(...)：外部编辑/表单可能把 name 存成 int/list，.strip() 会崩，先统一转字符串
+        base = (str(n.get("name") or n.get("server") or "节点")).strip() or "节点"
         if base.upper() in _RESERVED_NAMES:
             base = base + "·"          # 避免与策略组名 PROXY/AUTO、内建 DIRECT 等冲突
         if base in seen:
@@ -420,7 +443,6 @@ def _dedup_names(nodes: list[dict]) -> list[dict]:
         else:
             seen[base] = 1
             n["name"] = base
-        out.append(n)
     return out
 
 
@@ -433,16 +455,29 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
     mixed_port = _safe_int(s.get("mixed_port"), 7890)   # 脏值（字符串/越界）回落，避免 YAML 里出现非法端口
     if not 1 <= mixed_port <= 65535:
         mixed_port = 7890
+    # 枚举型设置即便经外部编辑/旧版迁移带入非法值，也在此夹紧，避免坏值流进 config.yaml 被
+    # mihomo -t 拒绝、卡住此后每次 apply（webui 层只在写入时校验，store/其它写入方不保证）。
+    log_level = s.get("log_level") if s.get("log_level") in (
+        "silent", "error", "warning", "info", "debug") else "warning"
+    tun_stack = s.get("tun_stack") if s.get("tun_stack") in (
+        "system", "gvisor", "mixed") else "system"
     cfg: dict = {
         "mixed-port": mixed_port,
         # 网关模式或显式 allow_lan 时，混合代理端口/DNS 对局域网开放
         "allow-lan": bool(s.get("allow_lan") or s.get("gateway_mode")),
         "mode": "rule",
-        "log-level": s["log_level"],
-        "ipv6": s["ipv6"],
+        "log-level": log_level,
+        "ipv6": bool(s.get("ipv6")),
     }
-    if s.get("external_controller"):
-        cfg["external-controller"] = s["external_controller"]
+    ec = s.get("external_controller")
+    if ec:
+        # external-controller 必须回环：非回环值（手工编辑/未来校验回归）会把带 secret 的控制器
+        # 暴露到 LAN，故在序列化时再夹一道（与 manager._controller_base / webui 校验同口径）。
+        _host = urllib.parse.urlparse(
+            ec if str(ec).startswith("http") else "http://" + str(ec)).hostname or ""
+        if _host not in ("127.0.0.1", "::1", "localhost"):
+            ec = "127.0.0.1:9090"
+        cfg["external-controller"] = ec
         if s.get("secret"):
             cfg["secret"] = s["secret"]
 
@@ -476,11 +511,11 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
     # dns-hijack / auto-redirect 可配：与本机 Pi-hole/dnsmasq（占 :53）或
     # Docker/firewalld（管 nftables）共存时，可改劫持目标或关掉 nft 重定向。默认保持原行为。
     hijack = s.get("tun_dns_hijack")
-    if not isinstance(hijack, list) or not hijack:
-        hijack = ["any:53"]
+    if not isinstance(hijack, list):
+        hijack = ["any:53"]      # 缺失/脏类型回落默认；显式清空（[]）则尊重用户、下发 dns-hijack: []
     cfg["tun"] = {
         "enable": True,
-        "stack": s["tun_stack"],
+        "stack": tun_stack,
         "dns-hijack": hijack,
         "auto-route": True,
         "auto-redirect": bool(s.get("tun_auto_redirect", True)),
@@ -522,8 +557,14 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
     # rules：安全直连 -> 用户规则 -> 预设 -> 兜底
     # 没有任何节点时，引用 PROXY 组的规则都无效，直接跳过用户规则/预设，整体走 DIRECT
     rule_lines = [f"IP-CIDR,{c},DIRECT,no-resolve" for c in _SAFE_DIRECT_CIDRS]
+    if bool(s.get("ipv6")):
+        # 开 IPv6 时，IPv6 私有/链路本地/回环网段也固定直连，避免 LAN IPv6（SSH/局域网）被代理切断
+        rule_lines += [f"IP-CIDR6,{c},DIRECT,no-resolve"
+                       for c in ("fc00::/7", "fe80::/10", "::1/128")]
     if nodes:
         for r in (rules or []):
+            if not isinstance(r, dict):   # 防御：外部手编/历史毒丸 state 里的非 dict 规则项不该让整份渲染崩
+                continue
             rv = r.get("value")
             if rv is None or not str(rv).strip():
                 continue
