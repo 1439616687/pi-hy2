@@ -179,6 +179,7 @@ def _split_kv(text: str) -> tuple[str, str | None]:
 class _Reader:
     def __init__(self, text: str):
         self.lines = []
+        self.full: list[str] = []     # 与 self.lines 同序对齐：保留缩进的整行（供块标量按相对缩进还原）
         for raw in text.splitlines():
             # 仅把行首缩进里的 tab 折算成空格；行内（尤其是引号字符串里的真实 \t，
             # 如 header/password）原样保留，避免被悄悄替换成 4 个空格造成数据损坏
@@ -194,6 +195,7 @@ class _Reader:
                 continue
             indent = len(s) - len(s.lstrip(" "))
             self.lines.append((indent, stripped))
+            self.full.append(s)
         self.i = 0
         self.anchors: dict[str, object] = {}
 
@@ -240,11 +242,16 @@ class _Reader:
 
     def _block_scalar(self, indent: int, indicator: str = "|") -> str:
         """收集所有缩进大于 indent 的后续行作为块标量字符串（尽力而为）。
-        indicator 形如 |、>、|-、>+ 等：> 折叠换行为空格，| 保留换行；'-' 去尾随换行。"""
-        parts = []
+        indicator 形如 |、>、|-、>+ 等：> 折叠换行为空格，| 保留换行；'-' 去尾随换行。
+        用保留缩进的整行（self.full）并按块内最小缩进统一左移，保留 PEM/多行内容的相对缩进。"""
+        rows = []
         while self.i < len(self.lines) and self.lines[self.i][0] > indent:
-            parts.append(self.lines[self.i][1])
+            rows.append(self.full[self.i])
             self.i += 1
+        if not rows:
+            return ""
+        base = min(len(r) - len(r.lstrip(" ")) for r in rows)
+        parts = [r[base:] for r in rows]
         sep = " " if indicator.startswith(">") else "\n"
         text = sep.join(parts)
         if indicator.endswith("-"):     # chomping '-'(strip)：去尾随换行；默认/'+' 保持
