@@ -68,7 +68,7 @@ sudo bash install.sh
 ## ⌨️ 命令行（装好后可用 `pihy2`）
 
 ```bash
-pihy2 install            # 重新运行部署向导
+pihy2 install            # 部署向导；已部署时会先弹管理菜单（继续向导/自检/状态/恢复默认/卸载）
 pihy2 add 'hy2://...'    # 快速加节点（也可管道：echo 链接 | pihy2 add）
 pihy2 add 'hy2://...' --apply   # 加完直接应用
 pihy2 sub add 'https://订阅URL' --name 机场 --apply   # 添加订阅（定时自动更新）

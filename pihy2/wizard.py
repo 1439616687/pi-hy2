@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import sys
 import urllib.parse
@@ -45,23 +46,29 @@ def ask_yn(prompt: str, default: bool = True) -> bool:
 
 
 def _ask_mirror(default: str = "") -> str:
-    """选填 mihomo 下载镜像：留空（或回车保持已有默认）=直连，``-`` =强制直连。
+    """选填 mihomo 下载镜像：回车=保持当前（无当前则=直连）；输入 ``-`` / ``直连`` / ``无`` =强制直连。
 
     就地把取值规整为 ``https://`` 前缀，并拒绝 http 与内网/本机地址（与 manager 的 SSRF 校验
-    同口径——manager 在真正下载时还会再校验一次）。非法即重填，绝不因一次手误中断整个向导。
+    同口径——manager 在真正下载时还会再校验一次）。非法即重填，但**绝不卡死**：若带进来的旧默认
+    本身已失效（如旧镜像域名当前解析不了），首次校验失败后即清掉该默认，使下一次回车=直连——
+    这正是“重新部署时回车也过不去”死循环的根因修复（默认值粘住回车、而其又通不过校验）。
     """
+    if default:
+        _p(f"{C_DIM}  当前已存镜像：{default}（回车保留并校验；输入 - 改直连；或输入新的 https 镜像）{C_END}")
     while True:
-        val = ask("下载镜像（留空=直连 GitHub）", default).strip()
-        if val in ("", "-"):
+        val = ask("下载镜像（- 或留空=直连 GitHub）", default).strip()
+        if val in ("", "-", "直连", "无", "none", "skip"):
             return ""
         url = val if "://" in val else "https://" + val
         if not url.lower().startswith("https://"):
-            _p(f"{C_WARN}  镜像必须以 https:// 开头，请重填或留空直连。{C_END}")
+            _p(f"{C_WARN}  镜像必须以 https:// 开头；输入 - 直连，或重填。{C_END}")
+            default = "" if val == default else default   # 失效的旧默认不再粘住回车
             continue
         try:
             manager._resolve_public(urllib.parse.urlparse(url).hostname or "")
         except Exception:
-            _p(f"{C_WARN}  镜像主机无法解析或指向内网/本机，请换公网镜像或留空直连。{C_END}")
+            _p(f"{C_WARN}  镜像主机无法解析或指向内网/本机；输入 - 直连，或换公网镜像。{C_END}")
+            default = "" if val == default else default   # 同上：避免“回车=重填同一失效默认”的死循环
             continue
         return url
 
@@ -95,6 +102,103 @@ def show_nodes(nodes: list[dict]):
         _p(f"  {i}. {C_OK}{n['name']}{C_END}  {n['server']}:{n['port']}{tail}")
 
 
+def _ask_choice(prompt: str, n: int) -> int:
+    """读 0..n 的菜单选择；非法（空/非数字/越界）就重读，绝不因手误跳到别的动作。"""
+    while True:
+        v = ask(prompt).strip()
+        if v.isdigit() and 0 <= int(v) <= n:
+            return int(v)
+        _p(f"{C_WARN}  请输入 0–{n} 之间的数字。{C_END}")
+
+
+_ST_SYM = {"ok": (C_OK, "✓"), "warn": (C_WARN, "!"), "fail": (C_ERR, "✗"), "skip": (C_DIM, "–")}
+
+
+def _print_selftest(store):
+    """运行期自检并彩色打印（与 `pihy2 selftest` 同源 manager.self_test）。"""
+    res = manager.self_test(store)
+    _p("")
+    for c in res["checks"]:
+        col, s = _ST_SYM.get(c["status"], (C_DIM, "?"))
+        line = f"  {col}{s}{C_END} {c['label']}"
+        if c["detail"]:
+            line += f"：{c['detail']}"
+        _p(line)
+    s = res["summary"]
+    _p(f"  ——  {C_OK}通过 {s['ok']}{C_END} / {C_WARN}警告 {s['warn']}{C_END} / "
+       f"{C_ERR}失败 {s['fail']}{C_END} / 跳过 {s['skip']}")
+
+
+def _print_status(store):
+    st = manager.service_status("mihomo")
+    web = manager.service_status("pihy2-web")
+    _p(f"\n  mihomo   ：{st['active']} / 开机自启 {st['enabled']}")
+    _p(f"  pihy2-web：{web['active']} / 开机自启 {web['enabled']}")
+    act = store.active_node()
+    _p(f"  节点数   ：{len(store.data['nodes'])}  当前出口：{(act or {}).get('name', '无')}")
+    w = store.data["webui"]
+    tail = "（已设密码）" if w.get("password") else "（未设密码，仅本机可访问）"
+    _p(f"  面板     ：http://<树莓派IP>:{w['port']}  {tail}")
+    if st["active"] == "active":
+        _p(f"  {C_DIM}正在探测出口 IP…{C_END}")
+        _p(f"  出口 IP  ：{C_OK}{manager.current_ip(timeout=5, retries=2)}{C_END}")
+
+
+def _do_restore_defaults(store):
+    if not ask_yn("把设置恢复出厂默认？（重置带宽/DNS/TUN/预设等，不动节点/订阅/规则/面板密码）", False):
+        return
+    with state_lock():
+        store.restore_default_settings()
+        store.save()
+    _p(f"  {C_OK}已恢复默认设置。{C_END}")
+    if os.path.exists(manager.MIHOMO_BIN) and ask_yn("现在应用并重启 mihomo 使其生效吗？", True):
+        ok, msg = manager.apply_config(store)
+        _p("  " + msg)
+
+
+def _do_uninstall() -> bool:
+    """交互式卸载；返回 True=已卸载，False=用户取消。"""
+    _p(f"{C_WARN}  卸载会停止并移除 mihomo 与面板服务、撤销开机自启与网关转发持久化。{C_END}")
+    purge = ask_yn("同时删除二进制、配置与 /etc/pihy2 状态（--purge，不可恢复）？", False)
+    prompt = ("确认卸载？（含 purge：节点/订阅/设置全部删除且不可恢复）" if purge
+              else "确认卸载？（保留 /etc/pihy2 状态，可重装恢复）")
+    if not ask_yn(prompt, False):
+        _p("  已取消卸载。")
+        return False
+    manager.uninstall(purge=purge, log=lambda m: _p("  " + m))
+    _p(f"  {C_OK}卸载完成。{C_END}")
+    return True
+
+
+def _manage_existing(store) -> bool:
+    """已部署时的管理菜单。返回 True=继续走部署向导（添加/改节点与设置）；
+    返回 False=用户选择退出或已执行完终态动作（卸载），调用方据此直接结束。"""
+    while True:
+        title("检测到 pihy2 已部署 · 选择要做什么")
+        _p(f"  已有节点 {len(store.data['nodes'])} 个，面板端口 {store.data['webui']['port']}。")
+        _p("  1) 继续部署向导（添加节点 / 修改带宽·路由·网关·面板等设置）")
+        _p("  2) 运行自检（检查安装/服务/配置/出口是否正常）")
+        _p("  3) 查看运行状态与面板地址")
+        _p("  4) 恢复默认设置（不动节点/订阅/规则/面板密码）")
+        _p(f"  5) {C_ERR}卸载 pihy2{C_END}")
+        _p("  0) 退出（不改动任何东西）")
+        choice = _ask_choice("输入序号", 5)
+        if choice == 1:
+            return True
+        if choice == 0:
+            _p("已退出，未改动任何东西。")
+            return False
+        if choice == 2:
+            _print_selftest(store)
+        elif choice == 3:
+            _print_status(store)
+        elif choice == 4:
+            _do_restore_defaults(store)
+        elif choice == 5:
+            if _do_uninstall():
+                return False          # 已卸载，结束；取消则回到菜单
+
+
 def run_wizard():
     try:
         _run_wizard()
@@ -111,10 +215,13 @@ def _run_wizard():
         sys.exit(1)
 
     store = Store()
-    if store.data["nodes"]:
-        _p(f"{C_WARN}检测到已有 {len(store.data['nodes'])} 个节点配置。{C_END}")
-        if not ask_yn("继续将向导添加新节点（不会删除现有），是否继续？", True):
-            return
+    # 已部署（装了二进制/服务或已有节点）时先给管理菜单：继续向导 / 自检 / 状态 / 恢复默认 / 卸载。
+    # 这样重新执行脚本不再被迫从头走一遍向导，卸载与恢复默认也都能在此一处完成（FEAT-2/3/4）。
+    installed = (os.path.exists(manager.MIHOMO_BIN)
+                 or os.path.exists(manager.MIHOMO_SERVICE)
+                 or bool(store.data["nodes"]))
+    if installed and not _manage_existing(store):
+        return
 
     # ---- 1. 节点 ----
     title("第 1 步 / 添加节点")
@@ -196,15 +303,24 @@ def _run_wizard():
     # 面板能以 root 改系统代理，必须有密码——否则只监听回环，无法局域网访问。
     _p(f"{C_WARN}面板以 root 运行、能改系统代理，必须设访问密码才会开放到局域网。{C_END}")
     import getpass
+    existing_pw = store.data["webui"].get("password", "")
+    if existing_pw:        # 重新部署：回车=保持原密码不变，绝不在用户没要求时悄悄改掉它
+        _p(f"{C_DIM}已设置过访问密码。直接回车=保持不变；输入新密码=修改。{C_END}")
+    prompt = "访问密码（回车=保持不变）: " if existing_pw else "设置访问密码（直接回车=自动生成）: "
     pw = ""
     try:
-        pw = getpass.getpass("设置访问密码（直接回车=自动生成）: ").strip()
+        pw = getpass.getpass(prompt).strip()
     except Exception:
-        # 无法隐藏输入的环境（如某些管道/无 tty）：不退回明文 input 回显密码，直接自动生成
-        _p(f"{C_WARN}  当前环境无法隐藏输入，将自动生成随机密码以避免明文回显。{C_END}")
+        # 无法隐藏输入的环境（如某些管道/无 tty）：不退回明文 input 回显密码
+        _p(f"{C_WARN}  当前环境无法隐藏输入，{'保持原密码' if existing_pw else '将自动生成随机密码'}以避免明文回显。{C_END}")
         pw = ""
-    store.data["webui"]["password"] = pw or secrets.token_urlsafe(9)
-    if not pw:
+    if pw:
+        store.data["webui"]["password"] = pw
+    elif existing_pw:
+        store.data["webui"]["password"] = existing_pw         # 保持不变
+        _p(f"  {C_DIM}保持原访问密码不变。{C_END}")
+    else:
+        store.data["webui"]["password"] = secrets.token_urlsafe(9)
         _p(f"  已生成随机密码：{C_OK}{store.data['webui']['password']}{C_END}")
     with state_lock():        # 与订阅定时器/面板的并发写互斥，避免它们的更新被本次保存覆盖丢失
         store.save()
@@ -218,35 +334,40 @@ def _run_wizard():
             _p("已中止。请确认内核 tun 模块可用后重试。")
             sys.exit(1)
     _p("· 安装 mihomo")
-    arch = manager.detect_arch()
-    # 镜像仅对内置 SHA-256 的架构（arm64/amd64）安全可用；其它架构 install_mihomo 会直接拒绝镜像，
-    # 故只在受支持的架构上提供镜像选项，避免在 32 位树莓派上填了镜像却必然安装失败（兼容性关键点）。
-    mirror_ok = arch in manager.PINNED_SHA256
-    mirror = store.data["settings"].get("github_mirror", "")
-    if mirror_ok:
-        _p(f"{C_DIM}  直连 GitHub 慢/被墙时可填下载镜像（公网 https 前缀，如 https://ghproxy.com/）；{C_END}")
-        _p(f"{C_DIM}  留空=直连。镜像会强制固定版本并校验 SHA-256，且不支持局域网地址。{C_END}")
-        mirror = _ask_mirror(mirror)
+    # 已装好可用的二进制（重新部署的常见情形）：无需再问下载镜像、更不必重新下载——这也避免了
+    # 旧的失效镜像默认值把“镜像”这一步卡死（用户报告的回车过不去即源于此）。
+    if os.path.exists(manager.MIHOMO_BIN) and manager._binary_ok(manager.MIHOMO_BIN):
+        _p(f"  {C_OK}已存在可用的 mihomo，跳过下载。{C_END}")
     else:
-        if mirror:
-            _p(f"{C_WARN}  当前架构 {arch} 未内置校验和，下载镜像不可用，改为直连 GitHub。{C_END}")
-        mirror = ""
-        _p(f"{C_DIM}  架构 {arch}：镜像需 arm64/amd64；本架构直连 GitHub"
-           f"（慢/失败可手动放二进制到 /usr/local/bin/mihomo 后重跑）。{C_END}")
-    store.data["settings"]["github_mirror"] = mirror
+        arch = manager.detect_arch()
+        # 镜像仅对内置 SHA-256 的架构（arm64/amd64）安全可用；其它架构 install_mihomo 会直接拒绝镜像，
+        # 故只在受支持的架构上提供镜像选项，避免在 32 位树莓派上填了镜像却必然安装失败（兼容性关键点）。
+        mirror_ok = arch in manager.PINNED_SHA256
+        mirror = store.data["settings"].get("github_mirror", "")
+        if mirror_ok:
+            _p(f"{C_DIM}  直连 GitHub 慢/被墙时可填下载镜像（公网 https 前缀，如 https://ghproxy.com/）；{C_END}")
+            _p(f"{C_DIM}  留空=直连。镜像会强制固定版本并校验 SHA-256，且不支持局域网地址。{C_END}")
+            mirror = _ask_mirror(mirror)
+        else:
+            if mirror:
+                _p(f"{C_WARN}  当前架构 {arch} 未内置校验和，下载镜像不可用，改为直连 GitHub。{C_END}")
+            mirror = ""
+            _p(f"{C_DIM}  架构 {arch}：镜像需 arm64/amd64；本架构直连 GitHub"
+               f"（慢/失败可手动放二进制到 /usr/local/bin/mihomo 后重跑）。{C_END}")
+        store.data["settings"]["github_mirror"] = mirror
 
-    while True:                                  # 失败可换镜像/改直连后重试，不丢前面几步的输入
-        try:
-            manager.install_mihomo(mirror=mirror, log=lambda m: _p("  " + m))
-            break
-        except Exception as e:
-            _p(f"{C_ERR}  mihomo 安装失败：{e}{C_END}")
-            if mirror_ok and ask_yn("换个镜像或留空直连后重试吗？（否=放弃）", True):
-                mirror = _ask_mirror(mirror)
-                store.data["settings"]["github_mirror"] = mirror
-                continue
-            _p("  也可手动下载二进制放到 /usr/local/bin/mihomo 后重跑：python3 -m pihy2 install")
-            sys.exit(1)
+        while True:                              # 失败可换镜像/改直连后重试，不丢前面几步的输入
+            try:
+                manager.install_mihomo(mirror=mirror, log=lambda m: _p("  " + m))
+                break
+            except Exception as e:
+                _p(f"{C_ERR}  mihomo 安装失败：{e}{C_END}")
+                if mirror_ok and ask_yn("换个镜像或留空直连后重试吗？（否=放弃）", True):
+                    mirror = _ask_mirror(mirror)
+                    store.data["settings"]["github_mirror"] = mirror
+                    continue
+                _p("  也可手动下载二进制放到 /usr/local/bin/mihomo 后重跑：python3 -m pihy2 install")
+                sys.exit(1)
     with state_lock():                           # 持久化最终镜像选择（WebUI 设置页也读它做后续下载）
         store.save()
 
