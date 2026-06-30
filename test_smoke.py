@@ -166,6 +166,13 @@ def _mirror(seq):
     return wizard._ask_mirror("")
 
 
+def _mirror_real(seq, default):
+    # 模拟真实 ask 语义：空输入回落 default（_mirror 的桩忽略 default，故另写一个用于验证“回车=默认”路径）
+    _it = iter(seq)
+    wizard.ask = lambda prompt, d="": (next(_it) or d)
+    return wizard._ask_mirror(default)
+
+
 _mgr._resolve_public = _fake_resolve
 try:
     check("mirror empty -> direct", _mirror([""]) == "")
@@ -177,6 +184,12 @@ try:
           _mirror(["https://192.168.5.2:2088/", "-"]) == "")
     check("arch gate: arm64 supported, armv7 not",
           "arm64" in _mgr.PINNED_SHA256 and "armv7" not in _mgr.PINNED_SHA256)
+    # 重新部署死循环修复：带进来的旧默认镜像失效时，连按回车不再卡死——首次失败即清默认，二次回车=直连
+    check("stale default mirror does not trap on enter",
+          _mirror_real(["", ""], "https://gh-proxy.org/") == "")
+    # 回车保留仍有效的旧默认镜像
+    check("valid default mirror kept on enter",
+          _mirror_real([""], "https://ghproxy.com/") == "https://ghproxy.com/")
 finally:
     _mgr._resolve_public, wizard.ask = _orig_resolve, _orig_ask
 
