@@ -297,6 +297,26 @@ legend .muted { font-weight: 500; }
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; color: #2b3440; line-height: 1.55;
 }
 
+/* ------------------------------------------------------------------ 自检 / 危险操作（FEAT-2/4） */
+.selftest { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.st-summary { font-weight: 600; color: var(--fg); margin-bottom: 4px; }
+.st-row {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 7px 11px; border-radius: var(--r-sm); background: var(--panel-2); border: 1px solid var(--line-soft);
+}
+.st-row .st-dot { width: 16px; text-align: center; font-weight: 700; flex-shrink: 0; }
+.st-row .st-label { min-width: 132px; color: var(--fg); font-weight: 500; }
+.st-row .st-detail { word-break: break-word; flex: 1; }
+.st-row.ok   .st-dot { color: var(--ok-text); }
+.st-row.warn .st-dot { color: var(--warn-text); }
+.st-row.warn { background: var(--warn-soft); border-color: rgba(255,149,0,.3); }
+.st-row.fail .st-dot { color: var(--err-text); }
+.st-row.fail { background: var(--err-soft); border-color: rgba(255,59,48,.32); }
+.st-row.skip .st-dot { color: var(--muted); }
+.st-row.skip .st-label { color: var(--fg-dim); }
+.danger-zone { border-color: rgba(255,59,48,.35); }
+.danger-zone legend { color: var(--err-text); }
+
 /* ------------------------------------------------------------------ 提示 / 预览 */
 .toast {
   position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);

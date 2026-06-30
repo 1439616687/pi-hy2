@@ -7,6 +7,7 @@ WebUI 与命令行向导都读写它，再调用 config_gen 渲染并 apply。
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import re
@@ -312,6 +313,21 @@ class Store:
     def set_settings(self, settings: dict) -> None:
         clean = {k: v for k, v in dict(settings).items() if k in self._ALLOWED_SETTING_KEYS}
         self.data["settings"].update(clean)
+
+    def restore_default_settings(self) -> dict:
+        """把「设置」恢复为出厂默认（含存于 settings 的分流预设 presets / 兜底策略 final）。FEAT-3
+
+        刻意保留 clash API 密钥 secret——重置它会让正在运行的 mihomo 与面板用的密钥不一致，
+        免重启切换/测速/流量在下次 apply 重启前全部失效，且轮换密钥对“恢复默认”无任何安全收益。
+        不触碰 节点 / 订阅 / 路由规则 / 面板访问（端口·地址·密码）：这些不属于「设置」页，
+        贸然清掉会误删用户精心配置或把用户锁在面板外。调用方须随后 save()，并 apply 才生效。"""
+        secret = self.data.get("settings", {}).get("secret")
+        # 深拷贝：默认值里的 list（dns_*/tun_dns_hijack/presets 等）必须是独立对象，
+        # 否则面板若原地改写某个 list 会污染模块级 DEFAULT_SETTINGS，殃及随后每一次恢复/新建。
+        fresh = copy.deepcopy(config_gen.DEFAULT_SETTINGS)
+        fresh["secret"] = secret if isinstance(secret, str) and secret else secrets.token_hex(16)
+        self.data["settings"] = fresh
+        return fresh
 
     def set_active(self, node_id: str) -> None:
         self.data["active"] = node_id

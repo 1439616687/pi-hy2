@@ -562,6 +562,43 @@ async function serviceAction(action) {
   if (done(r, '已执行 ' + action)) setTimeout(refreshStatus, 1200);
 }
 
+// ----------------------------------------------------------------- 维护 / 自检 / 卸载（FEAT-2/3/4）
+const ST_SYM = { ok: '✓', warn: '!', fail: '✗', skip: '–' };
+async function runSelfTest() {
+  const box = el('selftest-out'); box.classList.remove('hidden');
+  box.innerHTML = '<div class="muted small">正在自检…（探测出口 IP 可能需要几秒）</div>';
+  const r = await api('POST', '/api/selftest', { probe_ip: true });
+  if (!r.ok || !r.result) { box.innerHTML = '<div class="err">自检失败：' + esc((r && (r.error || r.message)) || '请重试') + '</div>'; return; }
+  const res = r.result, s = res.summary;
+  const rows = (res.checks || []).map(c =>
+    `<div class="st-row ${esc(c.status)}"><span class="st-dot">${ST_SYM[c.status] || '?'}</span>` +
+    `<span class="st-label">${esc(c.label)}</span>` +
+    `<span class="st-detail muted small">${esc(c.detail || '')}</span></div>`).join('');
+  box.innerHTML = `<div class="st-summary">通过 ${s.ok} · 警告 ${s.warn} · 失败 ${s.fail} · 跳过 ${s.skip}</div>` + rows;
+  toast(res.ok ? '自检通过' : '自检发现问题', res.ok ? 'ok' : 'err');
+}
+async function restoreDefaults() {
+  if (!confirm('把“设置”恢复为出厂默认？\n会重置设置页各项与分流预设、兜底策略；不影响节点、订阅、路由规则与面板密码。\n恢复后需点“应用配置并重启”才生效。')) return;
+  const r = await api('POST', '/api/restore-defaults');
+  if (done(r, r.message || '已恢复默认设置')) await loadState();
+}
+async function doUninstall() {
+  const purge = !!(el('uninstall-purge') && el('uninstall-purge').checked);
+  const msg = purge
+    ? '【高危】将卸载 pihy2，并删除二进制、配置与全部状态（节点 / 订阅 / 设置，不可恢复）。\n\n确定继续？'
+    : '将卸载 pihy2（停止并移除 mihomo 与面板服务），保留 /etc/pihy2 状态以便重装。\n\n确定继续？';
+  if (!confirm(msg)) return;
+  if (purge && !confirm('再次确认：purge 会彻底删除所有节点 / 订阅 / 设置，且无法恢复。仍要继续？')) return;
+  const r = await api('POST', '/api/uninstall', { confirm: true, purge: purge });
+  if (!r || !r.ok) { toast('失败：' + ((r && (r.error || r.message)) || '请重试'), 'err'); return; }
+  stopTraffic();
+  // 卸载会停掉面板服务，本页面随即失联——直接替换为终态提示，避免后续请求一片红错
+  el('app').innerHTML = '<div style="max-width:560px;margin:80px auto;text-align:center;line-height:1.7" class="muted">' +
+    '<h2>pihy2 正在卸载</h2><p>卸载已在后台独立进程执行，本面板随即下线。</p><p>' +
+    (purge ? '已选择 <b>purge</b>：二进制、配置与全部状态将一并删除。' : '已保留 <code>/etc/pihy2</code> 状态，可重装恢复。') +
+    '</p><p class="small">如需确认结果，可在树莓派上运行 <code>systemctl status mihomo pihy2-web</code>。</p></div>';
+}
+
 // ----------------------------------------------------------------- 流量面板
 function humanBytes(n) {
   n = n || 0; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;

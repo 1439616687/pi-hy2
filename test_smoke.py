@@ -180,6 +180,57 @@ try:
 finally:
     _mgr._resolve_public, wizard.ask = _orig_resolve, _orig_ask
 
+# 7. 维护功能：恢复默认设置 / 卸载命令构造 / 运行期自检（FEAT-2/3/4）
+section("maintenance features")
+from pihy2 import manager as _mgr2  # noqa: E402
+
+# restore_default_settings：重置设置但保留 secret 与节点/规则；结果与 DEFAULT_SETTINGS 一致（除 secret）
+_sp = tempfile.mktemp()
+_sst = store.Store(_sp)
+_sst.add_node({"type": "ss", "name": "x", "server": "a.com", "port": 8388,
+               "cipher": "aes-256-gcm", "password": "pw"})
+_sst.data["settings"]["mixed_port"] = 1234
+_sst.data["settings"]["log_level"] = "debug"
+_sst.data["settings"]["github_mirror"] = "https://m.example/"
+_old_secret = _sst.data["settings"]["secret"]
+_sst.restore_default_settings()
+if os.path.exists(_sp):
+    os.remove(_sp)
+check("restore resets changed setting", _sst.data["settings"]["mixed_port"] == 7890)
+check("restore clears mirror", _sst.data["settings"]["github_mirror"] == "")
+check("restore keeps clash secret", _sst.data["settings"]["secret"] == _old_secret)
+check("restore keeps nodes", len(_sst.data["nodes"]) == 1)
+check("restore equals DEFAULT_SETTINGS sans secret",
+      {k: v for k, v in _sst.data["settings"].items() if k != "secret"}
+      == {k: v for k, v in config_gen.DEFAULT_SETTINGS.items() if k != "secret"})
+# 默认值的可变 list 不与模块级 DEFAULT_SETTINGS 共享同一对象（避免原地改写污染下一次恢复）
+_sst.data["settings"]["dns_china"].append("8.8.4.4")
+check("restore does not alias DEFAULT_SETTINGS lists",
+      "8.8.4.4" not in config_gen.DEFAULT_SETTINGS["dns_china"])
+
+# 卸载子进程命令构造：末位带/不带 --purge，且始终含 `-m pihy2 uninstall`
+_argv = _mgr2._uninstall_argv(False)
+check("uninstall argv has module entry", _argv[1:4] == ["-m", "pihy2", "uninstall"])
+check("uninstall argv no purge by default", "--purge" not in _argv)
+check("uninstall argv purge appends flag", _mgr2._uninstall_argv(True)[-1] == "--purge")
+
+# self_test：结构完整、状态合法、单项兜底不抛异常（本机通常无 mihomo -> binary 判 fail）
+_tp = tempfile.mktemp()
+_tst = store.Store(_tp)
+_res = _mgr2.self_test(_tst, probe_ip=False)   # probe_ip=False：不打网络，CI 可跑
+if os.path.exists(_tp):
+    os.remove(_tp)
+check("self_test returns non-empty checks", isinstance(_res.get("checks"), list) and bool(_res["checks"]))
+check("self_test summary totals match", sum(_res["summary"].values()) == len(_res["checks"]))
+check("self_test rows well-formed",
+      all({"key", "label", "status", "detail"} <= set(c)
+          and c["status"] in ("ok", "warn", "fail", "skip") for c in _res["checks"]))
+check("self_test ok flag reflects fails",
+      _res["ok"] == (_res["summary"]["fail"] == 0))
+check("self_test covers core checks",
+      {"binary_installed", "config", "service_active", "egress", "state_perm"}
+      <= {c["key"] for c in _res["checks"]})
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
