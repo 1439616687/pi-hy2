@@ -518,6 +518,26 @@ class Handler(BaseHTTPRequestHandler):
                 applied = manager.apply_config(self._store())[1]   # 锁外应用
             return self._json({"ok": True, "count": total, "applied": applied})
 
+        if path == "/api/selftest":          # FEAT-4 运行期健康自检（只读探测，不改状态，故不持锁）
+            probe = body.get("probe_ip", True)
+            return self._json({"ok": True,
+                               "result": manager.self_test(store, probe_ip=bool(probe))})
+
+        if path == "/api/restore-defaults":  # FEAT-3 恢复默认设置（保留 secret/节点/订阅/规则/面板密码）
+            with _lock, state_lock():
+                store = self._store()
+                store.restore_default_settings()
+                store.save()
+            return self._json({"ok": True, "message": "已恢复默认设置，点“应用配置并重启”后生效"})
+
+        if path == "/api/uninstall":         # FEAT-2 一键卸载：用脱离本服务 cgroup 的独立进程执行
+            # 二次确认门槛：除登录态 + CSRF 守卫外，强制要求显式 confirm，防误触/重放触发毁灭性操作
+            if not body.get("confirm"):
+                return self._err("卸载需要显式确认（confirm=true）")
+            purge = bool(body.get("purge"))
+            ok, msg = manager.spawn_uninstall(purge=purge)   # 子进程，瞬时返回
+            return self._json({"ok": ok, "message": msg, "purge": purge})
+
         return self._err("not found", 404)
 
     # ----------------------------------------------------------- PUT API

@@ -16,9 +16,11 @@ import ipaddress
 import json
 import os
 import platform
+import shlex
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -948,3 +950,157 @@ def uninstall(purge: bool = False, log=print) -> None:
     log("已卸载" + ("（含二进制、配置、状态与安装目录）" if purge else "（保留 /etc/pihy2 状态，可重装恢复）") +
         "。注意：为避免影响 Docker 等，本机运行期的 net.ipv4.ip_forward / rp_filter 不会被改回；"
         "如需还原请重启或手动 sysctl -w。")
+
+
+def _uninstall_argv(purge: bool = False) -> list:
+    """构造与 `pihy2 uninstall [--purge]` 等价的子进程命令行。抽出来便于复用与单测。"""
+    py = sys.executable or "/usr/bin/python3"
+    argv = [py, "-m", "pihy2", "uninstall"]
+    if purge:
+        argv.append("--purge")
+    return argv
+
+
+def spawn_uninstall(purge: bool = False, delay: int = 1, log=print) -> tuple[bool, str]:
+    """从 WebUI 触发「一键卸载」：必须用脱离 pihy2-web 自身 cgroup 的独立进程执行（FEAT-2）。
+
+    卸载流程会 `systemctl stop pihy2-web`——若卸载逻辑跑在面板请求线程或其直接子进程里，
+    systemd 默认 KillMode=control-group 会在停服务时把同 cgroup 的它一并杀掉，使卸载半途而废、
+    服务/文件残留。故优先用 `systemd-run` 起一个瞬态 service（独立 cgroup 与生命周期）执行 CLI
+    卸载，`--collect` 让单元结束后自动回收；延迟 delay 秒启动，给 HTTP 响应先发回浏览器留时间。
+    无 systemd-run 时退回 setsid 后台进程（同 cgroup，KillMode 默认仍可能波及，故仅作兜底）。
+    返回 (是否成功拉起卸载进程, 提示信息)；不在本进程内直接执行卸载，避免自杀式中断。"""
+    pkg = package_dir()
+    argv = _uninstall_argv(purge)
+    # sleep 给响应回传留窗口；exec 让 sh 被 python 取代，进程树更干净
+    inner = f"sleep {int(max(0, delay))}; exec " + " ".join(shlex.quote(a) for a in argv)
+    sr = shutil.which("systemd-run")
+    if sr:
+        # 不指定 --unit（瞬态自动命名），避免上一次遗留的同名单元导致 "unit already exists" 冲突
+        r = run([sr, "--collect", f"--setenv=PYTHONPATH={pkg}", "/bin/sh", "-c", inner],
+                timeout=20)
+        if r.returncode == 0:
+            return True, "卸载已在后台独立进程启动（systemd-run），面板即将下线"
+        log(f"systemd-run 拉起卸载失败：{((r.stderr or r.stdout) or '').strip()}；改用 setsid 兜底")
+    try:
+        # 兜底：start_new_session 脱离会话；继承 root 的 env 但显式补上 PYTHONPATH，
+        # 保证 `python3 -m pihy2` 能从安装目录导入（与 web 服务单元的环境一致）。
+        subprocess.Popen(
+            ["/bin/sh", "-c", inner], cwd=pkg,
+            env={**os.environ, "PYTHONPATH": pkg},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        return True, "卸载已在后台启动，面板即将下线"
+    except OSError as e:
+        return False, f"无法启动卸载进程：{e}"
+
+
+# ---------------------------------------------------------------- 运行期自检
+def self_test(store, probe_ip: bool = True) -> dict:
+    """运行期健康自检（FEAT-4）：逐项体检 安装 / 二进制 / TUN / 配置可校验 / 节点 / 服务 /
+    clash 控制器 / 出口 IP / 主机冲突 / 状态文件权限，返回结构化结果供 CLI 与面板展示。
+
+    纯只读探测：不改任何状态或配置。与 test_smoke.py 互补——后者是离线“开发期回归自检”
+    （解析/渲染单元测试），本函数体检“这台机器此刻装好没、跑起来没、配置合不合法”。
+    每项独立兜底，单项异常不拖垮整体；probe_ip=False 跳过较慢的出口 IP 探测。
+    返回 {ok, checks:[{key,label,status,detail}], summary:{ok,warn,fail,skip}}，
+    status ∈ ok/warn/fail/skip；ok 仅在无 fail 项时为 True。"""
+    checks = []
+
+    def add(key, label, status, detail=""):
+        checks.append({"key": key, "label": label, "status": status, "detail": str(detail)})
+
+    add("root", "root 权限", "ok" if is_root() else "warn",
+        "" if is_root() else "非 root 运行，部分系统检查结果可能不准")
+
+    installed = os.path.exists(MIHOMO_BIN)
+    add("binary_installed", "mihomo 已安装", "ok" if installed else "fail",
+        MIHOMO_BIN if installed else f"{MIHOMO_BIN} 不存在，请重跑部署向导 pihy2 install")
+    bin_ok = False
+    if installed:
+        try:
+            bin_ok = _binary_ok(MIHOMO_BIN)
+        except Exception as e:                       # 探测本身异常也不应让自检崩
+            bin_ok = False
+            add("binary_runnable", "mihomo 可运行", "fail", f"探测异常：{e}")
+        else:
+            add("binary_runnable", "mihomo 可运行", "ok" if bin_ok else "fail",
+                "" if bin_ok else "二进制无法 `-v`（可能损坏/架构不符），建议设置里填镜像后重装")
+    else:
+        add("binary_runnable", "mihomo 可运行", "skip", "未安装")
+
+    tun = os.path.exists("/dev/net/tun")
+    add("tun", "TUN 设备", "ok" if tun else "warn",
+        "/dev/net/tun" if tun else "未发现 /dev/net/tun（容器/精简内核可能不支持透明代理）")
+
+    if installed and bin_ok:
+        try:
+            ok_cfg, out = test_config(store.render_config())
+        except Exception as e:
+            ok_cfg, out = False, f"渲染/校验异常：{e}"
+        add("config", "配置可通过校验", "ok" if ok_cfg else "fail",
+            "mihomo -t 通过" if ok_cfg else (out or "mihomo -t 未通过")[-400:])
+    else:
+        add("config", "配置可通过校验", "skip", "mihomo 不可用，跳过")
+
+    n = len(store.data.get("nodes", []))
+    add("nodes", "已配置节点", "ok" if n else "warn",
+        f"{n} 个节点" if n else "尚无节点，请在面板/向导添加后才能代理")
+    act = store.active_node()
+    add("active", "当前出口节点", "ok" if act else "warn",
+        (act or {}).get("name", "") if act else "未选择出口节点")
+
+    mst = service_status("mihomo")
+    running = mst.get("active") == "active"
+    add("service_active", "mihomo 服务运行中", "ok" if running else "fail",
+        f"active={mst.get('active') or '未知'}")
+    add("service_enabled", "mihomo 开机自启",
+        "ok" if mst.get("enabled") == "enabled" else "warn",
+        f"enabled={mst.get('enabled') or '未知'}")
+    wst = service_status("pihy2-web")
+    add("web_service", "面板服务", "ok" if wst.get("active") == "active" else "warn",
+        f"active={wst.get('active') or '未知'} / 开机自启 {wst.get('enabled') or '未知'}")
+
+    settings = store.data.get("settings", {})
+    if running:
+        try:
+            reachable = clash_connections(settings) is not None
+        except Exception:
+            reachable = False
+        add("clash_api", "clash 控制器可达", "ok" if reachable else "warn",
+            "" if reachable else "面板实时切换/测速/流量将不可用；检查 external_controller 与 secret")
+    else:
+        add("clash_api", "clash 控制器可达", "skip", "mihomo 未运行")
+
+    try:
+        warns = host_conflict_warnings(settings)
+    except Exception:
+        warns = []
+    add("conflicts", "主机环境无冲突", "warn" if warns else "ok",
+        "；".join(warns) if warns else "未发现 DNS/VPN 冲突")
+
+    if running and probe_ip:
+        ip = current_ip(timeout=5, retries=1)
+        good = bool(ip) and not ip.startswith("(")    # current_ip 失败时返回 "(获取失败: ...)"
+        add("egress", "出口 IP 探测", "ok" if good else "warn",
+            ip if good else (ip or "未取得出口 IP"))
+    else:
+        add("egress", "出口 IP 探测", "skip",
+            "mihomo 未运行" if not running else "已按请求跳过")
+
+    from .store import STATE_FILE
+    try:
+        if os.path.exists(STATE_FILE):
+            mode = stat.S_IMODE(os.stat(STATE_FILE).st_mode)
+            tight = (mode & 0o077) == 0               # 组/其它无任何权限
+            add("state_perm", "状态文件权限", "ok" if tight else "warn",
+                f"{STATE_FILE} {oct(mode)}" + ("" if tight else "，含明文密码/密钥，建议 chmod 600"))
+        else:
+            add("state_perm", "状态文件权限", "skip", "状态文件尚不存在")
+    except OSError as e:
+        add("state_perm", "状态文件权限", "skip", str(e))
+
+    summary = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
+    for c in checks:
+        summary[c["status"]] = summary.get(c["status"], 0) + 1
+    return {"ok": summary["fail"] == 0, "checks": checks, "summary": summary}

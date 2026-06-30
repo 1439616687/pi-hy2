@@ -7,6 +7,8 @@
   restart/start/stop 控制 mihomo 服务
   config             打印将会生成的 mihomo 配置
   add                从链接快速添加节点并应用（--apply）
+  selftest           运行期健康自检（安装/服务/配置/出口是否正常）
+  restore-defaults   把设置恢复出厂默认（不动节点/订阅/规则/面板密码）
   uninstall          卸载（--purge 同时删除二进制与配置）
   version            版本
 """
@@ -91,6 +93,34 @@ def cmd_add(args):
 
 def cmd_uninstall(args):
     manager.uninstall(purge=args.purge)
+
+
+def cmd_selftest(args):
+    result = manager.self_test(Store(), probe_ip=not args.quick)
+    sym = {"ok": "✓", "warn": "!", "fail": "✗", "skip": "–"}
+    for c in result["checks"]:
+        line = f"  {sym.get(c['status'], '?')} {c['label']}"
+        if c["detail"]:
+            line += f"：{c['detail']}"
+        print(line)
+    s = result["summary"]
+    print(f"\n自检完成：通过 {s['ok']} / 警告 {s['warn']} / 失败 {s['fail']} / 跳过 {s['skip']}")
+    sys.exit(0 if result["ok"] else 1)   # 有失败项即非零退出，便于脚本/CI 感知
+
+
+def cmd_restore_defaults(args):
+    with state_lock():                   # 与面板/订阅定时器互斥，避免半写状态
+        store = Store()
+        store.restore_default_settings()
+        store.save()
+    print("已把设置恢复为出厂默认（保留节点 / 订阅 / 路由规则 / 面板密码 / clash 密钥）。")
+    if args.apply:
+        ok, msg = manager.apply_config(Store())   # 慢 IO 放锁外
+        print(msg)
+        if not ok:
+            sys.exit(1)
+    else:
+        print("提示：运行 `pihy2 apply` 或在面板点“应用配置并重启”后生效。")
 
 
 def cmd_sub(args):
@@ -210,6 +240,14 @@ def build_parser():
     sbd = sbs.add_parser("del", help="删除订阅")
     sbd.add_argument("id"); sbd.add_argument("--keep-nodes", action="store_true")
     sbd.add_argument("--apply", action="store_true"); sbd.set_defaults(func=cmd_sub)
+
+    stp = sub.add_parser("selftest", help="运行期健康自检")
+    stp.add_argument("--quick", action="store_true", help="跳过较慢的出口 IP 探测")
+    stp.set_defaults(func=cmd_selftest)
+
+    rd = sub.add_parser("restore-defaults", help="把设置恢复出厂默认（不动节点/订阅/规则）")
+    rd.add_argument("--apply", action="store_true", help="恢复后立即应用")
+    rd.set_defaults(func=cmd_restore_defaults)
 
     un = sub.add_parser("uninstall", help="卸载")
     un.add_argument("--purge", action="store_true", help="同时删除二进制与配置")

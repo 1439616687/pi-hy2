@@ -202,6 +202,29 @@
         <button class="btn warn" onclick="serviceAction('stop')">停止 mihomo</button>
       </div>
       <pre id="tools-out" class="codebox hidden"></pre>
+
+      <!-- 维护与自检 -->
+      <fieldset style="margin-top:18px">
+        <legend>维护与自检</legend>
+        <div class="bar">
+          <button class="btn" onclick="runSelfTest()">运行自检</button>
+          <button class="btn" onclick="restoreDefaults()">恢复默认设置</button>
+        </div>
+        <div id="selftest-out" class="selftest hidden"></div>
+        <p class="muted small">“运行自检”体检当前<b>安装 / 服务 / 配置 / 节点 / 出口</b>是否正常，逐项给出通过/警告/失败。
+          “恢复默认设置”把<b>设置页各项与分流预设、兜底策略</b>恢复出厂值（<b>不影响</b>节点、订阅、路由规则、面板密码与 clash 密钥），恢复后需点右上角“应用配置并重启”才生效。</p>
+      </fieldset>
+
+      <!-- 危险操作 -->
+      <fieldset style="margin-top:18px" class="danger-zone">
+        <legend>危险操作</legend>
+        <label class="row"><input id="uninstall-purge" type="checkbox"> 同时删除二进制、配置与 <code>/etc/pihy2</code> 状态（--purge，<b>不可恢复</b>）</label>
+        <div class="bar" style="margin-top:8px">
+          <button class="btn danger" onclick="doUninstall()">卸载 pihy2</button>
+        </div>
+        <p class="muted small">卸载会停止并移除 mihomo 与面板服务、撤销开机自启与网关转发持久化。卸载在<b>后台独立进程</b>执行，<b>本面板随即下线</b>。
+          勾选 purge 还会删除二进制、配置与全部状态（节点 / 订阅 / 设置）；默认不勾选则保留 <code>/etc/pihy2</code> 状态，便于重装恢复。</p>
+      </fieldset>
     </section>
   </main>
 </div>
