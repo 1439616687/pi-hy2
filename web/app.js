@@ -181,6 +181,10 @@ function renderNodes() {
   list.innerHTML = STATE.nodes.map(n => {
     const active = n.id === STATE.active;
     const tags = [esc((n.type || 'hysteria2').toUpperCase())];
+    if (n.dialer_proxy) {
+      const f = (STATE.nodes || []).find(x => x.id === n.dialer_proxy);
+      tags.push('链式→' + esc(f ? f.name : '前置缺失'));
+    }
     if (n.network && n.network !== 'tcp') tags.push(esc(n.network));
     if (n.reality_pbk) tags.push('reality');
     if (n.sub) { const s = (STATE.subscriptions || []).find(x => x.id === n.sub); tags.push('订阅:' + esc(s ? s.name : n.sub)); }
@@ -227,7 +231,15 @@ async function setActive(id) {
 
 async function deleteNode(id) {
   const n = STATE.nodes.find(x => x.id === id);
-  if (!confirm(`删除节点「${n ? n.name : id}」？`)) return;
+  // 该节点若被别的链式出口当前置（dialer_proxy）引用：删除后那些出口在下次应用时会被跳过（不再下发）。
+  // 提前列出，避免用户困惑“我加的出口节点怎么没了”。
+  const deps = STATE.nodes.filter(x => x.dialer_proxy === id);
+  let msg = `删除节点「${n ? n.name : id}」？`;
+  if (deps.length) {
+    msg += `\n\n注意：它是以下链式出口的前置代理，删除后这些出口将不再生效（节点仍保留在列表，需改选其它前置）：\n`
+      + deps.map(x => '· ' + x.name).join('\n');
+  }
+  if (!confirm(msg)) return;
   const r = await api('DELETE', '/api/nodes/' + id);
   await loadState();
   done(r, '已删除，记得“应用配置”');
@@ -269,7 +281,63 @@ async function commitNodes() {
   closeModal();
   await loadState();
   const errs = (r.errors || []).length;
-  toast(`已添加 ${(r.added || []).length} 个节点${errs ? `（${errs} 行无法解析）` : ''}，记得“应用配置”`, 'ok');
+  toast(`已添加 ${(r.added || []).length} 个节点${errs ? `（${errs} 行无法解析）` : ''}，记得”应用配置”`, 'ok');
+}
+
+// 链式代理：添加 HTTP/SOCKS5 住宅 IP 代理作为「出口」。这类代理国内不可直连，
+// 须挂在某个国内可达的普通节点（前置代理）后面经 dialer-proxy 出网。
+// 前置下拉只列「自身非链式（无 dialer_proxy）」的节点——既是国内可达的中继，又天然防循环链。
+function frontOptions(excludeId, selectedId) {
+  const fronts = STATE.nodes.filter(n => n.id !== excludeId && !n.dialer_proxy && n.server);
+  if (!fronts.length) return '<option value="">（请先添加一个国内可达的节点作为前置）</option>';
+  return '<option value="">-- 选择前置节点 --</option>' +
+    fronts.map(n => `<option value="${n.id}" ${n.id === selectedId ? 'selected' : ''}>${esc(n.name)}（${esc((n.type || '').toUpperCase())}）</option>`).join('');
+}
+function openAddChain() {
+  el('modal-card').innerHTML = `
+    <h3>添加链式代理 <span class="muted small">出口</span></h3>
+    <p class="muted small">录入 HTTP/SOCKS5 住宅 IP 代理作为<b>出口</b>。它从国内不能直连，须挂在下面选的「前置代理」（国内可达的节点）后面链式出网，从而用更干净的 IP 上网。</p>
+    <div class="grid">
+      <label>名称 <input id="ch-name" type="text" placeholder="如 美国家宽"></label>
+      <label>类型
+        <select id="ch-type"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select>
+      </label>
+      <label>服务器 <input id="ch-server" type="text" placeholder="住宅代理地址"></label>
+      <label>端口 <input id="ch-port" type="number" placeholder="1080"></label>
+      <label>用户名（可空） <input id="ch-user" type="text"></label>
+      <label>密码（可空） <input id="ch-pass" type="text"></label>
+    </div>
+    <label class="row"><input id="ch-tls" type="checkbox"> 启用 TLS（HTTP/HTTPS 代理可选）</label>
+    <label class="row"><input id="ch-skip" type="checkbox" checked> 跳过证书校验</label>
+    <label>前置代理（必选 · 国内可达的中继节点）
+      <select id="ch-front">${frontOptions(null, null)}</select>
+    </label>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn primary" onclick="commitChain()">添加</button>
+    </div>`;
+  el('modal').classList.remove('hidden');
+}
+async function commitChain() {
+  const front = el('ch-front').value;
+  if (!front) { toast('请选择前置代理节点（链式出口必须挂在它后面）', 'err'); return; }
+  const server = el('ch-server').value.trim();
+  if (!server) { toast('请填服务器地址', 'err'); return; }
+  const node = {
+    type: el('ch-type').value,
+    name: el('ch-name').value.trim() || server,
+    server,
+    port: parseInt(el('ch-port').value) || 1080,
+    username: el('ch-user').value.trim(),
+    password: el('ch-pass').value,
+    tls: el('ch-tls').checked,
+    skip_cert_verify: el('ch-skip').checked,
+    dialer_proxy: front,
+  };
+  const r = await api('POST', '/api/nodes', { node });
+  if (!r.ok) { toast('添加失败：' + (r.error || ''), 'err'); return; }
+  closeModal(); await loadState();
+  toast('已添加链式代理，记得”应用配置”', 'ok');
 }
 
 // 编辑节点：按协议显示对应字段
@@ -286,8 +354,11 @@ const FIELDS_BY_TYPE = {
   trojan: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['client_fingerprint', '指纹'], ALPN, ...NET],
   ss: [...COMMON, ['cipher', '加密方式'], ['password', '密码']],
   tuic: [...COMMON, ['uuid', 'UUID'], ['password', '密码'], ['sni', 'SNI'], ALPN, ['congestion', '拥塞控制(bbr)'], ['udp_relay_mode', 'UDP中继(native)']],
+  http: [...COMMON, ['username', '用户名(可空)'], ['password', '密码(可空)'], ['sni', 'SNI(可空)']],
+  socks5: [...COMMON, ['username', '用户名(可空)'], ['password', '密码(可空)']],
 };
-const TLS_TYPES = ['vless', 'vmess', 'trojan'];
+const TLS_TYPES = ['vless', 'vmess', 'trojan', 'http', 'socks5'];
+const CHAIN_TYPES = ['http', 'socks5'];
 function editNode(id) {
   const n = STATE.nodes.find(x => x.id === id); if (!n) return;
   const type = n.type || 'hysteria2';
@@ -295,11 +366,14 @@ function editNode(id) {
     `<label>${label}<input data-k="${k}" type="${t || 'text'}" value="${esc(n[k] != null ? n[k] : '')}"></label>`).join('');
   const tlsBox = TLS_TYPES.includes(type) ? `<label class="row"><input id="ed-tls" type="checkbox" ${n.tls ? 'checked' : ''}> 启用 TLS</label>` : '';
   const fopenBox = type === 'hysteria2' ? `<label class="row"><input id="ed-fopen" type="checkbox" ${n.fast_open ? 'checked' : ''}> fast-open</label>` : '';
+  const chainBox = CHAIN_TYPES.includes(type)
+    ? `<label>前置代理（必选 · 国内可达的中继节点）<select id="ed-front">${frontOptions(id, n.dialer_proxy)}</select></label>`
+    : '';
   el('modal-card').innerHTML = `
     <h3>编辑节点 <span class="muted small">${esc(type.toUpperCase())}</span></h3>
     <div class="grid">${fields}</div>
     <label class="row"><input id="ed-skip" type="checkbox" ${n.skip_cert_verify ? 'checked' : ''}> 跳过证书校验 (insecure)</label>
-    ${tlsBox}${fopenBox}
+    ${tlsBox}${fopenBox}${chainBox}
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">取消</button>
       <button class="btn primary" onclick="saveNode('${id}')">保存</button>
@@ -326,6 +400,10 @@ async function saveNode(id) {
   patch.skip_cert_verify = el('ed-skip').checked;
   if (el('ed-tls')) patch.tls = el('ed-tls').checked;
   if (el('ed-fopen')) patch.fast_open = el('ed-fopen').checked;
+  if (el('ed-front')) {
+    if (!el('ed-front').value) { toast('链式出口必须选择前置代理', 'err'); return; }
+    patch.dialer_proxy = el('ed-front').value;
+  }
   const r = await api('PUT', '/api/nodes/' + id, patch);
   closeModal(); await loadState();
   done(r, '已保存，记得“应用配置”');

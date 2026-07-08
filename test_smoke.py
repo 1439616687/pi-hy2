@@ -80,6 +80,57 @@ if PYYAML:
     _h2 = [p for p in doc["proxies"] if p["type"] == "hysteria2"][0]
     check("special-char password intact", _h2["password"] == "p:a#s s/+w@rd", repr(_h2["password"]))
 
+# 2b. 链式代理：http/socks5 经 dialer-proxy 挂在前置节点后；前置缺失则跳过
+section("chained proxy (dialer-proxy)")
+_CHAIN = [
+    {"id": "n1", "type": "hysteria2", "name": "relay", "server": "r.com", "port": 443, "password": "p"},
+    {"id": "n2", "type": "socks5", "name": "home-exit", "server": "10.0.0.9", "port": 1080,
+     "username": "u", "password": "pw", "dialer_proxy": "n1"},
+    {"id": "n3", "type": "http", "name": "home-http", "server": "10.0.0.10", "port": 8080,
+     "tls": True, "dialer_proxy": "n1"},
+    {"id": "n4", "type": "socks5", "name": "dangling", "server": "10.0.0.11", "port": 1080,
+     "dialer_proxy": "ghost"},   # 前置不存在 -> 应被跳过
+    {"id": "n5", "type": "socks5", "name": "no-front", "server": "10.0.0.12", "port": 1080},  # 缺前置 -> 跳过
+]
+_ctext = config_gen.render(_CHAIN, [], dict(config_gen.DEFAULT_SETTINGS, secret="x"))
+check("chain render has proxies", "proxies:" in _ctext)
+check("dialer-proxy emitted in text", "dialer-proxy:" in _ctext)
+# 出口节点的 password 在预览/打印时同样脱敏（redact_secrets 按行匹配 password: 键，覆盖 http/socks5）
+check("socks5 exit password redacted", "pw" not in config_gen.redact_secrets(_ctext))
+if PYYAML:
+    _cdoc = PYYAML.safe_load(_ctext)
+    _byname = {p["name"]: p for p in _cdoc["proxies"]}
+    check("socks5 exit emitted", _byname.get("home-exit", {}).get("type") == "socks5")
+    check("http exit emitted", _byname.get("home-http", {}).get("type") == "http")
+    check("dialer-proxy resolves to front display name",
+          _byname.get("home-exit", {}).get("dialer-proxy") == "relay", str(_byname.get("home-exit")))
+    check("dangling-front chain node skipped", "dangling" not in _byname, str(list(_byname)))
+    check("missing-front chain node skipped", "no-front" not in _byname, str(list(_byname)))
+    check("front relay node still present", "relay" in _byname)
+# node_to_link 对 http/socks5 抛错（无分享链接格式）-> 导出跳过
+_ne = False
+try:
+    parser.node_to_link({"type": "socks5", "name": "x", "server": "s", "port": 1080})
+except parser.ParseError:
+    _ne = True
+check("node_to_link refuses http/socks5", _ne)
+
+# 2c. dialer-proxy 引用的显示名必须与 display_names()（面板 clash API 切换/测速用的名字）一致：
+# 前置节点名被去重时（两个 relay -> relay / relay #2）渲染端与 API 端仍要对齐，
+# 否则面板会按不存在的名字去切换/测速。这是链式代理可用性的关键不变量。
+_DEDUP = [
+    {"id": "f1", "type": "hysteria2", "name": "relay", "server": "a.com", "port": 443, "password": "p"},
+    {"id": "f2", "type": "hysteria2", "name": "relay", "server": "b.com", "port": 443, "password": "p"},
+    {"id": "c1", "type": "socks5", "name": "exit", "server": "10.0.0.9", "port": 1080, "dialer_proxy": "f2"},
+]
+_dn = config_gen.display_names(_DEDUP)
+if PYYAML:
+    _ddoc = PYYAML.safe_load(config_gen.render(_DEDUP, [], dict(config_gen.DEFAULT_SETTINGS, secret="x")))
+    _exitp = next(p for p in _ddoc["proxies"] if p["type"] == "socks5")
+    check("dialer-proxy matches display_names under dedup",
+          _exitp.get("dialer-proxy") == _dn.get("f2") == "relay #2",
+          str((_exitp.get("dialer-proxy"), _dn.get("f2"))))
+
 # 3. 脱敏：节点密码/UUID/混淆密码/secret 全部打码且仍是合法 YAML
 section("secret redaction")
 red = config_gen.redact_secrets(text)

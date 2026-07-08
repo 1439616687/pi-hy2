@@ -388,9 +388,48 @@ def _proxy_tuic(node: dict, settings: dict) -> dict:
     return p
 
 
+def _proxy_http(node: dict, settings: dict) -> dict:
+    """HTTP/HTTPS 出站代理。仅作链式「出口」使用：国内不可直连的住宅 IP 代理挂在
+    前置节点（dialer-proxy）后面出网，从而拿到更干净的出口 IP。
+    username/password 仅在填了用户名时下发；tls/sni/skip-cert-verify 可选。"""
+    p = {
+        "name": node["name"], "type": "http",
+        "server": node["server"], "port": _port(node),
+    }
+    if node.get("username"):
+        p["username"] = str(node["username"])
+        p["password"] = str(node.get("password", ""))   # 密码仅在带用户名时才有意义
+    if node.get("tls"):
+        p["tls"] = True
+        if node.get("sni"):
+            p["sni"] = node["sni"]
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    return p
+
+
+def _proxy_socks5(node: dict, settings: dict) -> dict:
+    """SOCKS5 出站代理，语义同 _proxy_http（链式出口）。udp 默认开，与其它 builder 一致；
+    住宅 SOCKS5 即便不支持 UDP，TCP 流量仍正常，mihomo 会自行降级。"""
+    p = {
+        "name": node["name"], "type": "socks5",
+        "server": node["server"], "port": _port(node),
+        "udp": True,
+    }
+    if node.get("username"):
+        p["username"] = str(node["username"])
+        p["password"] = str(node.get("password", ""))
+    if node.get("tls"):
+        p["tls"] = True
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    return p
+
+
 _PROXY_BUILDERS = {
     "hysteria2": _proxy_hysteria2, "vless": _proxy_vless, "vmess": _proxy_vmess,
     "trojan": _proxy_trojan, "ss": _proxy_ss, "tuic": _proxy_tuic,
+    "http": _proxy_http, "socks5": _proxy_socks5,
 }
 
 
@@ -524,10 +563,25 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
 
     # proxies —— 单个坏节点（字段类型异常等）跳过而非拖垮整份配置；
     # 全部失败时按“零节点”处理（兜底 DIRECT），与下方规则/final 逻辑保持一致
+    #
+    # 链式代理（dialer-proxy）：http/socks5 等出口节点经「前置节点」出网。前置引用的是 mihomo
+    # 配置里**去重后的显示名**（与 display_names / clash API 同源），故先由已去重的 nodes 建
+    # id->name 映射再解析。http/socks5 作为「仅出口」类型强制要求前置（住宅 IP 国内不可直连，
+    # 缺前置只会得到连不通的死节点）；前置缺失/被删一律跳过该节点，绝不下发悬空 dialer-proxy
+    # 让 mihomo -t 失败、卡住此后每次 apply。前置由面板限定为「非链式节点」，故其显示名恒在
+    # 最终 proxies 中（普通节点永不在此循环被跳过），不存在指向已跳过节点的悬空引用。
+    id2name = {n["id"]: n["name"] for n in nodes if n.get("id")}
     built_proxies, kept_nodes = [], []
     for n in nodes:
         try:
-            built_proxies.append(node_to_proxy(n, s))
+            p = node_to_proxy(n, s)
+            dp = n.get("dialer_proxy")
+            if dp or n.get("type") in ("http", "socks5"):
+                front = id2name.get(str(dp)) if dp else ""
+                if not front:
+                    continue              # 缺前置/前置已删/无效：跳过该链式节点
+                p["dialer-proxy"] = front
+            built_proxies.append(p)
             kept_nodes.append(n)
         except Exception:
             continue
