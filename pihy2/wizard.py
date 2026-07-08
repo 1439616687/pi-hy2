@@ -12,6 +12,7 @@ import sys
 import urllib.parse
 
 from . import manager, parser
+from .log import setup_logging
 from .store import Store, state_lock
 
 C_TITLE = "\033[1;36m"
@@ -200,6 +201,7 @@ def _manage_existing(store) -> bool:
 
 
 def run_wizard():
+    setup_logging(os.environ.get("PIHY2_LOG_LEVEL", "INFO"))   # 向导进程：异常全程入日志文件
     try:
         _run_wizard()
     except (EOFError, KeyboardInterrupt):

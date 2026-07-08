@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from . import __version__, manager, config_gen
+from .log import setup_logging
 from .store import Store, state_lock
 
 
@@ -150,10 +152,17 @@ def _cmd_sub_mutate(args, action):
         with state_lock():
             store = Store()
             sub = store.add_subscription(args.name or "订阅", args.url)
-            cnt = store.set_subscription_nodes(sub["id"], nodes) if nodes else 0
+            if nodes:
+                cnt = store.set_subscription_nodes(sub["id"], nodes)
+            else:                       # 拉取/解析失败：把原因落进订阅记录，便于面板追溯
+                store.mark_subscription_error(sub["id"], "; ".join(errs[:2]) or "未取到节点")
+                cnt = 0
             store.save()
         for e in errs[:3]:
             print("  " + e)
+        if not nodes:
+            manager.notify(Store().data["settings"], "订阅更新失败",
+                           f"{sub['name']}：{'; '.join(errs[:2]) or '未取到节点'}")
         print(f"已添加订阅 {sub['id']}（{cnt} 个节点）")
         if args.apply and not _apply_outside_lock():
             sys.exit(1)                      # 应用失败反映到退出码（CLI-3）
@@ -168,6 +177,13 @@ def _cmd_sub_mutate(args, action):
             if not nodes:
                 for e in errs[:2]:
                     print("  " + e)
+                with state_lock():                        # 失败原因也落盘，便于面板追溯
+                    store = Store()
+                    if store.get_subscription(s["id"]):
+                        store.mark_subscription_error(s["id"], "; ".join(errs[:2]) or "未取到节点")
+                        store.save()
+                manager.notify(Store().data["settings"], "订阅更新失败",
+                               f"{s['name']}：{'; '.join(errs[:2]) or '未取到节点'}")
                 continue
             with state_lock():                            # 锁内仅写回
                 store = Store()
@@ -193,6 +209,42 @@ def _cmd_sub_mutate(args, action):
 
 def cmd_version(args):
     print(f"pihy2 {__version__}")
+
+
+def cmd_logs(args):
+    from .log import read_logs
+    for line in read_logs(args.n, args.level, args.grep):
+        sys.stdout.write(line)
+
+
+def cmd_backup(args):
+    import json
+    print(json.dumps(manager.backup_state(), ensure_ascii=False, indent=2))
+
+
+def cmd_restore(args):
+    import json
+    try:
+        with open(args.file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"读取备份失败：{e}")
+        sys.exit(1)
+    ok, msg = manager.restore_state(data)
+    print(msg)
+    if not ok:
+        sys.exit(1)
+    if args.apply:
+        ok2, msg2 = manager.apply_config(Store())
+        print(msg2)
+
+
+def cmd_update(args):
+    code = args.code or args.code_only
+    ok, msg = manager.update_pihy2(mihomo=not args.code_only, code=code)
+    print(msg)
+    if not ok:
+        sys.exit(1)
 
 
 def build_parser():
@@ -254,10 +306,31 @@ def build_parser():
     un.set_defaults(func=cmd_uninstall)
 
     sub.add_parser("version", help="版本").set_defaults(func=cmd_version)
+
+    lg = sub.add_parser("logs", help="查看 pihy2 系统日志（异常/错误追溯）")
+    lg.add_argument("-n", type=int, default=200, help="显示尾部行数（默认 200，0=全部）")
+    lg.add_argument("--grep", default="", help="关键字过滤（大小写不敏感）")
+    lg.add_argument("--level", default="", help="级别过滤（DEBUG/INFO/WARNING/ERROR/CRITICAL）")
+    lg.set_defaults(func=cmd_logs)
+
+    sub.add_parser("backup", help="导出完整状态到标准输出（节点/订阅/规则/设置，重定向到文件即可备份）") \
+       .set_defaults(func=cmd_backup)
+    rs = sub.add_parser("restore", help="从备份文件恢复状态")
+    rs.add_argument("file", help="备份 JSON 文件路径")
+    rs.add_argument("--apply", action="store_true", help="恢复后立即应用配置")
+    rs.set_defaults(func=cmd_restore)
+
+    up = sub.add_parser("update", help="更新（默认刷新 mihomo 二进制；--code 同时更新代码）")
+    up.add_argument("--code", action="store_true", help="同时更新 pihy2 代码（仅 /opt/pihy2 为 git 仓库时）")
+    up.add_argument("--code-only", action="store_true", help="只更新代码，不刷新 mihomo")
+    up.set_defaults(func=cmd_update)
     return p
 
 
 def main(argv=None):
+    # 任何子命令入口先铺日志基座：异常/失败全部进 /var/log/pihy2/pihy2.log（+stderr->journald），
+    # PIHY2_LOG_LEVEL=debug 可开详细。CLI 各命令里 manager 等的 get_logger 调用由此生效。
+    setup_logging(os.environ.get("PIHY2_LOG_LEVEL", "INFO"))
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

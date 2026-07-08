@@ -569,6 +569,11 @@ def normalize_node(node: dict) -> dict:
         node["alpn"] = _alpn(a)
     elif a is not None and not isinstance(a, list):
         node["alpn"] = []
+    # 布尔字段规整：表单/JSON 可能传成 "false"/0 等非布尔，统一成 bool，
+    # 避免 config_gen 里 bool("false") 恒真、disable_proxy_udp/udp 判断失真
+    for bf in ("udp", "fast_open"):
+        if bf in node and not isinstance(node[bf], bool):
+            node[bf] = _truthy(node[bf])
     return node
 
 

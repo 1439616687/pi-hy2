@@ -83,7 +83,11 @@ pihy2 config             # 打印将生成的 mihomo 配置
 pihy2 restart            # 重启 mihomo
 pihy2 web --port 8088    # 前台启动 WebUI（一般由 systemd 托管）
 pihy2 selftest           # 运行期健康自检（安装/服务/配置/出口；--quick 跳过出口探测）
+pihy2 logs -n 200        # 查看 pihy2 系统日志（异常/错误追溯；--grep/--level 过滤）
 pihy2 restore-defaults   # 把设置恢复出厂默认（不动节点/订阅/规则/面板密码，--apply 立即生效）
+pihy2 backup > bak.json  # 导出完整状态（节点/订阅/规则/设置，含明文密码，妥善保管）
+pihy2 restore bak.json --apply   # 从备份恢复（经清洗后覆盖），--apply 立即生效
+pihy2 update             # 刷新 mihomo 二进制（--code 同时更新 pihy2 代码，需 /opt/pihy2 为 git 仓库）
 pihy2 uninstall          # 卸载（--purge 同时删二进制、配置与 /etc/pihy2 状态）
 ```
 
@@ -189,3 +193,72 @@ CI 见 [`.github/workflows/test.yml`](.github/workflows/test.yml)（在 3.8 与 
 代码注释里形如 `SEC-*/BUG-*/CONFLICT-*/DC-*/ROBUST-*/FRONT-*/FEAT-*` 的编号，是历次代码审查
 发现项的稳定标签：每条注释自带完整说明、用作回归记忆，改动相关逻辑时勿无意回退（对应的逐轮
 审查报告未随生产版仓库一起发布）。
+
+---
+
+## 📋 更新日志
+
+### v1.3.2 —— 第二轮独立审计修复
+
+- **A1/A2 scrub 绕过**：密码含 `@` 的订阅 URL（`https://u:p@ss@host`）原修复会漏出密码尾段——改为按 URL authority 里“最后一个 @”拆分（与 `urllib`/parser 一致），且只动 authority、不误伤 path/query 里的 `@`；`Authorization` 在 dict/JSON repr 形态（`{'authorization': '...'}`）原修复失效，现兼容引号包裹的键。
+- **A4/A8 scrub 覆盖**：补“空格+引号裸值”（`password 'xxx'`，不误伤自然语言）；键名扩展 `access_token`/`api_token`/`csrf_token`/`api_key`/`private_key` 等；URL scheme 扩 `ws(s)`/`ftp`。
+- **A3 悬空 dialer-proxy**：前置节点 build 抛异常被跳过时，引用它的链式出口会带悬空 `dialer-proxy` 让 `mihomo -t` 永久卡死——build 后按实际下发的名字过滤一遍（latent 兜底）。
+- **A5 恶意 id XSS**：恢复恶意备份时，含引号/括号的节点 id 会进前端 inline `onclick` 造成存储型 XSS——在 `_migrate` 这个唯一入口校验 id 匹配 `^[A-Za-z0-9_-]{1,64}$`，不符即重发（比前端 N 处转义更稳）。
+- **A6 文档化**：注明 `pihy2.log` 在多进程并发写下为 best-effort，systemd journal 才是权威可追溯来源。
+
+### v1.3.1 —— 安全加固（独立审计修复）
+
+- **H1 日志凭据泄漏**：订阅/webhook URL 内嵌的 `user:pass@` 现在落盘前被剥离（原 scrub 拦不住 URL userinfo）。
+- **H2 本地提权原语**：`restore_state` 的 `tempfile.mktemp()`（符号链接竞争→root 任意文件覆盖）改为 `mkstemp`（O_EXCL）。
+- **H3 scrub 残留**：`Authorization: Bearer <jwt>` 现整体脱敏（原正则只吃掉 `Bearer`、token 明文残留）；裸 `bearer <token>` 同样覆盖。
+- **M1 并发数据完整性**：`/api/restore` 补上 webui 进程锁，与其它写端点对齐（避免与订阅更新并发静默丢数据）。
+- **M4**：`pihy2 update --code` 的 `.bak` 备份目录收紧到 `0700`。
+- **L1 测试**：补 scrub 回归 + 新端点（`/api/syslogs`/`/api/backup`/`/api/restore`）鉴权与 rebinding host 守卫的**实服务集成测试**。
+
+### v1.3 —— 可运维性
+
+- **完整状态备份/恢复**：`pihy2 backup > bak.json` / `pihy2 restore bak.json --apply`，面板「工具」页「下载备份 / 从文件恢复」。
+  恢复经 `_migrate` 清洗后原子覆盖（脏备份会被拒，不会写坏 state）。
+- **`pihy2 update`**：默认刷新 mihomo 二进制（重跑幂等的 `install_mihomo`）；`--code` 在 `/opt/pihy2` 为 git 仓库时**先打包备份**再 `git pull`。
+- **掉线告警**：可选 Webhook（设置→高级）。订阅更新失败时 POST JSON；复用订阅抓取的 SSRF 钉死连接（拒绝内网/本机），超时短、绝不阻塞主流程；未配 Webhook 时仅写日志（v1.1 已让一切可追溯）。
+- **地理库自检**：`pihy2 selftest` 新增「地理库」项——用了 GEOIP/GEOSITE 规则时提示地理库状态（mihomo 运行时自动下载，首次部署前可能缺失）。
+
+### v1.2 —— 性能 + UDP 安全
+
+**性能与连接复用**
+- 全局下发 `tcp-concurrent`（并发建连）、`keep-alive-interval`/`keep-alive-idle`（TCP 保活，复用连接、减少重连）。
+- 新增「mux 多路复用」开关（默认关）：开启后 vmess/vless/trojan 复用代理连接，减少逐流 TCP+TLS 握手。
+- AUTO 自动测速组的 `interval`/`tolerance` 可在面板调整（节点不稳时切更快）。
+
+**UDP 安全（直接回应“UDP 丢包/绕过/泄漏真实 IP”的担心）**
+- 新增「强制 TCP」开关（`disable_proxy_udp`，默认关）：开启后所有可关 UDP 的出站一律 `udp:false`，
+  浏览器不走 QUIC/UDP、降低 UDP 被限速的面；**hy2/tuic 本就是 UDP 协议，不受影响**（要 TCP 得换前置协议）。
+- 节点级「启用 UDP 中继」开关：可对单个 vless/vmess/trojan/ss/socks5 节点关闭 UDP。
+- `pihy2 selftest` 新增「UDP 防泄漏」项：体检 TUN 接管 + 出口 UDP 支持的结构保证，把“相信 UDP 没泄漏”变成“看得见”。
+- 链式代理表单标注：树莓派这一端的传输层由前置协议决定（hy2/tuic=UDP，vless/vmess/trojan=TCP），链式出口改变不了前置段。
+
+> 说明：TUN + fake-ip + 兜底走代理 的架构本身已让 UDP 经代理转发（不裸奔泄漏）；v1.2 在此基础上加了
+> “强制 TCP”与“可观测自检”，把保证变成开关与绿灯。回归自检新增 15 项性能/UDP 断言。
+
+### v1.1 —— 安全加固 + 可观测性基座
+
+**可追溯（日志）**
+- 新增结构化日志（零依赖，标准库 `logging`）：所有异常/错误落 `/var/log/pihy2/pihy2.log`
+  （轮转，约 6MB 上限）+ stderr→journald；不可写时退化为仅 stderr，绝不因日志让程序起不来。
+- **请求级追溯 ID**：面板每个请求绑定一个 ID，异常带完整堆栈入日志、并把 ID 回传前端
+  （`服务器内部错误（ID a3f9…）`），`grep <ID>` 即可定位。
+- 把原先“静默吞异常”的点（`webui._safe` / `manager.run` / 订阅抓取 / 出口 IP 探测 / 配置校验失败 /
+  状态文件损坏）全部改成“记录后兜底”，不再无声丢失。
+- 落盘前 scrub `password/uuid/secret/token` 等密钥——日志是新泄露面，明文凭据不进文件。
+- 查看入口：`pihy2 logs [-n|--grep|--level]`、面板「工具」页「系统日志」、`pihy2 selftest` 新增“系统日志”项。
+
+**安全加固**
+- DNS 段显式 `ipv6`（跟随顶层），杜绝 AAAA 路径泄漏；新增可选「DNS 解析走代理规则」
+  （`respect-rules`，默认关）让 DoH 经代理出网，连 DNS 服务器地址都不暴露给 ISP。
+- 配置预览/`pihy2 config` 脱敏覆盖 http/socks5 链式出口的 `username`。
+
+**正确性 / 工程**
+- 订阅失败可追溯：订阅记录加 `last_error`，面板订阅卡直接显示“上次失败原因”，不再默默没更新。
+- 补齐 CI：新增 `.github/workflows/test.yml`（Python 3.8 / 3.12 跑离线自检），兑现此前承诺。
+- 回归自检新增 DNS/脱敏/日志/去重顺序无关/订阅 last_error 等断言（76 项全绿）。
+

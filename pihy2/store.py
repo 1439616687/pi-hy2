@@ -12,7 +12,6 @@ import json
 import os
 import re
 import secrets
-import sys
 import time
 
 try:
@@ -21,6 +20,9 @@ except ImportError:                    # pragma: no cover
     fcntl = None
 
 from . import config_gen, parser
+from .log import get_logger
+
+_log = get_logger("store")
 
 STATE_DIR = os.environ.get("PIHY2_DIR", "/etc/pihy2")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -60,6 +62,12 @@ def _id_num(id_str) -> int:
     """取 id 末尾数字（n12 -> 12，s3 -> 3）；无数字返回 0。"""
     m = re.search(r"(\d+)$", str(id_str or ""))
     return int(m.group(1)) if m else 0
+
+
+# id 安全模式：仅字母/数字/_/-。恶意备份/外部编辑可能塞入含引号括号的 id（如
+# x');evil//），进前端 inline onclick 即存储型 XSS（A5）。在 _migrate 这个唯一 chokepoint 拦截：
+# 不符模式一律重发为 n{seq}/s{seq}，比前端 N 处转义更稳。
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # 内置的常用直连规则（首次初始化时写入，用户可在面板里增删）。
 # 刻意只用“不依赖 geodata”的规则：GEOIP/GEOSITE 需要 geoip.metadb/GeoSite.dat，
@@ -118,12 +126,13 @@ class Store:
             bak = f"{self.path}.bad.{i}"
         try:
             os.replace(self.path, bak)
-            sys.stderr.write(
-                f"⚠️  pihy2: 无法读取状态文件 {self.path}（{type(err).__name__}: {err}）；"
-                f"已备份为 {bak} 并以空白状态启动——请检查该备份能否抢救后再做改动。\n")
+            _log.error(
+                "无法读取状态文件 %s（%s: %s）；已备份为 %s 并以空白状态启动——"
+                "请检查该备份能否抢救后再做改动。",
+                self.path, type(err).__name__, err, bak)
         except OSError:
-            sys.stderr.write(
-                f"⚠️  pihy2: 状态文件 {self.path} 损坏且无法备份（{type(err).__name__}: {err}）。\n")
+            _log.error("状态文件 %s 损坏且无法备份（%s: %s）。",
+                       self.path, type(err).__name__, err)
 
     def save(self) -> None:
         # state.json 含明文密码/密钥，目录与文件都收紧权限到仅 root 可读
@@ -168,7 +177,7 @@ class Store:
         seen_ids: set = set()
         for n in base["nodes"]:
             nid = n.get("id")
-            if not nid or nid in seen_ids:
+            if not nid or nid in seen_ids or not _SAFE_ID_RE.match(str(nid)):
                 n["id"] = self._next_id_on(base)
             seen_ids.add(n["id"])
         # 订阅：补全缺失字段（旧版/手工编辑的 state 缺 name/url/count/updated 会让 `pihy2 sub list` KeyError）、
@@ -179,8 +188,9 @@ class Store:
             s.setdefault("url", "")
             s.setdefault("count", 0)
             s.setdefault("updated", "")
+            s.setdefault("last_error", "")
             sid = s.get("id")
-            if not sid or sid in seen_sids:
+            if not sid or sid in seen_sids or not _SAFE_ID_RE.match(str(sid)):
                 s["id"] = self._next_sub_id_on(base)
             seen_sids.add(s["id"])
         # active 指向已不存在的节点时（外部编辑/导入）回落到第一个有效 id，避免悬空 active
@@ -249,7 +259,7 @@ class Store:
 
     def add_subscription(self, name: str, url: str) -> dict:
         sub = {"id": self._next_sub_id(), "name": name.strip() or "订阅",
-               "url": url.strip(), "updated": "", "count": 0}
+               "url": url.strip(), "updated": "", "count": 0, "last_error": ""}
         self.data.setdefault("subscriptions", []).append(sub)
         return sub
 
@@ -298,7 +308,18 @@ class Store:
             self.data["active"] = self.data["nodes"][0]["id"] if self.data["nodes"] else ""
         sub["updated"] = time.strftime("%Y-%m-%d %H:%M")
         sub["count"] = len(added)
+        sub["last_error"] = ""            # 成功：清掉上次失败原因
         return len(added)
+
+    def mark_subscription_error(self, sid: str, msg: str) -> bool:
+        """记录某订阅最近一次更新失败的原因（成功时由 set_subscription_nodes 清空），
+        供面板订阅卡直接显示“为什么没更新”，把静默失败变成可追溯。"""
+        sub = self.get_subscription(sid)
+        if not sub:
+            return False
+        sub["last_error"] = (msg or "")[:200]
+        sub["updated"] = time.strftime("%Y-%m-%d %H:%M")
+        return True
 
     # ---------------------------------------------------------------- 规则/设置
     def set_rules(self, rules: list[dict]) -> None:

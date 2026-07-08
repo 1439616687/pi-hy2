@@ -80,7 +80,8 @@ function renderSubs() {
     <div class="node" style="padding:8px 12px">
       <div class="info"><div class="name">${esc(s.name)}</div>
         <div class="addr">${esc(s.url)}</div>
-        <div class="muted small">节点 ${s.count || 0} · 更新于 ${esc(s.updated || '从未')}</div></div>
+        <div class="muted small">节点 ${s.count || 0} · 更新于 ${esc(s.updated || '从未')}</div>
+        ${s.last_error ? `<div class="muted small" style="color:var(--err-text)">上次失败：${esc(s.last_error)}</div>` : ''}</div>
       <button class="btn small" onclick="updateSub('${s.id}')">更新</button>
       <button class="btn small danger" onclick="delSub('${s.id}')">删除</button>
     </div>`).join('') : '<p class="muted small">暂无订阅。粘贴订阅链接，会定时自动更新节点。</p>';
@@ -296,7 +297,8 @@ function frontOptions(excludeId, selectedId) {
 function openAddChain() {
   el('modal-card').innerHTML = `
     <h3>添加链式代理 <span class="muted small">出口</span></h3>
-    <p class="muted small">录入 HTTP/SOCKS5 住宅 IP 代理作为<b>出口</b>。它从国内不能直连，须挂在下面选的「前置代理」（国内可达的节点）后面链式出网，从而用更干净的 IP 上网。</p>
+    <p class="muted small">录入 HTTP/SOCKS5 住宅 IP 代理作为<b>出口</b>。它从国内不能直连，须挂在下面选的「前置代理」（国内可达的节点）后面链式出网，从而用更干净的 IP 上网。<br>
+      <b>注意</b>：树莓派这一端的传输层由「前置代理」的协议决定——选 hy2/tuic 走 UDP，选 vless/vmess/trojan 走 TCP。挂链式出口改变不了前置段的协议（UDP 不会被转成 TCP）。</p>
     <div class="grid">
       <label>名称 <input id="ch-name" type="text" placeholder="如 美国家宽"></label>
       <label>类型
@@ -359,12 +361,14 @@ const FIELDS_BY_TYPE = {
 };
 const TLS_TYPES = ['vless', 'vmess', 'trojan', 'http', 'socks5'];
 const CHAIN_TYPES = ['http', 'socks5'];
+const UDP_TYPES = ['vless', 'vmess', 'trojan', 'ss', 'socks5'];   // hy2/tuic 是 UDP 原生协议，无此开关
 function editNode(id) {
   const n = STATE.nodes.find(x => x.id === id); if (!n) return;
   const type = n.type || 'hysteria2';
   const fields = (FIELDS_BY_TYPE[type] || FIELDS_BY_TYPE.hysteria2).map(([k, label, t]) =>
     `<label>${label}<input data-k="${k}" type="${t || 'text'}" value="${esc(n[k] != null ? n[k] : '')}"></label>`).join('');
   const tlsBox = TLS_TYPES.includes(type) ? `<label class="row"><input id="ed-tls" type="checkbox" ${n.tls ? 'checked' : ''}> 启用 TLS</label>` : '';
+  const udpBox = UDP_TYPES.includes(type) ? `<label class="row"><input id="ed-udp" type="checkbox" ${n.udp !== false ? 'checked' : ''}> 启用 UDP 中继（关掉则该节点只转 TCP；全局“强制 TCP”会覆盖此项）</label>` : '';
   const fopenBox = type === 'hysteria2' ? `<label class="row"><input id="ed-fopen" type="checkbox" ${n.fast_open ? 'checked' : ''}> fast-open</label>` : '';
   const chainBox = CHAIN_TYPES.includes(type)
     ? `<label>前置代理（必选 · 国内可达的中继节点）<select id="ed-front">${frontOptions(id, n.dialer_proxy)}</select></label>`
@@ -373,7 +377,7 @@ function editNode(id) {
     <h3>编辑节点 <span class="muted small">${esc(type.toUpperCase())}</span></h3>
     <div class="grid">${fields}</div>
     <label class="row"><input id="ed-skip" type="checkbox" ${n.skip_cert_verify ? 'checked' : ''}> 跳过证书校验 (insecure)</label>
-    ${tlsBox}${fopenBox}${chainBox}
+    ${tlsBox}${udpBox}${fopenBox}${chainBox}
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">取消</button>
       <button class="btn primary" onclick="saveNode('${id}')">保存</button>
@@ -399,6 +403,7 @@ async function saveNode(id) {
   });
   patch.skip_cert_verify = el('ed-skip').checked;
   if (el('ed-tls')) patch.tls = el('ed-tls').checked;
+  if (el('ed-udp')) patch.udp = el('ed-udp').checked;
   if (el('ed-fopen')) patch.fast_open = el('ed-fopen').checked;
   if (el('ed-front')) {
     if (!el('ed-front').value) { toast('链式出口必须选择前置代理', 'err'); return; }
@@ -569,6 +574,12 @@ function renderSettings() {
   el('set-up').value = parseInt(s.default_up) || 20;
   el('set-down').value = parseInt(s.default_down) || 100;
   el('set-port').value = s.mixed_port || 7890;
+  el('set-autointerval').value = s.auto_interval || 300;
+  el('set-autotol').value = s.auto_tolerance || 50;
+  el('set-keepalive').value = (s.keep_alive_interval ?? 30);
+  el('set-tcpconc').checked = s.tcp_concurrent !== false;
+  el('set-mux').checked = !!s.mux_enabled;
+  el('set-noudp').checked = !!s.disable_proxy_udp;
   el('set-stack').value = s.tun_stack || 'system';
   el('set-log').value = s.log_level || 'warning';
   el('set-ipv6').checked = !!s.ipv6;
@@ -580,8 +591,10 @@ function renderSettings() {
   el('set-dnscn').value = (s.dns_china || []).join('\n');
   if (el('set-hijack')) el('set-hijack').value = (s.tun_dns_hijack || []).join('\n');     // FEAT-1
   if (el('set-autoredirect')) el('set-autoredirect').checked = s.tun_auto_redirect !== false;
+  if (el('set-respectrules')) el('set-respectrules').checked = !!s.dns_respect_rules;
   el('set-mirror').value = s.github_mirror || '';
   el('set-ctrl').value = s.external_controller || '';
+  if (el('set-webhook')) el('set-webhook').value = s.webhook_url || '';
   el('web-port').value = (STATE.webui || {}).port || 8088;
   el('web-bind').value = (STATE.webui || {}).bind || '0.0.0.0';
   el('web-pw').value = '';
@@ -595,6 +608,12 @@ async function saveSettings() {
     default_up: (parseInt(el('set-up').value) || 20) + ' Mbps',
     default_down: (parseInt(el('set-down').value) || 100) + ' Mbps',
     mixed_port: parseInt(el('set-port').value) || 7890,
+    auto_interval: parseInt(el('set-autointerval').value) || 300,
+    auto_tolerance: parseInt(el('set-autotol').value) || 50,
+    keep_alive_interval: parseInt(el('set-keepalive').value) || 0,
+    tcp_concurrent: el('set-tcpconc').checked,
+    mux_enabled: el('set-mux').checked,
+    disable_proxy_udp: el('set-noudp').checked,
     tun_stack: el('set-stack').value,
     log_level: el('set-log').value,
     ipv6: el('set-ipv6').checked,
@@ -605,8 +624,10 @@ async function saveSettings() {
     // FEAT-1：TUN DNS 劫持目标与 nftables auto-redirect 现可在面板改（清空 hijack=不劫持，与 Pi-hole 共存）
     tun_dns_hijack: el('set-hijack') ? lines(el('set-hijack').value) : (STATE.settings.tun_dns_hijack || ['any:53']),
     tun_auto_redirect: el('set-autoredirect') ? el('set-autoredirect').checked : true,
+    dns_respect_rules: el('set-respectrules') ? el('set-respectrules').checked : false,
     github_mirror: el('set-mirror').value.trim(),
     external_controller: el('set-ctrl').value.trim(),
+    webhook_url: el('set-webhook') ? el('set-webhook').value.trim() : '',
   };
   const r = await api('PUT', '/api/settings', { settings });
   if (!done(r, '设置已保存，记得“应用配置”')) return;
@@ -634,6 +655,12 @@ async function exportLinks() {
   const r = await api('GET', '/api/export');
   const box = el('tools-out'); box.classList.remove('hidden'); box.textContent = (r.links || []).join('\n') || '（无节点）';
 }
+// pihy2 自身系统日志（异常/错误追溯，区别于流量页的 mihomo journal）
+async function showSysLogs() {
+  const r = await api('GET', '/api/syslogs?n=300');
+  const box = el('tools-out'); box.classList.remove('hidden');
+  box.textContent = (r.logs || []).join('') || r.error || '（无日志）';
+}
 async function serviceAction(action) {
   if (action !== 'restart' && !confirm(`确定 ${action} mihomo 服务？`)) return;
   const r = await api('POST', '/api/service', { action });
@@ -659,6 +686,27 @@ async function restoreDefaults() {
   if (!confirm('把“设置”恢复为出厂默认？\n会重置设置页各项与分流预设、兜底策略；不影响节点、订阅、路由规则与面板密码。\n恢复后需点“应用配置并重启”才生效。')) return;
   const r = await api('POST', '/api/restore-defaults');
   if (done(r, r.message || '已恢复默认设置')) await loadState();
+}
+// 完整状态备份/恢复（含节点凭据，妥善保管）
+async function backupDownload() {
+  const r = await fetch('/api/backup', {headers: {'X-Requested-With': 'pihy2', ...(TOKEN ? {Authorization: 'Bearer ' + TOKEN} : {})}});
+  if (r.status === 401) { TOKEN = ''; localStorage.removeItem('pihy2_token'); showLogin(); return; }
+  const blob = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'pihy2-backup.json'; a.click();
+  URL.revokeObjectURL(a.href);
+  toast('已下载备份', 'ok');
+}
+async function restoreUpload(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!confirm('确认用该备份覆盖当前状态？')) { e.target.value = ''; return; }
+  let state;
+  try { state = JSON.parse(await file.text()); }
+  catch (_) { toast('备份文件不是合法 JSON', 'err'); e.target.value = ''; return; }
+  const r = await api('POST', '/api/restore', { state });
+  if (done(r, '已恢复，记得“应用配置并重启”')) await loadState();
+  e.target.value = '';
 }
 async function doUninstall() {
   const purge = !!(el('uninstall-purge') && el('uninstall-purge').checked);

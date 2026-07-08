@@ -133,6 +133,15 @@
           <p class="muted small">未在链接里写明带宽的节点用默认值；填接近实际宽带的数，填太高反而不稳。</p>
         </fieldset>
         <fieldset>
+          <legend>性能 / UDP</legend>
+          <label>AUTO 测速间隔 (秒) <input id="set-autointerval" type="number" min="30"></label>
+          <label>AUTO 容差 (ms) <input id="set-autotol" type="number" min="0"></label>
+          <label>TCP keep-alive 间隔 (秒，0=默认) <input id="set-keepalive" type="number" min="0"></label>
+          <label class="row"><input id="set-tcpconc" type="checkbox"> tcp-concurrent（并发建连）</label>
+          <label class="row"><input id="set-mux" type="checkbox"> mux 多路复用（vmess/vless/trojan 复用连接，减少握手；部分站点兼容性差）</label>
+          <label class="row"><input id="set-noudp" type="checkbox"> 强制 TCP（禁用代理 UDP，浏览器不走 QUIC；hy2/tuic 不受影响）</label>
+        </fieldset>
+        <fieldset>
           <legend>TUN / 日志</legend>
           <label>TUN 协议栈
             <select id="set-stack">
@@ -168,13 +177,15 @@
           <label>TUN DNS 劫持目标（每行一个，如 <code>any:53</code>；<b>清空=不劫持</b>，与本机 Pi-hole/dnsmasq 共存）
             <textarea id="set-hijack" rows="2" placeholder="any:53"></textarea></label>
           <label class="row"><input id="set-autoredirect" type="checkbox"> 启用 nftables auto-redirect（与 Docker/firewalld 冲突或无 nft 时关掉）</label>
+          <label class="row"><input id="set-respectrules" type="checkbox"> DNS 解析走代理规则（让 DoH 经代理出网，更防泄漏；默认关，开启后解析可能略慢）</label>
         </fieldset>
         <fieldset>
           <legend>高级</legend>
           <label>GitHub 下载镜像前缀（可空）
             <input id="set-mirror" type="text" placeholder="如 https://ghproxy.com/"></label>
           <label>clash 外部控制器 <input id="set-ctrl" type="text"></label>
-          <p class="muted small">镜像用于 mihomo 二进制下载加速；外部控制器供面板做免重启切换与测速。</p>
+          <label>告警 Webhook（可空，公网 http(s)）<input id="set-webhook" type="text" placeholder="https://example.com/hook"></label>
+          <p class="muted small">镜像用于 mihomo 二进制下载加速；外部控制器供面板做免重启切换与测速；Webhook 在订阅更新失败等事件触发（POST JSON）。</p>
         </fieldset>
       </div>
       <div class="bar"><button class="btn primary" onclick="saveSettings()">保存设置</button></div>
@@ -199,6 +210,7 @@
       <div class="bar">
         <button class="btn" onclick="showConfig()">预览生成的配置</button>
         <button class="btn" onclick="exportLinks()">导出节点链接</button>
+        <button class="btn" onclick="showSysLogs()">系统日志</button>
         <button class="btn warn" onclick="serviceAction('restart')">重启 mihomo</button>
         <button class="btn warn" onclick="serviceAction('stop')">停止 mihomo</button>
       </div>
@@ -211,6 +223,11 @@
           <button class="btn" onclick="runSelfTest()">运行自检</button>
           <button class="btn" onclick="restoreDefaults()">恢复默认设置</button>
         </div>
+        <div class="bar" style="margin-top:10px">
+          <button class="btn" onclick="backupDownload()">下载备份</button>
+          <label class="btn">从文件恢复<input id="restore-file" type="file" accept="application/json,.json" style="display:none" onchange="restoreUpload(event)"></label>
+        </div>
+        <p class="muted small">备份含全部节点/订阅/规则/设置（含明文密码，妥善保管）。恢复会覆盖当前状态（经清洗后写入），恢复后需点右上角“应用配置并重启”。</p>
         <div id="selftest-out" class="selftest hidden"></div>
         <p class="muted small">“运行自检”体检当前<b>安装 / 服务 / 配置 / 节点 / 出口</b>是否正常，逐项给出通过/警告/失败。
           “恢复默认设置”把<b>设置页各项与分流预设、兜底策略</b>恢复出厂值（<b>不影响</b>节点、订阅、路由规则、面板密码与 clash 密钥），恢复后需点右上角“应用配置并重启”才生效。</p>

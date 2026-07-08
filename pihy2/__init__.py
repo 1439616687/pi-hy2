@@ -9,4 +9,4 @@
     webui       可视化管理面板（HTTP 服务 + REST API + clash API 代理）
 """
 
-__version__ = "1.0"
+__version__ = "1.3.2"

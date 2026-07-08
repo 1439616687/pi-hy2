@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import manager, parser, config_gen
+from .log import setup_logging, bind_request_id, get_request_id, get_logger, read_logs
 from .store import Store, state_lock
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
@@ -26,6 +27,8 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 TOKEN_TTL = 12 * 3600          # token 有效期（秒）
 LOGIN_MAX_FAILS = 8            # 同一 IP 连续失败上限
 LOGIN_LOCK_SECS = 60          # 触发上限后锁定时长
+
+_log = get_logger("webui")
 
 _lock = threading.Lock()
 _tokens: dict[str, float] = {}          # token -> 过期时间戳
@@ -147,7 +150,8 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         try:
             d = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError) as e:
+            _log.debug("请求体 JSON 解析失败（已按空对象处理）: %s", e)
             return {}
         # 合法但非对象的 JSON（如 [1,2] / 5 / "x" / null）会让各处 body.get(...) 崩，统一归一为 {}
         return d if isinstance(d, dict) else {}
@@ -239,11 +243,16 @@ class Handler(BaseHTTPRequestHandler):
     # ----------------------------------------------------------- 路由
     def _safe(self, fn, *a):
         """统一兜底：处理器里的任何意外异常都回成 {ok:false,error} 的 500 JSON，
-        而不是裸 500（前端拿不到 error 字段）。锁用 with 管理，异常时已正常释放，无死锁风险（ROBUST-2）。"""
+        而不是裸 500（前端拿不到 error 字段）。锁用 with 管理，异常时已正常释放，无死锁风险（ROBUST-2）。
+
+        每个请求绑定一个追溯 ID（reqid）：异常时完整堆栈带 ID 写进日志，并把 ID 回传前端——
+        用户报错时 `grep <ID> /var/log/pihy2/pihy2.log` 即可定位，兑现“任何异常可追溯”。"""
+        bind_request_id()
         try:
             return fn(*a)
-        except Exception as e:
-            return self._err(f"服务器内部错误：{e}", 500)
+        except Exception:
+            _log.exception("%s %s 处理失败", self.command, self.path)
+            return self._err(f"服务器内部错误（ID {get_request_id()}）", 500)
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -377,6 +386,17 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     continue
             return self._json({"ok": True, "links": links})
+        if path == "/api/syslogs":   # pihy2 自身系统日志（异常/错误追溯，区别于 /api/logs 的 mihomo journal）
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                n = int((qs.get("n") or ["200"])[0])
+            except ValueError:
+                n = 200
+            level = (qs.get("level") or [""])[0]
+            grep = (qs.get("grep") or [""])[0]
+            return self._json({"ok": True, "logs": read_logs(n, level, grep)})
+        if path == "/api/backup":   # 导出完整状态（含明文凭据——备份用途；与读接口同口径鉴权+host 守卫）
+            return self._json({"ok": True, "state": store.data})
         return self._err("not found", 404)
 
     # ----------------------------------------------------------- POST API
@@ -490,11 +510,17 @@ class Handler(BaseHTTPRequestHandler):
             manager.install_sub_timer(interval)
             nodes, errs = manager.fetch_sub_nodes(url)   # 2) 锁外：拉取（可能很慢）
             cnt = 0
-            with _lock, state_lock():            # 3) 锁内：写回该订阅的节点
+            with _lock, state_lock():            # 3) 锁内：写回该订阅的节点（或记录失败原因）
                 store = self._store()
-                if nodes and store.get_subscription(sid):
-                    cnt = store.set_subscription_nodes(sid, nodes)
+                if store.get_subscription(sid):
+                    if nodes:
+                        cnt = store.set_subscription_nodes(sid, nodes)
+                    else:
+                        store.mark_subscription_error(sid, "; ".join(errs[:2]) or "未取到节点")
                     store.save()
+            if not nodes:   # 订阅失效告警（webhook 可选；无 webhook 时仅写日志）
+                manager.notify(self._store().data["settings"], "订阅更新失败",
+                               f"{sub.get('name', '')}：{'; '.join(errs[:2]) or '未取到节点'}")
             if cnt:
                 manager.apply_config(self._store())   # 4) 锁外：应用
             return self._json({"ok": True, "sub": sub, "count": cnt, "errors": errs})
@@ -505,8 +531,15 @@ class Handler(BaseHTTPRequestHandler):
             targets = subs if sid == "all" else [s for s in subs if s["id"] == sid]
             total = 0
             for s in targets:
-                nodes, _errs = manager.fetch_sub_nodes(s["url"])   # 锁外逐个拉取
+                nodes, errs = manager.fetch_sub_nodes(s["url"])   # 锁外逐个拉取
                 if not nodes:
+                    with _lock, state_lock():    # 失败也落盘原因，便于面板追溯
+                        store = self._store()
+                        if store.get_subscription(s["id"]):
+                            store.mark_subscription_error(s["id"], "; ".join(errs[:2]) or "未取到节点")
+                            store.save()
+                    manager.notify(self._store().data["settings"], "订阅更新失败",
+                                   f"{s.get('name', '')}：{'; '.join(errs[:2]) or '未取到节点'}")
                     continue
                 with _lock, state_lock():        # 锁内写回，不持锁做网络 IO
                     store = self._store()
@@ -529,6 +562,14 @@ class Handler(BaseHTTPRequestHandler):
                 store.restore_default_settings()
                 store.save()
             return self._json({"ok": True, "message": "已恢复默认设置，点“应用配置并重启”后生效"})
+
+        if path == "/api/restore":   # 从完整备份恢复状态（经 _migrate 清洗后原子覆盖）
+            data = body.get("state")
+            # 与其它写端点一样经 webui 进程锁串行；restore_state 内部自取 state_lock（与 _lock 是不同锁，
+            # 故不会 fcntl 重入死锁）。避免与 /api/subs 等并发时静默丢数据（M1）。
+            with _lock:
+                ok, msg = manager.restore_state(data if isinstance(data, dict) else {})
+            return self._json({"ok": ok, "message": msg})
 
         if path == "/api/uninstall":         # FEAT-2 一键卸载：用脱离本服务 cgroup 的独立进程执行
             # 二次确认门槛：除登录态 + CSRF 守卫外，强制要求显式 confirm，防误触/重放触发毁灭性操作
@@ -691,6 +732,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(port: int | None = None, bind: str | None = None):
+    setup_logging(os.environ.get("PIHY2_LOG_LEVEL", "INFO"))   # 面板进程：异常全程入日志文件
     store = Store()
     port = port or store.data["webui"]["port"]
     bind = bind or store.data["webui"].get("bind", "0.0.0.0")

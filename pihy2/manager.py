@@ -29,6 +29,10 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+from .log import get_logger
+
+_log = get_logger("manager")
+
 MIHOMO_BIN = "/usr/local/bin/mihomo"
 MIHOMO_DIR = "/etc/mihomo"
 MIHOMO_CONFIG = os.path.join(MIHOMO_DIR, "config.yaml")
@@ -59,14 +63,20 @@ def is_root() -> bool:
 
 def run(cmd: list[str], check: bool = False, timeout: int = 60) -> subprocess.CompletedProcess:
     """运行命令；命令不存在或超时时返回一个非零的合成结果而不是抛异常，
-    这样调用方（状态查询、配置校验等）在非 systemd 环境或卡顿时也不会崩。"""
+    这样调用方（状态查询、配置校验等）在非 systemd 环境或卡顿时也不会崩。
+
+    各失败分支同时写一条 WARNING 日志（带 reqid），把“合成返回码”背后的真实原因
+    留下追溯痕迹——原先只压成 127/124/126，出错时无从查起。"""
     try:
         return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
     except FileNotFoundError:
+        _log.warning("命令不存在: %s", cmd[0])
         return subprocess.CompletedProcess(cmd, 127, "", f"命令不存在: {cmd[0]}")
     except subprocess.TimeoutExpired:
+        _log.warning("命令超时(%ss): %s", timeout, " ".join(cmd))
         return subprocess.CompletedProcess(cmd, 124, "", f"命令超时({timeout}s): {' '.join(cmd)}")
     except OSError as e:  # 例如架构不符的二进制 Exec format error
+        _log.warning("无法执行 %s: %s", cmd[0], e)
         return subprocess.CompletedProcess(cmd, 126, "", f"无法执行 {cmd[0]}: {e}")
 
 
@@ -528,6 +538,7 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
         ok, out = test_config(text)
         if not ok:
             # 校验失败：不写配置、也不动系统转发，保持原状——避免开了转发却没应用网关配置导致流量裸奔
+            _log.warning("配置校验失败，未落盘：\n%s", (out or "")[-500:])
             return False, f"配置校验失败，已保留原配置：\n{out}"
         write_config(text)
         if restart and os.path.exists(MIHOMO_SERVICE):
@@ -535,6 +546,7 @@ def apply_config(store, restart: bool = True, log=print) -> tuple[bool, str]:
             # -t 不绑定端口，真启动才会暴露端口占用（9090/7890/1053）等问题
             if not (r.returncode == 0 and wait_active("mihomo")):
                 # mihomo 没真正起来：不要开 IP 转发，否则网关模式下流量会经一个死代理裸奔/黑洞
+                _log.warning("mihomo 重启后未进入 active；配置已落盘")
                 return False, ("配置已写入，但 mihomo 未能启动（常见原因：控制器/代理/DNS 端口被占用，"
                                "如 9090/7890/1053）。最近日志：\n" + journal("mihomo", 12))
         _commit_forward()                    # 内含 mihomo 运行自检，restart=False 时也不会盲目开转发
@@ -687,10 +699,12 @@ def fetch_sub_nodes(url: str) -> tuple[list, list]:
     try:
         text = fetch_text(url)
     except Exception as e:
+        _log.warning("订阅拉取失败 %s: %s", url, e)
         return [], [f"拉取失败：{e}"]
     try:
         return parser.parse_many(text)
     except Exception as e:                    # 解析器兜底，任何脏数据都不该拖垮定时更新
+        _log.exception("订阅解析异常 %s", url)
         return [], [f"解析失败：{e}"]
 
 
@@ -809,6 +823,7 @@ def current_ip(timeout: int = 8, retries: int = 3) -> str:
             last = str(e)
             if i + 1 < retries:
                 time.sleep(2 * (i + 1))
+    _log.warning("出口 IP 探测失败（重试 %s 次）: %s", retries, last)
     return f"(获取失败: {last})"
 
 
@@ -995,6 +1010,101 @@ def spawn_uninstall(purge: bool = False, delay: int = 1, log=print) -> tuple[boo
         return False, f"无法启动卸载进程：{e}"
 
 
+# ---------------------------------------------------------------- 备份 / 恢复 / 更新 / 告警
+def backup_state(path: str | None = None) -> dict:
+    """导出完整状态（节点/订阅/规则/设置/面板，含明文凭据——备份用途，注意保管）。"""
+    from .store import Store
+    return Store(path).data if path else Store().data
+
+
+def restore_state(data, path: str | None = None) -> tuple[bool, str]:
+    """从备份对象恢复状态：先经 Store._migrate 清洗/补全（与正常加载同口径，杜绝脏备份写坏），
+    再在 state_lock 内原子覆盖。返回 (ok, 提示)。path 仅用于测试隔离，默认写正式 state.json。"""
+    import tempfile
+    import json
+    from .store import Store, state_lock
+    if not isinstance(data, dict):
+        return False, "备份内容不是 JSON 对象"
+    # mkstemp（O_EXCL）而非已废弃的 mktemp：避免“生成名字→创建文件”窗口里的符号链接竞争，
+    # 该竞争可被本地攻击者利用让 root 覆盖任意文件（写入内容是 /api/restore body 控制的 JSON）。
+    fd, tmp = tempfile.mkstemp(prefix="pihy2-restore-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        migrated = Store(tmp).data      # _migrate 清洗：补默认/去重 id/规整类型（与正常启动一致）
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    with state_lock():
+        store = Store(path) if path else Store()
+        store.data = migrated
+        store.save()
+    return True, (f"已恢复：{len(migrated.get('nodes', []))} 个节点 / "
+                  f"{len(migrated.get('subscriptions', []))} 个订阅 / "
+                  f"{len(migrated.get('rules', []))} 条规则")
+
+
+def update_pihy2(log=print, mihomo: bool = True, code: bool = False) -> tuple[bool, str]:
+    """更新：默认刷新 mihomo 二进制（重跑幂等的 install_mihomo）；code=True 时若 /opt/pihy2 是 git
+    仓库则**先打包备份**再 git pull。返回 (ok, 提示)。
+
+    代码自更新有风险（root + 管理系统网络），故仅当安装目录确为 git 仓库时执行，并先备份可回退。"""
+    if mihomo:
+        try:
+            ver = install_mihomo(log=log)   # 幂等：已存在可用则跳过；否则下载校验原子安装
+            log(f"mihomo：{ver}")
+        except Exception as e:
+            _log.exception("更新 mihomo 失败")
+            return False, f"更新 mihomo 失败：{e}"
+    if code:
+        if not os.path.isdir(os.path.join(INSTALL_DIR, ".git")):
+            return True, "代码更新：安装目录不是 git 仓库，请用新版重跑 install.sh"
+        import shutil
+        bak = INSTALL_DIR + ".bak"
+        try:
+            shutil.rmtree(bak, ignore_errors=True)
+            shutil.copytree(INSTALL_DIR, bak)   # 先备份再 pull，pull 失败可从 .bak 回退
+            try:
+                os.chmod(bak, 0o700)            # 收紧：备份目录仅 root（防用户放进代码目录的 fixture/凭据被 world-read）
+            except OSError:
+                pass
+        except OSError as e:
+            return False, f"代码更新备份失败：{e}"
+        r = run(["git", "-C", INSTALL_DIR, "pull", "--ff-only"], timeout=120)
+        if r.returncode != 0:
+            return False, f"代码更新 git pull 失败：{(r.stderr or r.stdout).strip()}"
+        log("代码已更新；重新部署服务生效：systemctl restart pihy2-web mihomo")
+    return True, "更新完成"
+
+
+def notify(settings: dict, title: str, msg: str) -> None:
+    """可选告警：始终写一条 WARNING 日志（v1.1 日志基座已让任何异常可追溯）；若配了 webhook_url
+    则 best-effort POST JSON。复用订阅抓取的 SSRF 钉死连接（webhook 地址用户可配，须防打内网），
+    超时短、绝不抛——告警失败不影响主流程。"""
+    _log.warning("告警 %s：%s", title, msg)
+    url = str((settings or {}).get("webhook_url") or "").strip()
+    if not url:
+        return
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            return
+        ips = _resolve_public(parts.hostname)            # SSRF：拒绝内网/本机/保留地址
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = parts.path or "/"
+        body = json.dumps({"title": title, "message": msg}).encode()
+        cls = _PinnedHTTPSConnection if parts.scheme == "https" else _PinnedHTTPConnection
+        conn = cls(parts.hostname, ips, port=port, timeout=8)
+        try:
+            conn.request("POST", path, body=body,
+                         headers={"Content-Type": "application/json", "Host": parts.hostname})
+            conn.getresponse().read()
+        finally:
+            conn.close()
+    except Exception as e:
+        _log.debug("webhook 告警发送失败（已忽略）：%s", e)
+
+
 # ---------------------------------------------------------------- 运行期自检
 def self_test(store, probe_ip: bool = True) -> dict:
     """运行期健康自检（FEAT-4）：逐项体检 安装 / 二进制 / TUN / 配置可校验 / 节点 / 服务 /
@@ -1088,6 +1198,39 @@ def self_test(store, probe_ip: bool = True) -> dict:
         add("egress", "出口 IP 探测", "skip",
             "mihomo 未运行" if not running else "已按请求跳过")
 
+    # UDP 防泄漏：TUN 接管 + fake-ip 下 UDP 默认经代理转发（出口为节点 IP，不泄漏真实 IP）。
+    # 这里体检“结构保证”：强制 TCP 时 UDP 不出站；否则当前出口须支持 UDP（hy2/tuic 原生，或 udp 未关）。
+    if running:
+        act = store.active_node()
+        if settings.get("disable_proxy_udp"):
+            add("udp_guard", "UDP 防泄漏", "ok", "已强制 TCP：UDP 不经代理出站（浏览器不走 QUIC/UDP）")
+        elif act and (act.get("type") in ("hysteria2", "tuic") or act.get("udp", True)):
+            add("udp_guard", "UDP 防泄漏", "ok", "UDP 经代理转发，出口为节点 IP（不泄漏真实 IP）")
+        elif act:
+            add("udp_guard", "UDP 防泄漏", "warn",
+                f"当前出口「{act.get('name')}」关闭了 UDP：UDP 流量将被丢弃（TCP 不受影响）")
+        else:
+            add("udp_guard", "UDP 防泄漏", "warn", "未选择出口节点")
+    else:
+        add("udp_guard", "UDP 防泄漏", "skip", "mihomo 未运行")
+
+    # 地理库：用了 GEOIP/GEOSITE 规则才需要；mihomo 运行时会自动下载（走代理），首次部署前可能缺失
+    try:
+        uses_geo = ("GEOIP," in store.render_config() or "GEOSITE," in store.render_config())
+        geo_files = [f for f in ("geoip.metadb", "geosite.dat", "GeoIP.dat", "GeoSite.dat", "country.mmdb")
+                     if os.path.exists(os.path.join(MIHOMO_DIR, f))]
+        if not uses_geo:
+            add("geodata", "地理库", "skip", "未使用 GEOIP/GEOSITE 规则，无需地理库")
+        elif geo_files:
+            add("geodata", "地理库", "ok", "已存在：" + "、".join(geo_files))
+        elif running:
+            add("geodata", "地理库", "ok", "mihomo 运行中会自动下载地理库（走代理）")
+        else:
+            add("geodata", "地理库", "warn",
+                "用了 GEOIP/GEOSITE 规则但地理库未下载且 mihomo 未运行；首次部署建议先不加 GEO 规则，代理就绪后再加")
+    except Exception as e:
+        add("geodata", "地理库", "skip", str(e))
+
     from .store import STATE_FILE
     try:
         if os.path.exists(STATE_FILE):
@@ -1099,6 +1242,21 @@ def self_test(store, probe_ip: bool = True) -> dict:
             add("state_perm", "状态文件权限", "skip", "状态文件尚不存在")
     except OSError as e:
         add("state_perm", "状态文件权限", "skip", str(e))
+
+    # 系统日志：文件是否就位 + 近期是否有 ERROR（任何异常都会落到此文件，可追溯）
+    try:
+        from .log import current_log_file, read_logs
+        log_path = current_log_file()
+        if log_path and os.path.exists(log_path):
+            errs = [ln for ln in read_logs(500, "ERROR") if "无法读取日志" not in ln]
+            add("logs", "系统日志", "warn" if errs else "ok",
+                f"{log_path}，近 500 行有 {len(errs)} 条 ERROR" if errs
+                else f"{log_path} 正常，近期无 ERROR")
+        else:
+            add("logs", "系统日志", "warn",
+                "日志文件尚未就位（首次出错后生成；非 root 运行可能写不进去）")
+    except OSError as e:
+        add("logs", "系统日志", "skip", str(e))
 
     summary = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
     for c in checks:
