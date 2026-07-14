@@ -550,7 +550,8 @@ def proxy_to_node(p: dict) -> dict:
 _STR_FIELDS = ("name", "server", "password", "uuid", "obfs_password", "reality_sid",
                "reality_pbk", "sni", "cipher", "flow", "client_fingerprint", "obfs",
                "ws_path", "ws_host", "grpc_service_name", "fingerprint", "pin_sha256",
-               "up", "down", "ports", "type", "congestion", "udp_relay_mode", "plugin")
+               "up", "down", "ports", "type", "congestion", "udp_relay_mode", "plugin",
+               "username", "dialer_proxy")
 
 
 def normalize_node(node: dict) -> dict:
@@ -568,6 +569,11 @@ def normalize_node(node: dict) -> dict:
         node["alpn"] = _alpn(a)
     elif a is not None and not isinstance(a, list):
         node["alpn"] = []
+    # 布尔字段规整：表单/JSON 可能传成 "false"/0 等非布尔，统一成 bool，
+    # 避免 config_gen 里 bool("false") 恒真、disable_proxy_udp/udp 判断失真
+    for bf in ("udp", "fast_open"):
+        if bf in node and not isinstance(node[bf], bool):
+            node[bf] = _truthy(node[bf])
     return node
 
 
@@ -601,6 +607,10 @@ def node_to_link(node: dict) -> str:
     from urllib.parse import quote, urlencode
 
     t = node.get("type", "hysteria2")
+    # http/socks5 是链式出口，无标准分享链接格式：导出时跳过（/api/export 已 try/except 容错），
+    # 提示用户这类节点只能用面板表单录入/编辑——避免拼出伪链接误导。
+    if t in ("http", "socks5"):
+        raise ParseError(f"{t} 类型无分享链接格式，请在面板用表单录入")
     host = str(node.get("server", ""))
     if not host:
         raise ParseError("缺少服务器地址")

@@ -23,6 +23,7 @@ DEFAULT_SETTINGS = {
     "gateway_mode": False,           # 全屋网关：allow-lan + 开启 IP 转发
     "log_level": "warning",          # silent/error/warning/info/debug
     "ipv6": False,
+    "dns_respect_rules": False,      # DNS 解析是否走路由规则（让 DoH 可经代理出网，更防泄漏；默认关，对小白有兼容影响）
     "tun_stack": "system",           # system/gvisor/mixed
     "tun_dns_hijack": ["any:53"],    # TUN 劫持的 DNS 目标；与本机 Pi-hole/dnsmasq 冲突时可改/清空
     "tun_auto_redirect": True,       # nftables 重定向；与 Docker/firewalld 冲突或无 nft 时可关
@@ -31,9 +32,17 @@ DEFAULT_SETTINGS = {
     "dns_china": ["223.5.5.5", "119.29.29.29"],
     "default_up": "20 Mbps",
     "default_down": "100 Mbps",
+    "tcp_concurrent": True,          # 并发尝试 TCP 连接（IPv4/IPv6 多址时更快建连）
+    "keep_alive_interval": 30,       # TCP keep-alive 间隔（秒；0=不下发，用 mihomo 默认）
+    "keep_alive_idle": 600,          # TCP keep-alive 空闲（秒；0=不下发）
+    "mux_enabled": False,            # vmess/vless/trojan 多路复用，复用代理连接减少 TCP+TLS 握手（默认关：部分站点兼容性差）
+    "disable_proxy_udp": False,      # 强制 TCP：可关 UDP 的出站一律 udp:false（浏览器不走 QUIC/UDP；hy2/tuic 本就是 UDP，不受影响）
+    "auto_interval": 300,            # AUTO 自动测速组探测间隔（秒）
+    "auto_tolerance": 50,            # AUTO 容差（ms）
     "presets": [],                   # 启用的一键分流预设 key 列表
     "final": "PROXY",                # 兜底策略：PROXY 或 DIRECT
     "github_mirror": "",             # mihomo 下载镜像前缀（须 https://，留空=直连 GitHub）
+    "webhook_url": "",               # 可选告警 webhook（订阅更新失败等事件 POST JSON；须公网 http(s)，留空=不告警）
     "external_controller": "127.0.0.1:9090",  # clash API，供面板做实时切换/测速
     "secret": "",                    # clash API 密钥（首次安装随机生成）
 }
@@ -261,6 +270,22 @@ def _bandwidth(value, default: str) -> str:
     return s if re.search(r"\d", s) else default
 
 
+def _udp(node: dict, settings: dict) -> bool:
+    """出站是否转发 UDP：disable_proxy_udp 开时一律 False（强制 TCP，浏览器不走 QUIC/UDP）；
+    否则按节点级 udp 字段（默认 True）。hy2/tuic 本就是 UDP 协议，不调用此函数。"""
+    if settings.get("disable_proxy_udp"):
+        return False
+    return bool(node.get("udp", True))
+
+
+def _apply_mux(p: dict, settings: dict) -> None:
+    """按全局开关给 TCP 流式协议（vmess/vless/trojan）开 mux 多路复用，复用代理连接、
+    减少逐流 TCP+TLS 握手。默认关：部分站点/DPI 下 mux 兼容性较差。"""
+    if settings.get("mux_enabled"):
+        p["mux"] = True
+        p["mux-opts"] = {"concurrency": 8}
+
+
 def _apply_transport(p: dict, node: dict):
     """把 ws/grpc 等传输层字段写进 mihomo proxy。"""
     net = node.get("network")
@@ -304,7 +329,7 @@ def _proxy_vless(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "vless",
         "server": node["server"], "port": _port(node),
-        "uuid": str(node.get("uuid", "")), "udp": True,
+        "uuid": str(node.get("uuid", "")), "udp": _udp(node, settings),
         "tls": bool(node.get("tls", False)),
     }
     # flow（xtls-rprx-vision 等）只在裸 TCP/REALITY 下有效；与 ws/grpc/httpupgrade 同时下发会被 mihomo 拒绝
@@ -323,6 +348,7 @@ def _proxy_vless(node: dict, settings: dict) -> dict:
                              "short-id": node.get("reality_sid", "")}
         p["tls"] = True   # REALITY 必须 tls:true；编辑面板若未勾 TLS，否则 mihomo 会拒绝该配置
     _apply_transport(p, node)
+    _apply_mux(p, settings)
     return p
 
 
@@ -331,7 +357,7 @@ def _proxy_vmess(node: dict, settings: dict) -> dict:
         "name": node["name"], "type": "vmess",
         "server": node["server"], "port": _port(node),
         "uuid": str(node.get("uuid", "")), "alterId": _safe_int(node.get("alter_id"), 0),
-        "cipher": node.get("cipher") or "auto", "udp": True,
+        "cipher": node.get("cipher") or "auto", "udp": _udp(node, settings),
         "tls": bool(node.get("tls", False)),
     }
     if node.get("sni"):
@@ -341,6 +367,7 @@ def _proxy_vmess(node: dict, settings: dict) -> dict:
     if node.get("skip_cert_verify"):
         p["skip-cert-verify"] = True
     _apply_transport(p, node)
+    _apply_mux(p, settings)
     return p
 
 
@@ -348,7 +375,7 @@ def _proxy_trojan(node: dict, settings: dict) -> dict:
     p = {
         "name": node["name"], "type": "trojan",
         "server": node["server"], "port": _port(node),
-        "password": str(node.get("password", "")), "udp": True,
+        "password": str(node.get("password", "")), "udp": _udp(node, settings),
         "sni": node.get("sni") or node["server"],
         "skip-cert-verify": bool(node.get("skip_cert_verify", False)),
     }
@@ -357,6 +384,7 @@ def _proxy_trojan(node: dict, settings: dict) -> dict:
     if node.get("client_fingerprint"):
         p["client-fingerprint"] = node["client_fingerprint"]
     _apply_transport(p, node)
+    _apply_mux(p, settings)
     return p
 
 
@@ -365,7 +393,7 @@ def _proxy_ss(node: dict, settings: dict) -> dict:
         "name": node["name"], "type": "ss",
         "server": node["server"], "port": _port(node),
         "cipher": node.get("cipher") or "aes-256-gcm",
-        "password": str(node.get("password", "")), "udp": True,
+        "password": str(node.get("password", "")), "udp": _udp(node, settings),
     }
     if node.get("plugin"):
         p["plugin"] = node["plugin"]
@@ -388,9 +416,48 @@ def _proxy_tuic(node: dict, settings: dict) -> dict:
     return p
 
 
+def _proxy_http(node: dict, settings: dict) -> dict:
+    """HTTP/HTTPS 出站代理。仅作链式「出口」使用：国内不可直连的住宅 IP 代理挂在
+    前置节点（dialer-proxy）后面出网，从而拿到更干净的出口 IP。
+    username/password 仅在填了用户名时下发；tls/sni/skip-cert-verify 可选。"""
+    p = {
+        "name": node["name"], "type": "http",
+        "server": node["server"], "port": _port(node),
+    }
+    if node.get("username"):
+        p["username"] = str(node["username"])
+        p["password"] = str(node.get("password", ""))   # 密码仅在带用户名时才有意义
+    if node.get("tls"):
+        p["tls"] = True
+        if node.get("sni"):
+            p["sni"] = node["sni"]
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    return p
+
+
+def _proxy_socks5(node: dict, settings: dict) -> dict:
+    """SOCKS5 出站代理，语义同 _proxy_http（链式出口）。udp 默认开，与其它 builder 一致；
+    住宅 SOCKS5 即便不支持 UDP，TCP 流量仍正常，mihomo 会自行降级。"""
+    p = {
+        "name": node["name"], "type": "socks5",
+        "server": node["server"], "port": _port(node),
+        "udp": _udp(node, settings),
+    }
+    if node.get("username"):
+        p["username"] = str(node["username"])
+        p["password"] = str(node.get("password", ""))
+    if node.get("tls"):
+        p["tls"] = True
+    if node.get("skip_cert_verify"):
+        p["skip-cert-verify"] = True
+    return p
+
+
 _PROXY_BUILDERS = {
     "hysteria2": _proxy_hysteria2, "vless": _proxy_vless, "vmess": _proxy_vmess,
     "trojan": _proxy_trojan, "ss": _proxy_ss, "tuic": _proxy_tuic,
+    "http": _proxy_http, "socks5": _proxy_socks5,
 }
 
 
@@ -469,6 +536,15 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         "log-level": log_level,
         "ipv6": bool(s.get("ipv6")),
     }
+    # 性能：并发建连 + TCP keep-alive（复用保活，减少重连）；值为 0/非法则不下发，用 mihomo 默认
+    if s.get("tcp_concurrent"):
+        cfg["tcp-concurrent"] = True
+    kai = _safe_int(s.get("keep_alive_interval"), 0)
+    if kai > 0:
+        cfg["keep-alive-interval"] = kai
+    kidle = _safe_int(s.get("keep_alive_idle"), 0)
+    if kidle > 0:
+        cfg["keep-alive-idle"] = kidle
     ec = s.get("external_controller")
     if ec:
         # external-controller 必须回环：非回环值（手工编辑/未来校验回归）会把带 secret 的控制器
@@ -499,6 +575,9 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         fake_ip = DEFAULT_SETTINGS["fake_ip_range"]
     cfg["dns"] = {
         "enable": True,
+        # 显式跟随顶层 ipv6 开关：关时 mihomo 拒绝 AAAA，杜绝 IPv6 路径上的 DNS/地址泄漏
+        # （此前仅顶层 ipv6:false，dns 段靠默认行为；显式化更稳、可读）。
+        "ipv6": bool(s.get("ipv6")),
         # 仅在开放局域网（allow-lan/网关模式）时监听 0.0.0.0，否则收敛到回环，减少暴露面
         "listen": ("0.0.0.0:1053" if lan_open else "127.0.0.1:1053"),
         "enhanced-mode": "fake-ip",
@@ -508,6 +587,10 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         "nameserver": nameservers,
         "proxy-server-nameserver": china_dns,
     }
+    # respect-rules：让 DNS 解析本身走路由规则，DoH 等可经代理出网（连 DNS 服务器地址都不暴露给 ISP）。
+    # 默认关：对节点域名解析有更高要求（依赖 proxy-server-nameserver 自举），小白开了可能因引导问题解析变慢。
+    if s.get("dns_respect_rules"):
+        cfg["dns"]["respect-rules"] = True
     # dns-hijack / auto-redirect 可配：与本机 Pi-hole/dnsmasq（占 :53）或
     # Docker/firewalld（管 nftables）共存时，可改劫持目标或关掉 nft 重定向。默认保持原行为。
     hijack = s.get("tun_dns_hijack")
@@ -524,14 +607,36 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
 
     # proxies —— 单个坏节点（字段类型异常等）跳过而非拖垮整份配置；
     # 全部失败时按“零节点”处理（兜底 DIRECT），与下方规则/final 逻辑保持一致
+    #
+    # 链式代理（dialer-proxy）：http/socks5 等出口节点经「前置节点」出网。前置引用的是 mihomo
+    # 配置里**去重后的显示名**（与 display_names / clash API 同源），故先由已去重的 nodes 建
+    # id->name 映射再解析。http/socks5 作为「仅出口」类型强制要求前置（住宅 IP 国内不可直连，
+    # 缺前置只会得到连不通的死节点）；前置缺失/被删一律跳过该节点，绝不下发悬空 dialer-proxy
+    # 让 mihomo -t 失败、卡住此后每次 apply。前置由面板限定为「非链式节点」，故其显示名恒在
+    # 最终 proxies 中（普通节点永不在此循环被跳过），不存在指向已跳过节点的悬空引用。
+    id2name = {n["id"]: n["name"] for n in nodes if n.get("id")}
     built_proxies, kept_nodes = [], []
     for n in nodes:
         try:
-            built_proxies.append(node_to_proxy(n, s))
+            p = node_to_proxy(n, s)
+            dp = n.get("dialer_proxy")
+            if dp or n.get("type") in ("http", "socks5"):
+                front = id2name.get(str(dp)) if dp else ""
+                if not front:
+                    continue              # 缺前置/前置已删/无效：跳过该链式节点
+                p["dialer-proxy"] = front
+            built_proxies.append(p)
             kept_nodes.append(n)
         except Exception:
             continue
-    nodes = kept_nodes
+    # 前置节点 build 抛异常被跳过时，引用它的链式节点会带悬空 dialer-proxy（A3）：
+    # 注释旧称“前置恒在最终 proxies 中”，但 node_to_proxy 抛异常即不成立。按实际下发的名字过滤一遍，
+    # 避免悬空引用让 mihomo -t 失败、卡住此后每次 apply（含订阅定时器）。
+    valid_names = {p["name"] for p in built_proxies}
+    _kept = [(p, n) for p, n in zip(built_proxies, kept_nodes)
+             if not p.get("dialer-proxy") or p["dialer-proxy"] in valid_names]
+    built_proxies = [k[0] for k in _kept]
+    nodes = [k[1] for k in _kept]
     if nodes:
         cfg["proxies"] = built_proxies
         names = [n["name"] for n in nodes]  # 已按“当前节点优先”排序
@@ -548,8 +653,8 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
                 "name": "AUTO",
                 "type": "url-test",
                 "url": "http://www.gstatic.com/generate_204",
-                "interval": 300,
-                "tolerance": 50,
+                "interval": max(30, _safe_int(s.get("auto_interval"), 300)),
+                "tolerance": max(0, _safe_int(s.get("auto_tolerance"), 50)),
                 "proxies": names,
             })
         cfg["proxy-groups"] = groups
@@ -593,8 +698,8 @@ def render(nodes: list[dict], rules: list[dict], settings: dict) -> str:
     return header + to_yaml(build_config(nodes, rules, settings)) + "\n"
 
 
-# 渲染后用于「预览/打印」场景的敏感字段（节点密码/UUID/混淆密码 + clash 密钥）
-_SECRET_LINE_RE = re.compile(r"(?m)^(\s*(?:password|obfs-password|uuid|secret):\s*).+$")
+# 渲染后用于「预览/打印」场景的敏感字段（节点密码/UUID/混淆密码/链式出口用户名 + clash 密钥）
+_SECRET_LINE_RE = re.compile(r"(?m)^(\s*(?:password|obfs-password|uuid|username|secret):\s*).+$")
 
 
 def redact_secrets(text: str) -> str:

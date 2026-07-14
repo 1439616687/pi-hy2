@@ -80,7 +80,8 @@ function renderSubs() {
     <div class="node" style="padding:8px 12px">
       <div class="info"><div class="name">${esc(s.name)}</div>
         <div class="addr">${esc(s.url)}</div>
-        <div class="muted small">节点 ${s.count || 0} · 更新于 ${esc(s.updated || '从未')}</div></div>
+        <div class="muted small">节点 ${s.count || 0} · 更新于 ${esc(s.updated || '从未')}</div>
+        ${s.last_error ? `<div class="muted small" style="color:var(--err-text)">上次失败：${esc(s.last_error)}</div>` : ''}</div>
       <button class="btn small" onclick="updateSub('${s.id}')">更新</button>
       <button class="btn small danger" onclick="delSub('${s.id}')">删除</button>
     </div>`).join('') : '<p class="muted small">暂无订阅。粘贴订阅链接，会定时自动更新节点。</p>';
@@ -181,6 +182,10 @@ function renderNodes() {
   list.innerHTML = STATE.nodes.map(n => {
     const active = n.id === STATE.active;
     const tags = [esc((n.type || 'hysteria2').toUpperCase())];
+    if (n.dialer_proxy) {
+      const f = (STATE.nodes || []).find(x => x.id === n.dialer_proxy);
+      tags.push('链式→' + esc(f ? f.name : '前置缺失'));
+    }
     if (n.network && n.network !== 'tcp') tags.push(esc(n.network));
     if (n.reality_pbk) tags.push('reality');
     if (n.sub) { const s = (STATE.subscriptions || []).find(x => x.id === n.sub); tags.push('订阅:' + esc(s ? s.name : n.sub)); }
@@ -227,7 +232,15 @@ async function setActive(id) {
 
 async function deleteNode(id) {
   const n = STATE.nodes.find(x => x.id === id);
-  if (!confirm(`删除节点「${n ? n.name : id}」？`)) return;
+  // 该节点若被别的链式出口当前置（dialer_proxy）引用：删除后那些出口在下次应用时会被跳过（不再下发）。
+  // 提前列出，避免用户困惑“我加的出口节点怎么没了”。
+  const deps = STATE.nodes.filter(x => x.dialer_proxy === id);
+  let msg = `删除节点「${n ? n.name : id}」？`;
+  if (deps.length) {
+    msg += `\n\n注意：它是以下链式出口的前置代理，删除后这些出口将不再生效（节点仍保留在列表，需改选其它前置）：\n`
+      + deps.map(x => '· ' + x.name).join('\n');
+  }
+  if (!confirm(msg)) return;
   const r = await api('DELETE', '/api/nodes/' + id);
   await loadState();
   done(r, '已删除，记得“应用配置”');
@@ -269,7 +282,64 @@ async function commitNodes() {
   closeModal();
   await loadState();
   const errs = (r.errors || []).length;
-  toast(`已添加 ${(r.added || []).length} 个节点${errs ? `（${errs} 行无法解析）` : ''}，记得“应用配置”`, 'ok');
+  toast(`已添加 ${(r.added || []).length} 个节点${errs ? `（${errs} 行无法解析）` : ''}，记得”应用配置”`, 'ok');
+}
+
+// 链式代理：添加 HTTP/SOCKS5 住宅 IP 代理作为「出口」。这类代理国内不可直连，
+// 须挂在某个国内可达的普通节点（前置代理）后面经 dialer-proxy 出网。
+// 前置下拉只列「自身非链式（无 dialer_proxy）」的节点——既是国内可达的中继，又天然防循环链。
+function frontOptions(excludeId, selectedId) {
+  const fronts = STATE.nodes.filter(n => n.id !== excludeId && !n.dialer_proxy && n.server);
+  if (!fronts.length) return '<option value="">（请先添加一个国内可达的节点作为前置）</option>';
+  return '<option value="">-- 选择前置节点 --</option>' +
+    fronts.map(n => `<option value="${n.id}" ${n.id === selectedId ? 'selected' : ''}>${esc(n.name)}（${esc((n.type || '').toUpperCase())}）</option>`).join('');
+}
+function openAddChain() {
+  el('modal-card').innerHTML = `
+    <h3>添加链式代理 <span class="muted small">出口</span></h3>
+    <p class="muted small">录入 HTTP/SOCKS5 住宅 IP 代理作为<b>出口</b>。它从国内不能直连，须挂在下面选的「前置代理」（国内可达的节点）后面链式出网，从而用更干净的 IP 上网。<br>
+      <b>注意</b>：树莓派这一端的传输层由「前置代理」的协议决定——选 hy2/tuic 走 UDP，选 vless/vmess/trojan 走 TCP。挂链式出口改变不了前置段的协议（UDP 不会被转成 TCP）。</p>
+    <div class="grid">
+      <label>名称 <input id="ch-name" type="text" placeholder="如 美国家宽"></label>
+      <label>类型
+        <select id="ch-type"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select>
+      </label>
+      <label>服务器 <input id="ch-server" type="text" placeholder="住宅代理地址"></label>
+      <label>端口 <input id="ch-port" type="number" placeholder="1080"></label>
+      <label>用户名（可空） <input id="ch-user" type="text"></label>
+      <label>密码（可空） <input id="ch-pass" type="text"></label>
+    </div>
+    <label class="row"><input id="ch-tls" type="checkbox"> 启用 TLS（HTTP/HTTPS 代理可选）</label>
+    <label class="row"><input id="ch-skip" type="checkbox" checked> 跳过证书校验</label>
+    <label>前置代理（必选 · 国内可达的中继节点）
+      <select id="ch-front">${frontOptions(null, null)}</select>
+    </label>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn primary" onclick="commitChain()">添加</button>
+    </div>`;
+  el('modal').classList.remove('hidden');
+}
+async function commitChain() {
+  const front = el('ch-front').value;
+  if (!front) { toast('请选择前置代理节点（链式出口必须挂在它后面）', 'err'); return; }
+  const server = el('ch-server').value.trim();
+  if (!server) { toast('请填服务器地址', 'err'); return; }
+  const node = {
+    type: el('ch-type').value,
+    name: el('ch-name').value.trim() || server,
+    server,
+    port: parseInt(el('ch-port').value) || 1080,
+    username: el('ch-user').value.trim(),
+    password: el('ch-pass').value,
+    tls: el('ch-tls').checked,
+    skip_cert_verify: el('ch-skip').checked,
+    dialer_proxy: front,
+  };
+  const r = await api('POST', '/api/nodes', { node });
+  if (!r.ok) { toast('添加失败：' + (r.error || ''), 'err'); return; }
+  closeModal(); await loadState();
+  toast('已添加链式代理，记得”应用配置”', 'ok');
 }
 
 // 编辑节点：按协议显示对应字段
@@ -286,20 +356,28 @@ const FIELDS_BY_TYPE = {
   trojan: [...COMMON, ['password', '密码'], ['sni', 'SNI'], ['client_fingerprint', '指纹'], ALPN, ...NET],
   ss: [...COMMON, ['cipher', '加密方式'], ['password', '密码']],
   tuic: [...COMMON, ['uuid', 'UUID'], ['password', '密码'], ['sni', 'SNI'], ALPN, ['congestion', '拥塞控制(bbr)'], ['udp_relay_mode', 'UDP中继(native)']],
+  http: [...COMMON, ['username', '用户名(可空)'], ['password', '密码(可空)'], ['sni', 'SNI(可空)']],
+  socks5: [...COMMON, ['username', '用户名(可空)'], ['password', '密码(可空)']],
 };
-const TLS_TYPES = ['vless', 'vmess', 'trojan'];
+const TLS_TYPES = ['vless', 'vmess', 'trojan', 'http', 'socks5'];
+const CHAIN_TYPES = ['http', 'socks5'];
+const UDP_TYPES = ['vless', 'vmess', 'trojan', 'ss', 'socks5'];   // hy2/tuic 是 UDP 原生协议，无此开关
 function editNode(id) {
   const n = STATE.nodes.find(x => x.id === id); if (!n) return;
   const type = n.type || 'hysteria2';
   const fields = (FIELDS_BY_TYPE[type] || FIELDS_BY_TYPE.hysteria2).map(([k, label, t]) =>
     `<label>${label}<input data-k="${k}" type="${t || 'text'}" value="${esc(n[k] != null ? n[k] : '')}"></label>`).join('');
   const tlsBox = TLS_TYPES.includes(type) ? `<label class="row"><input id="ed-tls" type="checkbox" ${n.tls ? 'checked' : ''}> 启用 TLS</label>` : '';
+  const udpBox = UDP_TYPES.includes(type) ? `<label class="row"><input id="ed-udp" type="checkbox" ${n.udp !== false ? 'checked' : ''}> 启用 UDP 中继（关掉则该节点只转 TCP；全局“强制 TCP”会覆盖此项）</label>` : '';
   const fopenBox = type === 'hysteria2' ? `<label class="row"><input id="ed-fopen" type="checkbox" ${n.fast_open ? 'checked' : ''}> fast-open</label>` : '';
+  const chainBox = CHAIN_TYPES.includes(type)
+    ? `<label>前置代理（必选 · 国内可达的中继节点）<select id="ed-front">${frontOptions(id, n.dialer_proxy)}</select></label>`
+    : '';
   el('modal-card').innerHTML = `
     <h3>编辑节点 <span class="muted small">${esc(type.toUpperCase())}</span></h3>
     <div class="grid">${fields}</div>
     <label class="row"><input id="ed-skip" type="checkbox" ${n.skip_cert_verify ? 'checked' : ''}> 跳过证书校验 (insecure)</label>
-    ${tlsBox}${fopenBox}
+    ${tlsBox}${udpBox}${fopenBox}${chainBox}
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">取消</button>
       <button class="btn primary" onclick="saveNode('${id}')">保存</button>
@@ -325,7 +403,12 @@ async function saveNode(id) {
   });
   patch.skip_cert_verify = el('ed-skip').checked;
   if (el('ed-tls')) patch.tls = el('ed-tls').checked;
+  if (el('ed-udp')) patch.udp = el('ed-udp').checked;
   if (el('ed-fopen')) patch.fast_open = el('ed-fopen').checked;
+  if (el('ed-front')) {
+    if (!el('ed-front').value) { toast('链式出口必须选择前置代理', 'err'); return; }
+    patch.dialer_proxy = el('ed-front').value;
+  }
   const r = await api('PUT', '/api/nodes/' + id, patch);
   closeModal(); await loadState();
   done(r, '已保存，记得“应用配置”');
@@ -491,6 +574,12 @@ function renderSettings() {
   el('set-up').value = parseInt(s.default_up) || 20;
   el('set-down').value = parseInt(s.default_down) || 100;
   el('set-port').value = s.mixed_port || 7890;
+  el('set-autointerval').value = s.auto_interval || 300;
+  el('set-autotol').value = s.auto_tolerance || 50;
+  el('set-keepalive').value = (s.keep_alive_interval ?? 30);
+  el('set-tcpconc').checked = s.tcp_concurrent !== false;
+  el('set-mux').checked = !!s.mux_enabled;
+  el('set-noudp').checked = !!s.disable_proxy_udp;
   el('set-stack').value = s.tun_stack || 'system';
   el('set-log').value = s.log_level || 'warning';
   el('set-ipv6').checked = !!s.ipv6;
@@ -502,8 +591,10 @@ function renderSettings() {
   el('set-dnscn').value = (s.dns_china || []).join('\n');
   if (el('set-hijack')) el('set-hijack').value = (s.tun_dns_hijack || []).join('\n');     // FEAT-1
   if (el('set-autoredirect')) el('set-autoredirect').checked = s.tun_auto_redirect !== false;
+  if (el('set-respectrules')) el('set-respectrules').checked = !!s.dns_respect_rules;
   el('set-mirror').value = s.github_mirror || '';
   el('set-ctrl').value = s.external_controller || '';
+  if (el('set-webhook')) el('set-webhook').value = s.webhook_url || '';
   el('web-port').value = (STATE.webui || {}).port || 8088;
   el('web-bind').value = (STATE.webui || {}).bind || '0.0.0.0';
   el('web-pw').value = '';
@@ -517,6 +608,12 @@ async function saveSettings() {
     default_up: (parseInt(el('set-up').value) || 20) + ' Mbps',
     default_down: (parseInt(el('set-down').value) || 100) + ' Mbps',
     mixed_port: parseInt(el('set-port').value) || 7890,
+    auto_interval: parseInt(el('set-autointerval').value) || 300,
+    auto_tolerance: parseInt(el('set-autotol').value) || 50,
+    keep_alive_interval: parseInt(el('set-keepalive').value) || 0,
+    tcp_concurrent: el('set-tcpconc').checked,
+    mux_enabled: el('set-mux').checked,
+    disable_proxy_udp: el('set-noudp').checked,
     tun_stack: el('set-stack').value,
     log_level: el('set-log').value,
     ipv6: el('set-ipv6').checked,
@@ -527,8 +624,10 @@ async function saveSettings() {
     // FEAT-1：TUN DNS 劫持目标与 nftables auto-redirect 现可在面板改（清空 hijack=不劫持，与 Pi-hole 共存）
     tun_dns_hijack: el('set-hijack') ? lines(el('set-hijack').value) : (STATE.settings.tun_dns_hijack || ['any:53']),
     tun_auto_redirect: el('set-autoredirect') ? el('set-autoredirect').checked : true,
+    dns_respect_rules: el('set-respectrules') ? el('set-respectrules').checked : false,
     github_mirror: el('set-mirror').value.trim(),
     external_controller: el('set-ctrl').value.trim(),
+    webhook_url: el('set-webhook') ? el('set-webhook').value.trim() : '',
   };
   const r = await api('PUT', '/api/settings', { settings });
   if (!done(r, '设置已保存，记得“应用配置”')) return;
@@ -556,6 +655,12 @@ async function exportLinks() {
   const r = await api('GET', '/api/export');
   const box = el('tools-out'); box.classList.remove('hidden'); box.textContent = (r.links || []).join('\n') || '（无节点）';
 }
+// pihy2 自身系统日志（异常/错误追溯，区别于流量页的 mihomo journal）
+async function showSysLogs() {
+  const r = await api('GET', '/api/syslogs?n=300');
+  const box = el('tools-out'); box.classList.remove('hidden');
+  box.textContent = (r.logs || []).join('') || r.error || '（无日志）';
+}
 async function serviceAction(action) {
   if (action !== 'restart' && !confirm(`确定 ${action} mihomo 服务？`)) return;
   const r = await api('POST', '/api/service', { action });
@@ -581,6 +686,27 @@ async function restoreDefaults() {
   if (!confirm('把“设置”恢复为出厂默认？\n会重置设置页各项与分流预设、兜底策略；不影响节点、订阅、路由规则与面板密码。\n恢复后需点“应用配置并重启”才生效。')) return;
   const r = await api('POST', '/api/restore-defaults');
   if (done(r, r.message || '已恢复默认设置')) await loadState();
+}
+// 完整状态备份/恢复（含节点凭据，妥善保管）
+async function backupDownload() {
+  const r = await fetch('/api/backup', {headers: {'X-Requested-With': 'pihy2', ...(TOKEN ? {Authorization: 'Bearer ' + TOKEN} : {})}});
+  if (r.status === 401) { TOKEN = ''; localStorage.removeItem('pihy2_token'); showLogin(); return; }
+  const blob = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'pihy2-backup.json'; a.click();
+  URL.revokeObjectURL(a.href);
+  toast('已下载备份', 'ok');
+}
+async function restoreUpload(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!confirm('确认用该备份覆盖当前状态？')) { e.target.value = ''; return; }
+  let state;
+  try { state = JSON.parse(await file.text()); }
+  catch (_) { toast('备份文件不是合法 JSON', 'err'); e.target.value = ''; return; }
+  const r = await api('POST', '/api/restore', { state });
+  if (done(r, '已恢复，记得“应用配置并重启”')) await loadState();
+  e.target.value = '';
 }
 async function doUninstall() {
   const purge = !!(el('uninstall-purge') && el('uninstall-purge').checked);
