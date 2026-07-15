@@ -541,6 +541,61 @@ check("malicious node id reissued (A5)",
 check("malicious sub id reissued (A5)",
       all(store._SAFE_ID_RE.match(str(s["id"])) for s in _mig["subscriptions"]))
 
+# 13. UDP 防泄漏兜底（UDPLEAK-1）：存在 UDP-incapable 出口（链式 http/socks5、disable_proxy_udp、
+#     节点级 udp:false）时，必须在 MATCH 前生成 NETWORK,udp 兜底，否则 UDP 漏到 DIRECT 泄露真实 IP
+section("UDP leak guard (NETWORK,udp fallback)")
+from pihy2 import config_gen as _cg  # noqa: E402
+_S3 = dict(_cg.DEFAULT_SETTINGS, secret="x")
+
+check("http chain exit incapable", _cg.proxy_udp_incapable({"type": "http", "dialer-proxy": "f"}))
+check("socks5 chain exit incapable (even udp:true)", _cg.proxy_udp_incapable({"type": "socks5", "dialer-proxy": "f", "udp": True}))
+check("hy2 native capable", not _cg.proxy_udp_incapable({"type": "hysteria2"}))
+check("tuic native capable", not _cg.proxy_udp_incapable({"type": "tuic"}))
+check("vless udp=true capable", not _cg.proxy_udp_incapable({"type": "vless", "udp": True}))
+check("vless udp=false incapable", _cg.proxy_udp_incapable({"type": "vless", "udp": False}))
+
+# 链式住宅出口（hy2 前置 + http/socks5 出口）→ NETWORK,udp 指向前置，且在 MATCH 之前
+_CH = [
+    {"id": "f1", "type": "hysteria2", "name": "front", "server": "f.com", "port": 443, "password": "p"},
+    {"id": "c1", "type": "http", "name": "home-http", "server": "10.0.0.10", "port": 8080, "dialer_proxy": "f1"},
+    {"id": "c2", "type": "socks5", "name": "home-socks", "server": "10.0.0.9", "port": 1080, "dialer_proxy": "f1"},
+]
+_cC = _cg.build_config(_CH, [], _S3)
+_rules = _cC.get("rules", [])
+_netudp = [r for r in _rules if r.startswith("NETWORK,udp,")]
+check("chained exit emits NETWORK,udp", bool(_netudp), str(_rules))
+check("NETWORK,udp targets front node", bool(_netudp) and _netudp[0] == "NETWORK,udp,front", str(_netudp))
+check("NETWORK,udp precedes MATCH",
+      bool(_netudp) and _rules.index(_netudp[0]) < _rules.index(next(r for r in _rules if r.startswith("MATCH"))), str(_rules))
+if PYYAML:
+    check("chained+netudp config valid YAML", isinstance(PYYAML.safe_load(_cg.render(_CH, [], _S3)), dict))
+
+# 纯 hy2（无链式、无 disable）→ 不插 NETWORK,udp（零回归）
+_pure = _cg.build_config([{"id": "n1", "type": "hysteria2", "name": "h", "server": "1.1.1.1", "port": 443, "password": "p"}], [], _S3)
+check("pure hy2 no NETWORK,udp", not any(r.startswith("NETWORK,udp,") for r in _pure["rules"]), str(_pure["rules"]))
+
+# disable_proxy_udp + 非 hy2 节点 → 兜底（修掉 force-TCP 把 UDP 直连泄露的隐患）
+_dp = _cg.build_config([{"id": "n1", "type": "vless", "name": "v", "server": "2.2.2.2", "port": 443, "uuid": "u"}], [], dict(_S3, disable_proxy_udp=True))
+_dp_netudp = [r for r in _dp["rules"] if r.startswith("NETWORK,udp,")]
+check("disable_proxy_udp + vless emits fallback", bool(_dp_netudp), str(_dp["rules"]))
+check("no capable node -> REJECT", bool(_dp_netudp) and _dp_netudp[0] == "NETWORK,udp,REJECT", str(_dp_netudp))
+_dp2 = _cg.build_config([
+    {"id": "n1", "type": "hysteria2", "name": "h", "server": "1.1.1.1", "port": 443, "password": "p"},
+    {"id": "n2", "type": "vless", "name": "v", "server": "2.2.2.2", "port": 443, "uuid": "u"},
+], [], dict(_S3, disable_proxy_udp=True))
+check("disable_proxy_udp + hy2 routes to hy2",
+      [r for r in _dp2["rules"] if r.startswith("NETWORK,udp,")] == ["NETWORK,udp,h"], str(_dp2["rules"]))
+
+# 去重前置名（relay #2）也能正确进 NETWORK,udp（与 dialer-proxy 同源名字）
+_DD = [
+    {"id": "f1", "type": "hysteria2", "name": "relay", "server": "a.com", "port": 443, "password": "p"},
+    {"id": "f2", "type": "hysteria2", "name": "relay", "server": "b.com", "port": 443, "password": "p"},
+    {"id": "c1", "type": "socks5", "name": "exit", "server": "10.0.0.9", "port": 1080, "dialer_proxy": "f2"},
+]
+_ddrules = _cg.build_config(_DD, [], _S3)["rules"]
+check("dedup front name in NETWORK,udp",
+      "NETWORK,udp,relay #2" in _ddrules, str([r for r in _ddrules if r.startswith("NETWORK,udp")]))
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))

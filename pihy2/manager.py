@@ -1198,19 +1198,34 @@ def self_test(store, probe_ip: bool = True) -> dict:
         add("egress", "出口 IP 探测", "skip",
             "mihomo 未运行" if not running else "已按请求跳过")
 
-    # UDP 防泄漏：TUN 接管 + fake-ip 下 UDP 默认经代理转发（出口为节点 IP，不泄漏真实 IP）。
-    # 这里体检“结构保证”：强制 TCP 时 UDP 不出站；否则当前出口须支持 UDP（hy2/tuic 原生，或 udp 未关）。
+    # UDP 防泄漏：核对“若存在不支持 UDP 的出口（链式 http/socks5、或 disable_proxy_udp / 节点级
+    # udp:false），配置里是否带了 NETWORK,udp 兜底”。此前只看当前出口的 udp 字段，对 HTTP 链式
+    # 出口报假绿灯（http 出站无 udp 字段→误判为可用），而实际 UDP 漏到 DIRECT 泄露真实公网 IP
+    # （mihomo #2426/#1573）。现改为渲染配置、核对兜底不变量：有不可用出口必须有 NETWORK,udp。
     if running:
-        act = store.active_node()
-        if settings.get("disable_proxy_udp"):
-            add("udp_guard", "UDP 防泄漏", "ok", "已强制 TCP：UDP 不经代理出站（浏览器不走 QUIC/UDP）")
-        elif act and (act.get("type") in ("hysteria2", "tuic") or act.get("udp", True)):
-            add("udp_guard", "UDP 防泄漏", "ok", "UDP 经代理转发，出口为节点 IP（不泄漏真实 IP）")
-        elif act:
-            add("udp_guard", "UDP 防泄漏", "warn",
-                f"当前出口「{act.get('name')}」关闭了 UDP：UDP 流量将被丢弃（TCP 不受影响）")
+        from . import config_gen
+        try:
+            _ucfg = config_gen.build_config(
+                store.nodes_active_first(), store.data.get("rules", []), settings)
+        except Exception as e:
+            _ucfg = {}
+            _uerr = str(e)
+        _incapable = [p.get("name", "?") for p in _ucfg.get("proxies", [])
+                      if config_gen.proxy_udp_incapable(p)]
+        _netudp = [r for r in _ucfg.get("rules", []) if r.startswith("NETWORK,udp,")]
+        if not _ucfg:
+            add("udp_guard", "UDP 防泄漏", "warn", f"配置渲染失败，无法核对：{_uerr}")
+        elif not _incapable:
+            add("udp_guard", "UDP 防泄漏", "ok", "所有出口均支持 UDP，UDP 经代理转发（不泄漏真实 IP）")
+        elif _netudp:
+            _t = _netudp[0].split(",", 2)[2]
+            add("udp_guard", "UDP 防泄漏", "ok",
+                (f"存在不支持 UDP 的出口（{len(_incapable)} 个），已用 NETWORK,udp 把 UDP 引到 "
+                 f"{_t}（不直连泄露真实 IP）"))
         else:
-            add("udp_guard", "UDP 防泄漏", "warn", "未选择出口节点")
+            add("udp_guard", "UDP 防泄漏", "warn",
+                "存在不支持 UDP 的出口但缺少 NETWORK,udp 兜底：UDP 可能直连泄露真实 IP"
+                "（请点“应用配置并重启”以生成兜底规则）")
     else:
         add("udp_guard", "UDP 防泄漏", "skip", "mihomo 未运行")
 

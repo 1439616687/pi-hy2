@@ -198,6 +198,14 @@ CI 见 [`.github/workflows/test.yml`](.github/workflows/test.yml)（在 3.8 与 
 
 ## 📋 更新日志
 
+### v1.3.3 —— 链式代理 UDP 泄露修复
+
+- **UDPLEAK-1 链式/UDP-incapable 出口泄露真实 IP**：用链式代理（住宅 HTTP/SOCKS5 出口）时，WebRTC/QUIC 等 UDP 仍暴露树莓派真实公网 IP——根因是 mihomo 对“UDP 路由到不支持 UDP 的出站”不丢弃、而是“继续往下匹配”，在 pihy2 的配置里 `MATCH` 下面没有规则，UDP 漏到无匹配→走 DIRECT（mihomo issue [#2426](https://github.com/MetaCubeX/mihomo/issues/2426)/[#1573](https://github.com/MetaCubeX/mihomo/issues/1573)）。纯 hy2/tuic 不受影响（UDP 原生）。
+  修复：渲染配置时若存在 UDP-incapable 出口（链式 http/socks5、`disable_proxy_udp`、节点级 `udp:false`），在 `MATCH` 前插一条 `NETWORK,udp,<UDP 原生/可用节点>`，把 UDP 钉到必然支持 UDP 的出口（优先链式前置的 hy2/tuic，其次任意原生，再次任意 UDP 可用节点，都没有则 `REJECT` 丢弃也不泄露）。TCP 仍走链式住宅出口拿干净 IP，UDP 走前置节点不泄漏。纯 hy2/tuic 配置零回归（不触发）。
+- **顺带修复 `disable_proxy_udp`（强制 TCP）的直连泄露**：原实现把非原生出站设 `udp:false`，反而触发同一 fallthrough→DIRECT，是个隐藏泄露向量。现由上面的 `NETWORK,udp` 兜底一并覆盖（有原生节点则引到原生，否则 `REJECT`）。
+- **`selftest` 的 UDP 防泄漏项不再报假绿灯**：原逻辑对 HTTP 链式出口误判为“UDP 可用”并报 ok（实际在泄露）。改为渲染配置、核对“有 UDP-incapable 出口则必有 `NETWORK,udp` 兜底”这一不变量。
+- 回归自检新增 15 项 UDP 兜底断言。
+
 ### v1.3.2 —— 第二轮独立审计修复
 
 - **A1/A2 scrub 绕过**：密码含 `@` 的订阅 URL（`https://u:p@ss@host`）原修复会漏出密码尾段——改为按 URL authority 里“最后一个 @”拆分（与 `urllib`/parser 一致），且只动 authority、不误伤 path/query 里的 `@`；`Authorization` 在 dict/JSON repr 形态（`{'authorization': '...'}`）原修复失效，现兼容引号包裹的键。

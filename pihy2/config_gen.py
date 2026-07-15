@@ -467,6 +467,25 @@ def node_to_proxy(node: dict, settings: dict) -> dict:
     return builder(node, settings)
 
 
+def proxy_udp_incapable(p: dict) -> bool:
+    """该 mihomo proxy 是否不应承接 UDP。
+
+    UDP 路由到这样的出站时，mihomo 不会转发也不会丢弃，而是“继续往下匹配”规则——在 pihy2
+    的配置里 MATCH 下面没有别的规则，UDP 漏到“无匹配”，mihomo 对无匹配 UDP 走 DIRECT，
+    于是带着树莓派真实公网 IP 从物理网卡出去（WebRTC/QUIC 等 UDP 全泄露）。这正是链式
+    住宅出口泄露真实 IP 的根因（mihomo issue #2426 / #1573）。
+
+    判定：
+      * 带 dialer-proxy 的出站（链式 http/socks5 出口）一律算不可用——http 协议层本就无 UDP；
+        socks5 即便 udp:true，dialer-proxy 路径的 UDP 中继也不可靠（#2426 实测泄露本机真实 IP）。
+      * 其余类型显式 udp:false（disable_proxy_udp 或节点级关闭）算不可用。
+      * hysteria2/tuic 是 UDP 原生协议，mihomo 始终当其支持 UDP（无 udp 字段），算可用。"""
+    if p.get("dialer-proxy"):
+        return True
+    if p.get("type") == "http":
+        return True
+    return p.get("udp") is False
+
 
 # mihomo 保留策略/策略组名：节点若同名会与策略组/内建策略冲突，导致 config 校验失败
 _RESERVED_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE",
@@ -683,6 +702,23 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
         final = "PROXY"
     if not nodes:
         final = "DIRECT"
+    # UDP 防泄漏兜底（UDPLEAK-1）：存在不支持 UDP 的出口时，在 MATCH 前插一条 NETWORK,udp，
+    # 把 UDP 钉到一个必然支持 UDP 的节点上，绝不让它落到 MATCH 后的“无匹配 → DIRECT”而泄露
+    # 真实公网 IP。target 选取：优先 UDP 原生(hy2/tuic)且正好是某链式前置的节点；其次任意原生；
+    # 再次任意 UDP 可用节点（含 udp:true 的 vless/vmess/…）；都没有则 REJECT（丢弃也不泄露）。
+    # 纯 hy2/tuic 且无 UDP-incapable 出口的配置不触发，行为零回归。
+    if built_proxies and any(proxy_udp_incapable(p) for p in built_proxies):
+        fronts = {p["dialer-proxy"] for p in built_proxies if p.get("dialer-proxy")}
+        native = [p["name"] for p in built_proxies if p.get("type") in ("hysteria2", "tuic")]
+        capable = [p["name"] for p in built_proxies if not proxy_udp_incapable(p)]
+        target = next((n for n in native if n in fronts), None)
+        if target is None:
+            target = native[0] if native else None
+        if target is None:
+            target = next((n for n in capable if n in fronts), None)
+        if target is None and capable:
+            target = capable[0]
+        rule_lines.append(f"NETWORK,udp,{target}" if target else "NETWORK,udp,REJECT")
     rule_lines.append(f"MATCH,{final}")
     cfg["rules"] = rule_lines
 
