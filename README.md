@@ -198,6 +198,16 @@ CI 见 [`.github/workflows/test.yml`](.github/workflows/test.yml)（在 3.8 与 
 
 ## 📋 更新日志
 
+### v1.3.4 —— 高级分流：按域名指定出口节点（住宅 / 前置）
+
+- **FEAT-ROUTING-1 按域名选出口**：链式代理下，在「路由分流」里给每条规则可选「指定节点」——让某些域名走**住宅 IP**（更干净、防风控），某些走**前置节点**（更快/更省），其余走默认（当前选中节点）。底层是 mihomo 的"规则点名 proxy"；链式节点被点名时仍自动经前置出网。
+  - 规则字典加可选 `node`（节点 id），渲染时解析成去重后的显示名（与 `dialer-proxy` 同源）。
+  - **悬空目标兜底**：目标节点被删 / 被构建跳过时，自动丢弃该规则，绝不下发悬空引用让 `mihomo -t` 卡死（与 A3 同类）。
+  - 与 UDPLEAK-1 兼容：点给住宅的域名 **TCP 走住宅**，**UDP 落到 `NETWORK,udp` 兜底走前置**——住宅 HTTP/SOCKS5 本就只能承载 TCP，UDP 这样处理不泄露。
+  - 老规则（无 `node`）行为零变化。
+- **UI**：规则行「策略」加「指定节点」选项，选中后出现节点下拉（带 链式/协议 标签）；预览实时显示解析后的节点名。
+- 回归自检新增 11 项断言。
+
 ### v1.3.3 —— 链式代理 UDP 泄露修复
 
 - **UDPLEAK-1 链式/UDP-incapable 出口泄露真实 IP**：用链式代理（住宅 HTTP/SOCKS5 出口）时，WebRTC/QUIC 等 UDP 仍暴露树莓派真实公网 IP——根因是 mihomo 对“UDP 路由到不支持 UDP 的出站”不丢弃、而是“继续往下匹配”，在 pihy2 的配置里 `MATCH` 下面没有规则，UDP 漏到无匹配→走 DIRECT（mihomo issue [#2426](https://github.com/MetaCubeX/mihomo/issues/2426)/[#1573](https://github.com/MetaCubeX/mihomo/issues/1573)）。纯 hy2/tuic 不受影响（UDP 原生）。

@@ -234,9 +234,22 @@ def classify_rule(value: str, rtype: str = "auto") -> tuple[str, str]:
     return "DOMAIN-KEYWORD", value
 
 
-def rule_to_mihomo(rule: dict) -> str:
-    """单条规则字典 -> mihomo 规则行字符串。"""
+def rule_to_mihomo(rule: dict, id2name: dict | None = None,
+                   valid_names: set | None = None) -> str | None:
+    """单条规则字典 -> mihomo 规则行字符串；悬空目标返回 None（调用方跳过）。
+
+    rule.node 给定且 id2name 可用时，规则点名该节点（解析成去重后的显示名，与 dialer-proxy
+    同源），用于"高级分流：某域名走住宅、某域名走前置"。目标节点不在 valid_names（被删/被
+    构建跳过）则返回 None，避免下发悬空引用让 mihomo -t 卡死（与 A3 dialer-proxy 同类兜底）。
+    无 node 或无 id2name（如旧调用方）时回落 policy。"""
     kind, value = classify_rule(rule.get("value", ""), rule.get("type", "auto"))
+    node_id = str(rule.get("node") or "").strip()
+    if node_id and id2name is not None:
+        target = id2name.get(node_id)
+        if not target or (valid_names is not None and target not in valid_names):
+            return None                  # 悬空：节点被删/被跳过，丢弃该规则而非下发坏引用
+        suffix = ",no-resolve" if kind == "IP-CIDR" else ""
+        return f"{kind},{value},{target}{suffix}"
     policy = str(rule.get("policy", "PROXY")).strip().upper()
     if policy not in ("DIRECT", "PROXY", "REJECT"):
         policy = "PROXY"
@@ -693,9 +706,11 @@ def build_config(nodes: list[dict], rules: list[dict], settings: dict) -> dict:
             if rv is None or not str(rv).strip():
                 continue
             try:
-                rule_lines.append(rule_to_mihomo(r))
+                line = rule_to_mihomo(r, id2name, valid_names)
             except Exception:
                 continue
+            if line is not None:
+                rule_lines.append(line)
         rule_lines.extend(expand_presets(s.get("presets", [])))
     final = str(s.get("final", "PROXY")).upper()
     if final not in ("PROXY", "DIRECT"):

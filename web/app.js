@@ -507,13 +507,30 @@ function genRule(r) {
   if (!(r.value || '').trim()) return '';
   const [kind, val] = classifyRule(r.value, r.type);
   if (kind.startsWith('(')) return kind;        // 标记类（非法 IP / 空值·会被忽略）直接显示，不拼成假规则
+  const nosuf = kind === 'IP-CIDR' ? ',no-resolve' : '';
+  // 指定节点（高级分流：该域名走某节点，如住宅/前置）。前端预览用原始 name；
+  // 实际配置用去重后的显示名（重名时可能略有不同，以"预览生成的配置"为准）。
+  if ((r.policy || '').toUpperCase() === 'NODE' || r.node) {
+    const n = (STATE.nodes || []).find(x => x.id === r.node);
+    return n ? `${kind},${val},${n.name}${nosuf}` : `${kind},${val},(节点缺失·会被忽略)${nosuf}`;
+  }
   const policy = (r.policy || 'PROXY').toUpperCase();
-  return `${kind},${val},${policy}${kind === 'IP-CIDR' ? ',no-resolve' : ''}`;
+  return `${kind},${val},${policy}${nosuf}`;
 }
 
+function nodeLabel(n) {
+  const chain = n.dialer_proxy ? ' · 链式' : '';
+  return (n.name || n.id) + ' (' + (n.type || 'hy2').toUpperCase() + chain + ')';
+}
+function nodeTargetOptions(selectedId) {
+  if (!(STATE.nodes || []).length) return '<option value="">（请先添加节点）</option>';
+  return '<option value="">— 选择节点 —</option>' +
+    STATE.nodes.map(n => `<option value="${esc(n.id)}" ${n.id === selectedId ? 'selected' : ''}>${esc(nodeLabel(n))}</option>`).join('');
+}
 function ruleRowHtml(r, i) {
   const typeOpts = RULE_TYPES.map(([v, t]) => `<option value="${v}" ${r.type === v ? 'selected' : ''}>${t}</option>`).join('');
   const policy = (r.policy || 'PROXY').toUpperCase();
+  const isNode = policy === 'NODE';
   const gen = genRule(r);
   return `<div class="rule-row" data-i="${i}">
     <input value="${esc(r.value)}" oninput="ruleEdited(${i},'value',this.value)" placeholder="*.cn / github.com / 1.2.3.0/24">
@@ -522,7 +539,9 @@ function ruleRowHtml(r, i) {
       <option value="PROXY" ${policy === 'PROXY' ? 'selected' : ''}>代理</option>
       <option value="DIRECT" ${policy === 'DIRECT' ? 'selected' : ''}>直连</option>
       <option value="REJECT" ${policy === 'REJECT' ? 'selected' : ''}>拦截</option>
+      <option value="NODE" ${isNode ? 'selected' : ''}>指定节点</option>
     </select>
+    ${isNode ? `<select onchange="ruleEdited(${i},'node',this.value)" title="该域名走此节点（链式节点会自动经前置出网）">${nodeTargetOptions(r.node)}</select>` : ''}
     <span class="gen">${esc(gen)}</span>
     <button class="btn small danger" onclick="delRule(${i})">×</button>
   </div>`;
@@ -553,14 +572,25 @@ function finalChanged() {
 function ruleEdited(i, key, val) {
   STATE.rules[i][key] = val;
   rulesDirty = true;
-  // 仅刷新该行的“生成规则”预览，避免输入时光标丢失
+  if (key === 'policy') {
+    // 切到/离开“指定节点”要增删节点下拉，整行重渲染（下拉切换不涉及文本输入焦点）
+    if ((val || '').toUpperCase() === 'NODE' && !STATE.rules[i].node) STATE.rules[i].node = '';
+    renderRules();
+    return;
+  }
+  // 仅刷新该行的“生成规则”预览，避免输入时文本输入框丢焦
   const row = el('rule-list').querySelector(`.rule-row[data-i="${i}"] .gen`);
   if (row) row.textContent = genRule(STATE.rules[i]);
 }
 function addRuleRow() { STATE.rules.push({ value: '', type: 'auto', policy: 'PROXY' }); rulesDirty = true; renderRules(); }
 function delRule(i) { STATE.rules.splice(i, 1); rulesDirty = true; renderRules(); }
 async function saveRules() {
-  const rules = STATE.rules.filter(r => (r.value || '').trim());
+  const rules = STATE.rules.filter(r => (r.value || '').trim()).map(r => {
+    const out = { value: r.value, type: r.type || 'auto', policy: (r.policy || 'PROXY') };
+    // 指定节点：带有效 node id 才下发；空/缺则回落 policy（服务端 rule_to_mihomo 也以 node 为准）
+    if ((r.policy || '').toUpperCase() === 'NODE' && r.node) out.node = r.node;
+    return out;
+  });
   const presets = [...document.querySelectorAll('.preset-cb:checked')].map(c => c.value);
   const r1 = await api('PUT', '/api/rules', { rules });
   const r2 = await api('PUT', '/api/settings', { settings: { final: el('final-policy').value, presets } });

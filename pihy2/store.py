@@ -325,7 +325,19 @@ class Store:
     def set_rules(self, rules: list[dict]) -> None:
         # 只收 dict 规则项：非 dict（如外部传入 ["foo"]）会让 build_config 渲染时 r.get(...) 崩，
         # 且被持久化后变成毒丸——此后每次 config 预览/apply（含定时器）都 500，直到手改 state.json。
-        self.data["rules"] = [r for r in (rules or []) if isinstance(r, dict)]
+        # node（高级分流"指定节点"）只接受非空字符串 id；脏值剥掉，渲染时回落 policy（安全）。
+        out = []
+        for r in (rules or []):
+            if not isinstance(r, dict):
+                continue
+            r = dict(r)
+            n = r.get("node")
+            if isinstance(n, str) and n.strip():
+                r["node"] = n.strip()
+            else:
+                r.pop("node", None)
+            out.append(r)
+        self.data["rules"] = out
 
     # 已知可写设置键（DEFAULT_SETTINGS 全集，github_mirror 现已并入），永不让外部覆盖 secret。
     # 把这道硬保证放在 store 层，使 CLI/向导/未来任何写入方都继承；webui 仍各自保留用户友好的校验消息。

@@ -596,6 +596,63 @@ _ddrules = _cg.build_config(_DD, [], _S3)["rules"]
 check("dedup front name in NETWORK,udp",
       "NETWORK,udp,relay #2" in _ddrules, str([r for r in _ddrules if r.startswith("NETWORK,udp")]))
 
+# 14. 高级分流：规则点名节点（住宅/前置/其它），悬空丢弃，UDP 兜底不被破坏
+section("per-domain routing (rule -> specific node)")
+_RT = [
+    {"id": "f1", "type": "hysteria2", "name": "HK前置", "server": "hk.com", "port": 443, "password": "p"},
+    {"id": "c1", "type": "http", "name": "US住宅", "server": "10.0.0.10", "port": 8080, "dialer_proxy": "f1"},
+]
+_RRULES = [
+    {"value": "netflix.com", "type": "domain-suffix", "policy": "NODE", "node": "c1"},   # → 住宅(经前置)
+    {"value": "github.com", "type": "domain-suffix", "policy": "NODE", "node": "f1"},    # → 前置直出
+    {"value": "evil.com", "type": "domain-suffix", "policy": "NODE", "node": "ghost"},   # 悬空 → 丢弃
+    {"value": "direct.com", "type": "domain-suffix", "policy": "DIRECT"},                # 普通直连
+]
+_rc = _cg.build_config(_RT, _RRULES, _S3)
+_rrules = _rc["rules"]
+check("rule targets residential node", "DOMAIN-SUFFIX,netflix.com,US住宅" in _rrules, str(_rrules))
+check("rule targets front node", "DOMAIN-SUFFIX,github.com,HK前置" in _rrules, str(_rrules))
+check("dangling node rule dropped", not any("evil.com" in r for r in _rrules), str(_rrules))
+check("normal DIRECT rule intact", "DOMAIN-SUFFIX,direct.com,DIRECT" in _rrules, str(_rrules))
+_byname2 = {p["name"]: p for p in _rc["proxies"]}
+check("residential target still chained", _byname2.get("US住宅", {}).get("dialer-proxy") == "HK前置",
+      str(_byname2.get("US住宅")))
+# UDP 兜底仍在、且在 MATCH 前（高级分流不能破坏 UDPLEAK-1 修复）
+_nu = [r for r in _rrules if r.startswith("NETWORK,udp,")]
+_mi = next(i for i, r in enumerate(_rrules) if r.startswith("MATCH"))
+check("NETWORK,udp still before MATCH with per-domain rules", bool(_nu) and _rrules.index(_nu[0]) < _mi, str(_rrules))
+
+# 目标节点名被去重（两个同名）→ 规则用去重后的显示名
+_dd2rules = _cg.build_config([
+    {"id": "f1", "type": "hysteria2", "name": "relay", "server": "a.com", "port": 443, "password": "p"},
+    {"id": "f2", "type": "hysteria2", "name": "relay", "server": "b.com", "port": 443, "password": "p"},
+], [{"value": "x.com", "type": "domain-suffix", "policy": "NODE", "node": "f2"}], _S3)["rules"]
+check("rule uses dedup display name for node target",
+      "DOMAIN-SUFFIX,x.com,relay #2" in _dd2rules, str([r for r in _dd2rules if "x.com" in r]))
+
+# rule_to_mihomo：无 id2name 时忽略 node（旧调用方不崩）；有 id2name 时悬空返回 None、有效则解析
+check("rule_to_mihomo ignores node without id2name",
+      _cg.rule_to_mihomo({"value": "a.com", "type": "domain-suffix", "policy": "PROXY", "node": "f1"}) == "DOMAIN-SUFFIX,a.com,PROXY")
+check("rule_to_mihomo None on dangling",
+      _cg.rule_to_mihomo({"value": "a.com", "type": "domain-suffix", "node": "ghost"}, {"f1": "节点A"}, {"节点A"}) is None)
+check("rule_to_mihomo resolves node target",
+      _cg.rule_to_mihomo({"value": "a.com", "type": "domain-suffix", "node": "f1"}, {"f1": "节点A"}, {"节点A"}) == "DOMAIN-SUFFIX,a.com,节点A")
+
+# store.set_rules：node 仅接受非空字符串 id，脏值剥掉（渲染时回落 policy，安全）
+from pihy2 import store as _stm2  # noqa: E402
+_spR = tempfile.mktemp()
+_stR = _stm2.Store(_spR)
+_stR.set_rules([
+    {"value": "a.com", "policy": "NODE", "node": "n5"},
+    {"value": "b.com", "policy": "NODE", "node": 123},
+    {"value": "c.com", "policy": "PROXY"},
+])
+_rr2 = {r["value"]: r for r in _stR.data["rules"]}
+check("set_rules keeps valid node id", _rr2["a.com"].get("node") == "n5", str(_rr2["a.com"]))
+check("set_rules strips non-string node", "node" not in _rr2["b.com"], str(_rr2["b.com"]))
+check("set_rules leaves no-node rule alone", "node" not in _rr2["c.com"], str(_rr2["c.com"]))
+os.path.exists(_spR) and os.remove(_spR)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))
